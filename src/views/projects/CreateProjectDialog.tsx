@@ -14,12 +14,14 @@ interface CreateProjectDialogProps {
   onClose: () => void;
   onSubmit: (input: { name: string; description: string | null }) => Promise<Project>;
   onCreated: (project: Project) => void;
+  /** Focus target after closing when the opener no longer exists (e.g. onboarding). */
+  fallbackFocus?: () => HTMLElement | null;
 }
 
 /** Show the character counter only when the value approaches the limit. */
 const nearLimit = (count: number, max: number) => count >= Math.floor(max * 0.85);
 
-export function CreateProjectDialog({ open, onClose, onSubmit, onCreated }: CreateProjectDialogProps) {
+export function CreateProjectDialog({ open, onClose, onSubmit, onCreated, fallbackFocus }: CreateProjectDialogProps) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<Field, string>>>({});
@@ -95,6 +97,7 @@ export function CreateProjectDialog({ open, onClose, onSubmit, onCreated }: Crea
       labelledBy="create-project-title"
       initialFocusRef={nameRef}
       dismissDisabled={busy}
+      fallbackFocus={fallbackFocus}
       finalFocus={() => {
         const id = createdId.current;
         createdId.current = null;

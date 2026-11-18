@@ -10,6 +10,8 @@ interface DialogProps {
   initialFocusRef?: RefObject<HTMLElement | null>;
   /** Element to focus after closing; falls back to the element focused before opening. */
   finalFocus?: () => HTMLElement | null;
+  /** Used when neither finalFocus nor the original opener is available. */
+  fallbackFocus?: () => HTMLElement | null;
   /** While true, Esc is ignored (e.g. during a pending request). */
   dismissDisabled?: boolean;
   className?: string;
@@ -29,6 +31,7 @@ export function Dialog({
   describedBy,
   initialFocusRef,
   finalFocus,
+  fallbackFocus,
   dismissDisabled = false,
   className,
   role,
@@ -38,6 +41,8 @@ export function Dialog({
   const returnTo = useRef<HTMLElement | null>(null);
   const finalFocusRef = useRef(finalFocus);
   finalFocusRef.current = finalFocus;
+  const fallbackFocusRef = useRef(fallbackFocus);
+  fallbackFocusRef.current = fallbackFocus;
 
   useLayoutEffect(() => {
     const dialog = ref.current;
@@ -53,7 +58,8 @@ export function Dialog({
       dialog.close();
       const preferred = finalFocusRef.current?.();
       const fallback = returnTo.current;
-      const target = preferred ?? (fallback && fallback.isConnected ? fallback : null);
+      const target =
+        preferred ?? (fallback && fallback !== document.body && fallback.isConnected ? fallback : null) ?? fallbackFocusRef.current?.() ?? null;
       target?.focus();
       returnTo.current = null;
     }
