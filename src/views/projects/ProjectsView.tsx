@@ -30,12 +30,8 @@ export function ProjectsView({ store, selectedId, onSelect, onboarded, onOnboard
   const [notice, setNotice] = useState<AppError | null>(null);
   const showLoading = useDelayedFlag(status === "loading");
 
-  const selected = projects.find((p) => p.id === selectedId) ?? null;
-
-  // Keep a valid selection: default to the first project.
-  useEffect(() => {
-    if (status === "ready" && !selected && projects.length > 0) onSelect(projects[0]!.id);
-  }, [status, selected, projects, onSelect]);
+  // Fall back to the first project when nothing (valid) is selected.
+  const selected = projects.find((p) => p.id === selectedId) ?? projects[0] ?? null;
 
   // Existing projects mean the user is past onboarding.
   useEffect(() => {

@@ -242,6 +242,12 @@ button {
   padding: var(--space-3) var(--space-5) var(--space-6);
 }
 
+.view-header,
+.view-content {
+  width: 100%;
+  max-width: 80rem;
+}
+
 .view-header {
   display: flex;
   flex-wrap: wrap;

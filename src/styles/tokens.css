@@ -10,7 +10,7 @@
   --surface-hover: #e8ecf1;
   --surface-selected: #e1eaf3;
   --border: #dde2e8;
-  --border-strong: #b9c2cc;
+  --border-strong: #848e9a; /* 3.3:1 on --surface (input boundaries) */
   --text: #1c232b;
   --text-muted: #5a6572; /* 5.9:1 on --surface */
   --accent: #2f5d8a; /* 6.8:1 on white */
@@ -75,7 +75,7 @@
   --surface-hover: #262c34;
   --surface-selected: #253446;
   --border: #2e353e;
-  --border-strong: #46505c;
+  --border-strong: #66717e; /* 3.3:1 on --surface */
   --text: #e6e9ed;
   --text-muted: #a0aab5; /* 7.3:1 on --surface */
   --accent: #8cb8e6;

@@ -1,4 +1,4 @@
-import { useRef, type KeyboardEvent } from "react";
+import type { KeyboardEvent } from "react";
 import type { Project } from "../../api/types";
 
 export const optionId = (id: string) => `project-option-${id}`;
@@ -11,7 +11,6 @@ interface ProjectListProps {
 
 /** Single-select listbox with roving focus: arrows/Home/End move the selection. */
 export function ProjectList({ projects, selectedId, onSelect }: ProjectListProps) {
-  const listRef = useRef<HTMLUListElement>(null);
   const selectedIndex = projects.findIndex((p) => p.id === selectedId);
   const focusIndex = selectedIndex >= 0 ? selectedIndex : 0;
 
@@ -46,7 +45,7 @@ export function ProjectList({ projects, selectedId, onSelect }: ProjectListProps
   };
 
   return (
-    <ul ref={listRef} className="project-list" role="listbox" aria-label="Elenco progetti" onKeyDown={onKeyDown}>
+    <ul className="project-list" role="listbox" aria-label="Elenco progetti" onKeyDown={onKeyDown}>
       {projects.map((project, index) => {
         const selected = project.id === selectedId;
         return (
