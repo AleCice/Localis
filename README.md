@@ -68,9 +68,9 @@ Il database SQLite `localis.db` sta nella directory dati dell'app, mai nel repos
 | macOS | `~/Library/Application Support/app.localis.desktop/localis.db` |
 | Windows | `%APPDATA%\app.localis.desktop\localis.db` |
 
-Le preferenze dell'interfaccia (tema, stato della sidebar, onboarding completato) sono salvate nello storage locale della webview.
+Le preferenze dell'interfaccia (tema, stato della sidebar, onboarding completato) sono nello storage locale della webview: su Linux in `app.localis.desktop/localstorage/`, su macOS e Windows nella cartella dati della webview di sistema (non verificato su queste piattaforme).
 
-Per ripartire da zero, chiudi Localis e cancella la cartella `app.localis.desktop` indicata sopra. Eliminare un progetto dall'app rimuove soltanto il suo record nel database: Localis non cancella file sul disco.
+Per ripartire da zero, chiudi Localis e cancella la cartella `app.localis.desktop` indicata sopra (su Linux azzera anche le preferenze). Eliminare un progetto dall'app rimuove soltanto il suo record nel database: Localis non cancella file sul disco.
 
 ## Verifiche
 
@@ -102,7 +102,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Test end-to-end sull'app desktop vera: vedi le istruzioni in testa a [`e2e/native.mjs`](e2e/native.mjs) (Linux, richiede `tauri-driver` e `WebKitWebDriver`).
+Test end-to-end sull'app desktop vera (Linux): crea, valida, riavvia, elimina, usando una directory dati temporanea isolata. Richiede `WebKitWebDriver` (pacchetto `webkit2gtk-driver`), `tauri-driver` (`cargo install tauri-driver --locked`) e, senza display, `xvfb-run`. Dettagli in testa a [`e2e/native.mjs`](e2e/native.mjs).
+
+```bash
+npm run tauri build -- --debug --no-bundle
+```
+
+```bash
+node e2e/native.mjs
+```
 
 ## Struttura
 
