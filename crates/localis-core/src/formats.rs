@@ -153,8 +153,17 @@ pub fn detect_format(file_name: &str, bytes: &[u8]) -> Result<DetectedFormat> {
                 (DocumentKind::Markdown, "text/markdown")
             };
             let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-            if sniffed != Sniffed::Other || std::str::from_utf8(body).is_err() || body.contains(&0)
-            {
+            // `%PDF-` is tolerated anywhere in the first KiB only to recognise PDFs; a text file
+            // that merely mentions it is still text. Binary signatures at offset 0 are not.
+            let binary_signature = match sniffed {
+                Sniffed::Other => false,
+                Sniffed::Pdf => body.starts_with(b"%PDF-"),
+                _ => true,
+            };
+            if binary_signature {
+                return Err(mismatch("un file di testo"));
+            }
+            if std::str::from_utf8(body).is_err() || body.contains(&0) {
                 return Err(CoreError::unsupported(
                     "Formato non supportato: il file di testo deve essere in UTF-8.",
                 ));
@@ -224,5 +233,25 @@ mod tests {
             detect_format("a.txt", b"%PDF-1.4 fake"),
             Err(CoreError::Unsupported { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod pdf_marker_tests {
+    use super::*;
+
+    #[test]
+    fn text_mentioning_pdf_marker_is_still_text() {
+        let f =
+            detect_format("nota.txt", "Nota con %PDF-1.4 citato nel testo.".as_bytes()).unwrap();
+        assert_eq!(f.kind, DocumentKind::Text);
+        let f = detect_format("nota.md", b"# Titolo\n\nVedi %PDF-1.7.").unwrap();
+        assert_eq!(f.kind, DocumentKind::Markdown);
+    }
+
+    #[test]
+    fn pdf_renamed_to_txt_is_rejected_as_mismatch() {
+        let err = detect_format("finto.txt", b"%PDF-1.4\n%...").unwrap_err();
+        assert!(err.to_string().contains("non è un file di testo"), "{err}");
     }
 }

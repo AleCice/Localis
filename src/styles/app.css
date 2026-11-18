@@ -1795,3 +1795,8 @@ mark {
     outline: 2px solid CanvasText;
   }
 }
+
+/* In the stacked search-results header the title must not grow (it flexes in .pane-head rows). */
+.search-results .pane-title {
+  flex: none;
+}

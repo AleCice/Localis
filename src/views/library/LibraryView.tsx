@@ -160,6 +160,18 @@ function Library({ project, sidebarToggle }: { project: Project; sidebarToggle: 
     return () => window.clearTimeout(timer);
   }, [query]);
 
+  // Changes when the searchable set changes (an extraction finishes, a version or document is
+  // added or removed), so open results refresh without the user searching again.
+  const searchableKey = useMemo(
+    () =>
+      store.documents
+        .filter((d) => d.current.textStatus === "extracted")
+        .map((d) => d.current.id)
+        .sort()
+        .join(","),
+    [store.documents],
+  );
+
   useEffect(() => {
     const id = ++searchId.current;
     setSearchError(null);
@@ -182,7 +194,7 @@ function Library({ project, sidebarToggle }: { project: Project; sidebarToggle: 
         setSearching(false);
       },
     );
-  }, [submitted, project.id]);
+  }, [submitted, project.id, searchableKey]);
 
   // ---- Navigation
   const openDocument = (doc: LibraryDocument, nextTarget: ViewerTarget | null = null) => {
