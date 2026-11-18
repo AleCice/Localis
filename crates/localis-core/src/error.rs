@@ -49,9 +49,7 @@ impl CoreError {
     /// Field concerned, for validation and duplicate errors.
     pub fn field(&self) -> Option<&'static str> {
         match self {
-            CoreError::Validation { field, .. } | CoreError::Duplicate { field, .. } => {
-                Some(field)
-            }
+            CoreError::Validation { field, .. } | CoreError::Duplicate { field, .. } => Some(field),
             _ => None,
         }
     }

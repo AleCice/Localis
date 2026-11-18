@@ -173,9 +173,10 @@ impl Store {
             return Err(duplicate_name());
         }
 
-        let now: String = tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |r| {
-            r.get(0)
-        })?;
+        let now: String =
+            tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |r| {
+                r.get(0)
+            })?;
         let project = Project {
             id: uuid::Uuid::new_v4().to_string(),
             name,

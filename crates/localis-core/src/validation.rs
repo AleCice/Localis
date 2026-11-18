@@ -107,11 +107,17 @@ mod tests {
         assert!(validate_description(Some(&"x".repeat(DESCRIPTION_MAX))).is_ok());
         assert!(matches!(
             validate_description(Some(&"x".repeat(DESCRIPTION_MAX + 1))),
-            Err(CoreError::Validation { field: "description", .. })
+            Err(CoreError::Validation {
+                field: "description",
+                ..
+            })
         ));
         assert!(matches!(
             validate_description(Some("a\u{0}b")),
-            Err(CoreError::Validation { field: "description", .. })
+            Err(CoreError::Validation {
+                field: "description",
+                ..
+            })
         ));
     }
 

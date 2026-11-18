@@ -19,7 +19,7 @@ impl AppState {
         }
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, Store>, AppError> {
+    pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Store>, AppError> {
         match &self.store {
             Ok(mutex) => mutex
                 .lock()

@@ -164,7 +164,11 @@ fn newer_schema_version_is_refused() {
 #[test]
 fn opening_a_non_database_file_is_a_storage_error() {
     let (_dir, path) = temp_db();
-    std::fs::write(&path, b"this is not a sqlite database, just synthetic bytes....").unwrap();
+    std::fs::write(
+        &path,
+        b"this is not a sqlite database, just synthetic bytes....",
+    )
+    .unwrap();
     let err = Store::open(&path).unwrap_err();
     assert!(matches!(err, CoreError::Storage { .. }), "{err:?}");
     assert!(err.detail().is_some());
@@ -338,7 +342,12 @@ fn delete_removes_only_the_record_and_persists() {
 fn delete_unknown_id_is_not_found() {
     let mut store = Store::open_in_memory().unwrap();
     create(&mut store, "Uno");
-    for id in ["", "non-esiste", "00000000-0000-4000-8000-000000000000", "' OR 1=1 --"] {
+    for id in [
+        "",
+        "non-esiste",
+        "00000000-0000-4000-8000-000000000000",
+        "' OR 1=1 --",
+    ] {
         assert!(matches!(
             store.delete_project(id).unwrap_err(),
             CoreError::NotFound { .. }
@@ -375,11 +384,31 @@ fn list_ordered_by_updated_then_created_then_id() {
         )
         .unwrap();
     };
-    set(&ids[0], "2026-01-01T00:00:00.000Z", "2026-03-01T00:00:00.000Z");
-    set(&ids[1], "2026-01-02T00:00:00.000Z", "2026-02-01T00:00:00.000Z");
-    set(&ids[2], "2026-01-03T00:00:00.000Z", "2026-02-01T00:00:00.000Z");
-    set(&ids[3], "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
-    set(&ids[4], "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
+    set(
+        &ids[0],
+        "2026-01-01T00:00:00.000Z",
+        "2026-03-01T00:00:00.000Z",
+    );
+    set(
+        &ids[1],
+        "2026-01-02T00:00:00.000Z",
+        "2026-02-01T00:00:00.000Z",
+    );
+    set(
+        &ids[2],
+        "2026-01-03T00:00:00.000Z",
+        "2026-02-01T00:00:00.000Z",
+    );
+    set(
+        &ids[3],
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:00.000Z",
+    );
+    set(
+        &ids[4],
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:00.000Z",
+    );
     drop(conn);
 
     let names: Vec<String> = Store::open(&path)
