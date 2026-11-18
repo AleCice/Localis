@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { BooksIcon, ChatIcon, ChevronIcon, FolderIcon, SettingsIcon } from "./Icons";
 
-export type ViewId = "projects" | "settings";
+export type ViewId = "projects" | "library" | "settings";
 
 /** How the sidebar is drawn right now. "overlay" is the expanded sidebar over narrow content. */
 export type SidebarDisplay = "expanded" | "collapsed" | "overlay" | "hidden";
@@ -22,7 +22,7 @@ interface NavEntry {
 
 const ENTRIES: NavEntry[] = [
   { label: "Progetti", icon: <FolderIcon />, view: "projects" },
-  { label: "Libreria", icon: <BooksIcon /> },
+  { label: "Libreria", icon: <BooksIcon />, view: "library" },
   { label: "Chat", icon: <ChatIcon /> },
   { label: "Impostazioni", icon: <SettingsIcon />, view: "settings" },
 ];

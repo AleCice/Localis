@@ -71,3 +71,73 @@ export const AlertIcon = () => (
     <path d="M12 7.5v5.5M12 16.2v.3" />
   </Icon>
 );
+
+export const CaretIcon = ({ open }: { open: boolean }) => (
+  <Icon width="16" height="16">{open ? <path d="m6 9.5 6 6 6-6" /> : <path d="m9.5 6 6 6-6 6" />}</Icon>
+);
+
+export const UploadIcon = () => (
+  <Icon>
+    <path d="M12 15.5V4.5M7.5 9 12 4.5 16.5 9" />
+    <path d="M4.5 14.5v3a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-3" />
+  </Icon>
+);
+
+export const SearchIcon = () => (
+  <Icon>
+    <circle cx="10.5" cy="10.5" r="6" />
+    <path d="m15 15 4.5 4.5" />
+  </Icon>
+);
+
+export const FolderPlusIcon = () => (
+  <Icon>
+    <path d="M3.5 7.5a2 2 0 0 1 2-2h3.6l2 2.2h7.4a2 2 0 0 1 2 2v7.8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z" />
+    <path d="M12 11v5M9.5 13.5h5" />
+  </Icon>
+);
+
+export const InfoIcon = () => (
+  <Icon>
+    <circle cx="12" cy="12" r="8.5" />
+    <path d="M12 11v5.5M12 7.8v.2" />
+  </Icon>
+);
+
+export const ArrowLeftIcon = () => (
+  <Icon>
+    <path d="M19 12H5M11 6l-6 6 6 6" />
+  </Icon>
+);
+
+export const MinusIcon = () => (
+  <Icon>
+    <path d="M5 12h14" />
+  </Icon>
+);
+
+export const FitWidthIcon = () => (
+  <Icon>
+    <path d="M4 5v14M20 5v14M8 12h8M10.5 9.5 8 12l2.5 2.5M13.5 9.5 16 12l-2.5 2.5" />
+  </Icon>
+);
+
+export const CopyIcon = () => (
+  <Icon>
+    <rect x="8.5" y="8.5" width="11" height="11" rx="2" />
+    <path d="M15.5 5.5v-.5a1.5 1.5 0 0 0-1.5-1.5H6A1.5 1.5 0 0 0 4.5 5v8A1.5 1.5 0 0 0 6 14.5h.5" />
+  </Icon>
+);
+
+export const CloseIcon = () => (
+  <Icon>
+    <path d="m6.5 6.5 11 11M17.5 6.5l-11 11" />
+  </Icon>
+);
+
+export const PanelIcon = () => (
+  <Icon>
+    <rect x="3.5" y="4.5" width="17" height="15" rx="2.5" />
+    <path d="M9.5 4.5v15" />
+  </Icon>
+);

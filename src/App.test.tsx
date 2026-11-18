@@ -8,7 +8,14 @@ import { makeProject } from "./test/fixtures";
 import { setSystemDark } from "./test/setup";
 
 vi.mock("./api/client", () => ({
-  api: { listProjects: vi.fn(), createProject: vi.fn(), deleteProject: vi.fn() },
+  api: {
+    listProjects: vi.fn(),
+    createProject: vi.fn(),
+    deleteProject: vi.fn(),
+    listFolders: vi.fn(),
+    listDocuments: vi.fn(),
+    listJobs: vi.fn(),
+  },
 }));
 
 const mockedApi = vi.mocked(api);
@@ -26,6 +33,9 @@ function renderApp({ onboarded = true }: { onboarded?: boolean } = {}) {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  mockedApi.listDocuments.mockResolvedValue([]);
+  mockedApi.listFolders.mockResolvedValue([]);
+  mockedApi.listJobs.mockResolvedValue([]);
 });
 
 describe("onboarding", () => {
@@ -49,7 +59,7 @@ describe("onboarding", () => {
 
     expect(await screen.findByRole("option", { name: "Analisi 1" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Benvenuto in Localis" })).not.toBeInTheDocument();
-    expect(window.localStorage.getItem("localis.onboarded")).toBe("true");
+    await waitFor(() => expect(window.localStorage.getItem("localis.onboarded")).toBe("true"));
   });
 
   it("«Crea il primo progetto» opens the creation form with focus on Nome", async () => {
@@ -227,7 +237,9 @@ describe("delete", () => {
     const trigger = await screen.findByRole("button", { name: "Elimina" });
     await user.click(trigger);
     let dialog = screen.getByRole("alertdialog", { name: "Eliminare «Da tenere»?" });
-    expect(dialog).toHaveAccessibleDescription(/non vengono eliminati/);
+    expect(dialog).toHaveAccessibleDescription(
+      "Il progetto verrà rimosso da Localis insieme ai suoi documenti e alle copie degli originali conservate da Localis. I file sul tuo disco non vengono toccati.",
+    );
     const cancel = within(dialog).getByRole("button", { name: "Annulla" });
     expect(cancel).toHaveFocus();
     await user.click(cancel);
@@ -318,20 +330,52 @@ describe("settings", () => {
 });
 
 describe("shell", () => {
-  it("marks Libreria and Chat as unavailable and does nothing when activated", async () => {
+  it("marks only Chat as unavailable and does nothing when activated", async () => {
     withProjects([makeProject("Corso")]);
     const user = renderApp();
     await screen.findByRole("option", { name: "Corso" });
 
-    for (const label of ["Libreria", "Chat"]) {
-      const item = screen.getByRole("button", { name: label });
-      expect(item).toHaveAttribute("aria-disabled", "true");
-      expect(item).toHaveAccessibleDescription("Disponibile in una versione futura");
-      await user.click(item);
-      expect(item).not.toHaveAttribute("aria-current");
-    }
+    const chat = screen.getByRole("button", { name: "Chat" });
+    expect(chat).toHaveAttribute("aria-disabled", "true");
+    expect(chat).toHaveAccessibleDescription("Disponibile in una versione futura");
+    await user.click(chat);
+    expect(chat).not.toHaveAttribute("aria-current");
     expect(screen.getByRole("button", { name: "Progetti" })).toHaveAttribute("aria-current", "page");
     expect(screen.getByRole("heading", { level: 1, name: "Progetti" })).toBeInTheDocument();
+
+    const library = screen.getByRole("button", { name: "Libreria" });
+    expect(library).not.toHaveAttribute("aria-disabled");
+    expect(library).not.toHaveAccessibleDescription();
+  });
+
+  it("opens the Libreria of the selected project", async () => {
+    const project = makeProject("Tesi");
+    withProjects([makeProject("Corso"), project]);
+    const user = renderApp();
+    await user.click(await screen.findByRole("option", { name: "Tesi" }));
+
+    await user.click(screen.getByRole("button", { name: "Libreria" }));
+    expect(screen.getByRole("button", { name: "Libreria" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("heading", { level: 1, name: "Libreria" })).toBeInTheDocument();
+    expect(screen.getByText("Tesi", { selector: ".view-context" })).toBeInTheDocument();
+    await waitFor(() => expect(mockedApi.listDocuments).toHaveBeenCalledWith(project.id));
+  });
+
+  it("Libreria without projects points to Progetti", async () => {
+    withProjects([]);
+    const user = renderApp();
+    await screen.findByText(/Nessun progetto/);
+    await user.click(screen.getByRole("button", { name: "Libreria" }));
+    await user.click(screen.getByRole("button", { name: "Vai a Progetti" }));
+    expect(screen.getByRole("heading", { level: 1, name: "Progetti" })).toBeInTheDocument();
+  });
+
+  it("shows the real document count in the project detail", async () => {
+    withProjects([makeProject("Corso")]);
+    mockedApi.listDocuments.mockResolvedValue([{} as never, {} as never]);
+    renderApp();
+    const term = await screen.findByText("Documenti");
+    expect(term.nextElementSibling).toHaveTextContent("2");
   });
 
   it("collapses and hides the sidebar, persisting the state", async () => {

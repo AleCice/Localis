@@ -65,7 +65,7 @@ export function DeleteProjectDialog({ project, onCancel, onConfirm, focusAfterDe
             Eliminare «{target.name}»?
           </h2>
           <p id="delete-project-desc" className="dialog-text">
-            Il progetto verrà rimosso da Localis. I file sul disco non vengono eliminati.
+            Il progetto verrà rimosso da Localis insieme ai suoi documenti e alle copie degli originali conservate da Localis. I file sul tuo disco non vengono toccati.
           </p>
           {error ? <ErrorBanner error={error} /> : null}
           <div className="dialog-actions">

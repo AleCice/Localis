@@ -5,6 +5,7 @@ import { useMediaQuery } from "./hooks/useMediaQuery";
 import { useProjects } from "./hooks/useProjects";
 import { useTheme } from "./hooks/useTheme";
 import { readPref, STORAGE_KEYS, writePref } from "./lib/storage";
+import { LibraryView } from "./views/library/LibraryView";
 import { ProjectsView } from "./views/projects/ProjectsView";
 import { SettingsView } from "./views/SettingsView";
 
@@ -24,6 +25,8 @@ export function App() {
   const [theme, setTheme] = useTheme();
   const store = useProjects();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Same fallback as the Projects view: the first project when nothing (valid) is selected.
+  const selectedProject = store.projects.find((p) => p.id === selectedId) ?? store.projects[0] ?? null;
   const [onboarded, setOnboardedState] = useState(
     () => readPref(STORAGE_KEYS.onboarded, ["true", "false"] as const, "false") === "true",
   );
@@ -55,6 +58,19 @@ export function App() {
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [display]);
+
+  // A file dropped outside a drop target must not make the webview navigate to it.
+  useEffect(() => {
+    const guard = (event: DragEvent) => {
+      if (event.dataTransfer && Array.from(event.dataTransfer.types).includes("Files")) event.preventDefault();
+    };
+    window.addEventListener("dragover", guard);
+    window.addEventListener("drop", guard);
+    return () => {
+      window.removeEventListener("dragover", guard);
+      window.removeEventListener("drop", guard);
+    };
+  }, []);
 
   const markOnboarded = useCallback(() => {
     setOnboardedState(true);
@@ -107,6 +123,17 @@ export function App() {
             onSelect={setSelectedId}
             onboarded={onboarded}
             onOnboarded={markOnboarded}
+            sidebarToggle={sidebarToggle}
+            onOpenLibrary={() => {
+              if (selectedProject) setSelectedId(selectedProject.id);
+              setView("library");
+            }}
+          />
+        ) : view === "library" ? (
+          <LibraryView
+            project={selectedProject}
+            projectsStatus={store.status}
+            onGoToProjects={() => setView("projects")}
             sidebarToggle={sidebarToggle}
           />
         ) : (

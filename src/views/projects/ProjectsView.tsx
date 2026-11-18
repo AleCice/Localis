@@ -21,9 +21,10 @@ interface ProjectsViewProps {
   onboarded: boolean;
   onOnboarded: () => void;
   sidebarToggle: ReactNode;
+  onOpenLibrary: () => void;
 }
 
-export function ProjectsView({ store, selectedId, onSelect, onboarded, onOnboarded, sidebarToggle }: ProjectsViewProps) {
+export function ProjectsView({ store, selectedId, onSelect, onboarded, onOnboarded, sidebarToggle, onOpenLibrary }: ProjectsViewProps) {
   const { status, loadError, projects } = store;
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<Project | null>(null);
@@ -115,7 +116,7 @@ export function ProjectsView({ store, selectedId, onSelect, onboarded, onOnboard
                 <ProjectList projects={projects} selectedId={selected?.id ?? null} onSelect={onSelect} />
               </div>
               <div className="projects-detail-pane">
-                {selected ? <ProjectDetail project={selected} onDelete={() => setDeleting(selected)} /> : null}
+                {selected ? <ProjectDetail project={selected} onDelete={() => setDeleting(selected)} onOpenLibrary={onOpenLibrary} /> : null}
               </div>
             </div>
           ) : null}
