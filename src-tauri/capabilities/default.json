@@ -1,11 +1,28 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window: only the Localis project commands.",
-  "windows": ["main"],
+  "description": "Main window: only Localis' own commands (projects, library, jobs). No plugins.",
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "allow-list-projects",
     "allow-create-project",
-    "allow-delete-project"
+    "allow-delete-project",
+    "allow-list-folders",
+    "allow-create-folder",
+    "allow-rename-folder",
+    "allow-delete-folder",
+    "allow-list-documents",
+    "allow-list-versions",
+    "allow-import-document",
+    "allow-import-version",
+    "allow-move-document",
+    "allow-delete-document",
+    "allow-read-original",
+    "allow-get-text",
+    "allow-search",
+    "allow-list-jobs",
+    "allow-retry-job"
   ]
 }
