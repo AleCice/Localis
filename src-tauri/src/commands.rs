@@ -6,25 +6,40 @@ use tauri::State;
 
 use crate::error::AppError;
 
-/// Managed state: the open store, or the error that prevented opening it, so every
-/// command can report it to the UI instead of the app failing silently.
+type Opener = Box<dyn Fn() -> Result<Store, AppError> + Send + Sync>;
+
+/// Managed state: the store, opened lazily. If opening fails, the error is returned to
+/// the UI and the next command tries again, so «Riprova» can recover from a transient
+/// failure (e.g. the database locked by another process) without restarting the app.
 pub struct AppState {
-    store: Result<Mutex<Store>, AppError>,
+    opener: Opener,
+    store: Mutex<Option<Store>>,
 }
 
 impl AppState {
-    pub fn new(store: Result<Store, AppError>) -> Self {
+    pub fn new(opener: impl Fn() -> Result<Store, AppError> + Send + Sync + 'static) -> Self {
+        let store = opener().ok();
         AppState {
-            store: store.map(Mutex::new),
+            opener: Box::new(opener),
+            store: Mutex::new(store),
         }
     }
 
-    pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Store>, AppError> {
-        match &self.store {
-            Ok(mutex) => mutex
-                .lock()
-                .map_err(|_| AppError::internal("store mutex poisoned")),
-            Err(err) => Err(err.clone()),
+    /// Runs `f` with the open store, opening it first if needed.
+    pub(crate) fn with_store<R>(
+        &self,
+        f: impl FnOnce(&mut Store) -> Result<R, AppError>,
+    ) -> Result<R, AppError> {
+        let mut guard: MutexGuard<'_, Option<Store>> = self
+            .store
+            .lock()
+            .map_err(|_| AppError::internal("store mutex poisoned"))?;
+        if guard.is_none() {
+            *guard = Some((self.opener)()?);
+        }
+        match guard.as_mut() {
+            Some(store) => f(store),
+            None => Err(AppError::internal("store not available")),
         }
     }
 }
@@ -66,12 +81,13 @@ pub struct NewProjectInput {
 
 #[tauri::command]
 pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectDto>, AppError> {
-    let store = state.lock()?;
-    Ok(store
-        .list_projects()?
-        .into_iter()
-        .map(ProjectDto::from)
-        .collect())
+    state.with_store(|store| {
+        Ok(store
+            .list_projects()?
+            .into_iter()
+            .map(ProjectDto::from)
+            .collect())
+    })
 }
 
 #[tauri::command]
@@ -79,17 +95,16 @@ pub async fn create_project(
     state: State<'_, AppState>,
     input: NewProjectInput,
 ) -> Result<ProjectDto, AppError> {
-    let mut store = state.lock()?;
-    let project = store.create_project(NewProject {
-        name: input.name,
-        description: input.description,
-    })?;
-    Ok(project.into())
+    state.with_store(|store| {
+        let project = store.create_project(NewProject {
+            name: input.name,
+            description: input.description,
+        })?;
+        Ok(project.into())
+    })
 }
 
 #[tauri::command]
 pub async fn delete_project(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
-    let mut store = state.lock()?;
-    store.delete_project(&id)?;
-    Ok(())
+    state.with_store(|store| Ok(store.delete_project(&id)?))
 }

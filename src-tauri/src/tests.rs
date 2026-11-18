@@ -144,18 +144,37 @@ fn new_project_input_description_is_optional() {
 }
 
 #[test]
-fn failed_open_is_reported_by_every_lock() {
+fn failed_open_is_reported_and_retried() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     let open_err: AppError = CoreError::Storage {
         message: "Impossibile aprire il database.".into(),
         detail: "synthetic failure".into(),
     }
     .into();
-    let state = AppState::new(Err(open_err.clone()));
-    for _ in 0..2 {
-        assert_eq!(state.lock().unwrap_err(), open_err);
-    }
-    let ok = AppState::new(Ok(Store::open_in_memory().unwrap()));
-    assert!(ok.lock().unwrap().list_projects().unwrap().is_empty());
+    // Fails on the first two attempts (startup + first command), then succeeds.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&attempts);
+    let err = open_err.clone();
+    let state = AppState::new(move || {
+        if counter.fetch_add(1, Ordering::SeqCst) < 2 {
+            Err(err.clone())
+        } else {
+            Ok(Store::open_in_memory().unwrap())
+        }
+    });
+    assert_eq!(
+        state.with_store(|s| Ok(s.list_projects()?)).unwrap_err(),
+        open_err
+    );
+    assert!(state
+        .with_store(|s| Ok(s.list_projects()?))
+        .unwrap()
+        .is_empty());
+    // Once open, the store is reused rather than reopened.
+    state.with_store(|s| Ok(s.list_projects()?)).unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
 }
 
 /// Unique temporary directory (std only: tempfile is not a dependency of this crate).
