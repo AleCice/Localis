@@ -2,7 +2,14 @@
 
 App desktop local-first per studio e ricerca. Ogni **progetto** è un contenitore libero (un corso, una tesi, una ricerca) in cui, nelle prossime versioni, raccoglierai documenti e lezioni, farai domande con citazioni verificabili e produrrai materiali di studio collegati alle fonti.
 
-**Versione 0.1 — Fondazioni.** Oggi Localis permette di creare, ritrovare dopo il riavvio ed eliminare progetti, con onboarding, tema chiaro/scuro e una shell con navigazione. Libreria e Chat compaiono nella navigazione ma non sono ancora disponibili. Visione e versioni: [`docs/ROADMAP.md`](docs/ROADMAP.md). Stato verificato: [`docs/STATUS.md`](docs/STATUS.md).
+**Versione 0.2 — Libreria documenti.** Oggi Localis permette di:
+- creare, ritrovare ed eliminare progetti (onboarding, tema chiaro/scuro);
+- importare in un progetto PDF, TXT, Markdown, DOCX e immagini (PNG, JPEG, GIF, WebP), fino a 200 MB per file, con il pulsante «Importa» o trascinandoli nella finestra;
+- organizzarli in cartelle e caricarne nuove versioni;
+- aprirli: PDF e immagini nel viewer, gli altri formati come testo estratto;
+- cercare nel testo estratto, con l'indicazione della pagina o del blocco.
+
+La Chat compare nella navigazione ma non è ancora disponibile. Visione e versioni: [`docs/ROADMAP.md`](docs/ROADMAP.md). Stato verificato: [`docs/STATUS.md`](docs/STATUS.md).
 
 Tutti i dati restano sul tuo computer. Nessun account, nessun servizio esterno, nessuna telemetria.
 
@@ -70,7 +77,20 @@ Il database SQLite `localis.db` sta nella directory dati dell'app, mai nel repos
 
 Le preferenze dell'interfaccia (tema, stato della sidebar, onboarding completato) sono nello storage locale della webview: su Linux in `app.localis.desktop/localstorage/`, su macOS e Windows nella cartella dati della webview di sistema (non verificato su queste piattaforme).
 
-Per ripartire da zero, chiudi Localis e cancella la cartella `app.localis.desktop` indicata sopra (su Linux azzera anche le preferenze). Eliminare un progetto dall'app rimuove soltanto il suo record nel database: Localis non cancella file sul disco.
+### Documenti importati
+
+Localis **copia** ogni file importato nel proprio archivio, la sottocartella `originals/` della cartella dati, e non tiene riferimenti ai file sul tuo disco. Così le copie restano valide anche se sposti o cancelli i file di partenza, al costo dello spazio occupato.
+
+- Ogni copia è salvata con il nome del suo hash SHA-256 (`originals/ab/abcd…`). È identica byte per byte al file importato e viene ricontrollata ogni volta che la apri: se manca o è stata alterata, Localis lo dice invece di mostrarla.
+- Lo stesso file importato due volte nello stesso progetto viene riconosciuto come «già presente». In progetti diversi è consentito e la copia viene condivisa.
+- Il testo estratto e l'indice di ricerca stanno nel database, separati dagli originali. Non vengono generate anteprime.
+- Un PDF senza testo (per esempio una scansione) si apre ma non è ricercabile: l'OCR non c'è ancora. Le immagini si aprono ma non sono ricercabili.
+
+### Cancellazioni e reset
+
+Eliminare un documento o un progetto rimuove i record e le copie di Localis che nessun altro documento usa più. **I file sul tuo disco non vengono mai toccati.**
+
+Per ripartire da zero, chiudi Localis e cancella la cartella `app.localis.desktop` indicata sopra. Così rimuovi database e archivio e, su Linux, anche le preferenze.
 
 ## Verifiche
 
@@ -102,7 +122,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Test end-to-end sull'app desktop vera (Linux): crea, valida, riavvia, elimina, usando una directory dati temporanea isolata. Richiede `WebKitWebDriver` (pacchetto `webkit2gtk-driver`), `tauri-driver` (`cargo install tauri-driver --locked`) e, senza display, `xvfb-run`. Dettagli in testa a [`e2e/native.mjs`](e2e/native.mjs).
+Test end-to-end sull'app desktop vera (Linux), con una directory dati temporanea isolata. `e2e/native.mjs` copre i progetti: crea, valida, riavvia, elimina. `e2e/library.mjs` copre la libreria con file sintetici: import, estrazione, ricerca, viewer, cartelle, versioni, duplicati, integrità, cancellazioni, riavvio. Richiede `WebKitWebDriver` (pacchetto `webkit2gtk-driver`), `tauri-driver` (`cargo install tauri-driver --locked`) e, senza display, `xvfb-run`. Dettagli in testa a [`e2e/native.mjs`](e2e/native.mjs).
 
 ```bash
 npm run tauri build -- --debug --no-bundle
@@ -110,6 +130,10 @@ npm run tauri build -- --debug --no-bundle
 
 ```bash
 node e2e/native.mjs
+```
+
+```bash
+node e2e/library.mjs
 ```
 
 ## Struttura

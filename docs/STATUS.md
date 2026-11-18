@@ -1,74 +1,98 @@
 # Stato di Localis
 
-**Versione corrente: 0.1 — Fondazioni.** Stato: completata e verificata su Linux (container headless). Non verificata su macOS e Windows.
+**Versione corrente: 0.2 — Libreria documenti.** Completata e verificata su Linux, in un container senza display (Xvfb). Non verificata su macOS e Windows.
 
 Ultimo aggiornamento: 18 novembre 2026.
 
-## Piano 0.1 (seguito)
+## 0.2 — Requisiti della roadmap
 
-1. Bootstrap: workspace Cargo (`crates/localis-core` + `src-tauri`), Vite + React + TypeScript, Tauri v2, lockfile.
-2. Contratto frontend ↔ backend fissato in `src/api/types.ts` prima del lavoro in parallelo.
-3. Backend: SQLite con migrazioni versionate, validazione, tre comandi Tauri, errori strutturati, test su DB temporanei.
-4. Frontend: shell con sidebar, onboarding, progetti (elenco, dettaglio, creazione, eliminazione), impostazioni tema, stati vuoto/caricamento/errore.
-5. Integrazione, verifiche automatiche, build nativa, QA indipendente con E2E sull'app vera, correzioni.
+| Requisito | Stato | Evidenza |
+|---|---|---|
+| Import di PDF, TXT, Markdown, DOCX e immagini | ✅ | `e2e/library.mjs` importa nell'app vera, tramite il vero `<input type=file>`, un PDF con testo, un PDF «scansionato», un DOCX, un TXT, un MD e un PNG. JPEG, GIF e WebP sono coperti solo dai test Rust. |
+| Metadati | ✅ | sha256, dimensione, tipo, numero di pagine, dimensioni dell'immagine e data di modifica del file letti dall'app coincidono con i file di prova. |
+| Hash e versioni | ✅ | Nuova versione di un TXT: la versione 2 diventa corrente; la ricerca trova il testo nuovo e non quello vecchio; le copie di entrambe le versioni restano nell'archivio. |
+| Cartelle di progetto | ✅ | Creazione, spostamento di un documento, eliminazione rifiutata su cartella non vuota, eliminazione di cartella vuota, persistenza dopo il riavvio. |
+| Viewer PDF | ✅ | La pagina disegnata non è vuota; un risultato di ricerca apre la pagina giusta; navigazione e zoom funzionano; nessuna violazione della CSP registrata nella webview. |
+| Viewer immagini | ✅ | PNG mostrato alla dimensione naturale. |
+| Ricerca FTS5 sul testo estratto | ✅ | La ricerca ignora gli accenti («citta» trova «città»); funzionano prefissi e risultati con pagina o blocco ed evidenziazione; 10 query con caratteri speciali FTS non danno errori; la ricerca copre solo la versione corrente. |
+| Job queue con stati e retry | ✅ | Un PDF corrotto finisce in errore con «Riprova»; il nuovo tentativo viene eseguito (`attempts` passa da 1 a 2); riprovare un job completato restituisce `conflict`. |
+| Originali conservati e separati dai derivati | ✅ | Le copie in `originals/<2>/<sha256>` sono identiche byte per byte ai file di prova; i file di partenza non vengono modificati; testo estratto e indice stanno solo nel database; non vengono generate anteprime. |
+| Copia o riferimento documentato | ✅ | Scelta: **copia** (README, sezione «Documenti importati»). |
+| Duplicati | ✅ | Reimportare un file nello stesso progetto dà «Già presente» e non crea un documento; in un altro progetto il documento viene creato e la copia condivisa. |
+| File mancanti o corrotti | ✅ | Una copia alterata o mancante nell'archivio viene segnalata nel viewer (errore `integrity`). Vengono rifiutati: `.exe`, un file con estensione e contenuto diversi, un file vuoto, nomi e header non validi. |
+| PDF scansito visualizzabile ma non ricercabile | ✅ | Stato «Senza testo ricercabile», nessun testo indicizzato, nota che l'OCR non è disponibile. |
+| Cancellazioni | ✅ | Eliminare un documento rimuove la sua copia; eliminare un progetto rimuove le sue copie e conserva quelle condivise con altri progetti; nessun file fuori da `originals/` viene toccato. |
+| Persistenza dopo il riavvio | ✅ | Documenti, cartelle, versioni e stati di estrazione restano dopo la riapertura. |
 
-## Criteri di accettazione
+## 0.1 — Fondazioni
 
-| # | Criterio | Stato | Evidenza |
-|---|---|---|---|
-| 1 | L'app si avvia seguendo il README | ✅ Linux | Prerequisiti installati come da README; `npm ci`, `npm run tauri build -- --debug --no-bundle` riuscito; il binario parte sotto Xvfb (E2E). `npm run tauri dev` non provato con display reale. |
-| 2 | Primo avvio: creo un progetto senza servizi esterni | ✅ | E2E nativo: onboarding → «Crea il primo progetto» → progetto creato e selezionato. Nessuna rete a runtime (CSP `connect-src` limitata all'IPC, verificato che `fetch` esterno è bloccato). |
-| 3 | Nome vuoto rifiutato con messaggio chiaro | ✅ | E2E nativo: nome vuoto e solo spazi → «Inserisci un nome.» accanto al campo, focus sul campo; duplicato con maiuscole diverse rifiutato dal backend reale. Lunghezza massima coperta da test Rust e Vitest. |
-| 4 | Dopo il riavvio ritrovo progetto e tema | ✅ | E2E nativo: chiusura e riapertura con la stessa directory dati → progetto presente, onboarding non mostrato, tema scuro applicato. |
-| 5 | Annulla senza effetti; conferma elimina in modo permanente | ✅ | E2E nativo: Annulla ed Esc lasciano il progetto; conferma lo rimuove; dopo il riavvio resta eliminato. |
-| 6 | Controlli principali da tastiera con focus visibile | ✅ | Playwright (UI con backend finto) e WebDriver sulla webview nativa: ordine di tabulazione logico, anello di focus visibile, dialoghi con focus intrappolato, Esc e ritorno del focus, elenco navigabile con frecce/Home/Fine. |
-| 7 | Nessun overflow orizzontale, controlli raggiungibili | ✅ con riserva | Nessun overflow a 480, 720, 1280, 1920 px e a zoom 200% (anche 480 px al 200%, dopo correzione). Finestra nativa a 480×400, 720×600, 1920×1080. Massimizzazione e fullscreen reali non provati: Xvfb non ha window manager. |
-| 8 | Test automatici su DB di test | ✅ | `crates/localis-core/tests/store.rs` (16 test): migrazione da zero, riapertura senza perdite né duplicati, DB più recente rifiutato, creazione, validazione, duplicati, persistenza, cancellazione, `not_found`. |
+Tutti gli 8 criteri di accettazione sono verificati: il dettaglio è nella cronologia Git di questo file. `e2e/native.mjs` passa ancora 39 controlli su 39 sulla 0.2.
 
 ## Verifiche eseguite (ultima esecuzione)
 
 | Comando | Esito |
 |---|---|
 | `npm run typecheck` | ok |
-| `npm test` | 21/21 test passati |
-| `npm run build` | ok (il codice del backend finto non entra nel bundle) |
+| `npm test` (3 esecuzioni) | 43/43 ogni volta |
+| `npm run build` | ok; il backend finto non è nel bundle; pdf.js viene caricato solo quando si apre un PDF |
+| `npm audit` | 0 vulnerabilità |
 | `cargo fmt --all --check` | ok |
-| `cargo clippy --workspace --all-targets -- -D warnings` | ok, nessun warning |
-| `cargo test --workspace` | 33/33 passati: 8 nell'app Tauri, 9 unitari e 16 di integrazione nel core |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ok |
+| `cargo test --workspace` | 94/94: 19 nell'app Tauri, 32 unitari del core, 27 di integrazione della libreria, 16 dei progetti |
 | `npm run tauri build -- --debug --no-bundle` | ok |
-| `node e2e/native.mjs` (app nativa, SQLite reale, Xvfb + tauri-driver) | 39/39 controlli passati |
-| Playwright su `npm run dev:mock` (tastiera, focus, layout, zoom, reduced motion) | 32/32 controlli passati; script del QA non incluso nel repository |
+| `node e2e/library.mjs` (app nativa) | 98/98 |
+| `node e2e/native.mjs` (app nativa) | 39/39 |
+| Playwright su `npm run dev:mock`: tastiera e layout a 480, 720, 1280 e 1920 px e zoom al 200% con un PDF aperto | 38/39; l'unico fallimento riguarda il comportamento di Chromium con Tab nei dialoghi, mentre nella webview nativa il focus resta nel dialogo. Lo script è del QA e non è nel repository. |
 
-Non eseguito: `npm run tauri build` di release con installer, avvio su macOS e Windows, prova con screen reader.
+## Decisioni 0.2
 
-## Decisioni
-
-- **Core separato da Tauri** (`crates/localis-core`): dominio e SQLite si testano senza librerie grafiche.
-- **SQLite tramite `rusqlite` con `bundled`**: nessuna dipendenza dalla versione di SQLite di sistema. Migrazioni in un elenco statico tracciato con `PRAGMA user_version`, ciascuna in una transazione; un database creato da una versione più recente viene rifiutato senza modifiche.
-- **Unicità del nome** controllata nel core con confronto Unicode case-insensitive dopo il trim, più un indice `NOCASE` come rete di sicurezza.
-- **Firma di `create_project`**: il comando riceve `{ input: { name, description? } }` invece dei campi al primo livello indicati nel prompt; il contratto è coerente in `src/api/types.ts`, `client.ts` e `commands.rs`.
-- **Apertura del database pigra con nuovo tentativo**: se all'avvio il database non si apre, l'app parte comunque e mostra l'errore; ogni comando successivo (anche «Riprova») ritenta l'apertura.
-- **Permessi minimi**: `build.rs` genera permessi solo per i tre comandi e la capability li abilita soltanto per la finestra principale; nessun plugin Tauri. CSP restrittiva verificata nell'E2E.
-- **Preferenze UI in `localStorage`** (`localis.theme`, `localis.sidebar`, `localis.onboarded`), con accessi protetti; i progetti solo in SQLite.
-- **Backend finto in memoria** (`src/api/mock.ts`) solo per `npm run dev:mock` e test nel browser; non entra nella build di produzione.
+- **Copia degli originali**, scelta dall'utente. L'archivio è indirizzato per contenuto: i file prendono il nome dal loro SHA-256, la scrittura è atomica (file temporaneo e poi rinomina) e l'hash viene verificato a ogni lettura.
+- **Import tramite byte**: l'interfaccia legge il file scelto e lo invia al backend. Il backend non legge mai percorsi sul disco e non usa i plugin `fs` o `dialog`. Il drag & drop nativo della finestra è disattivato, così il trascinamento arriva all'interfaccia.
+- **Estrazione** in un worker in background con la propria connessione al database:
+  - PDF per pagina, con `lopdf` e un estrattore proprio. Ho scartato `pdf-extract` perché può far crollare l'app su PDF malformati.
+  - DOCX per paragrafo, TXT e Markdown per blocco.
+  - Limiti, `catch_unwind` e un timeout di 300 s.
+  - Nessun nuovo tentativo automatico: le estrazioni falliscono sempre allo stesso modo, quindi c'è solo «Riprova».
+- **Ricerca**: FTS5 con `unicode61 remove_diacritics 2`. Quello che scrivi viene diviso in parole e citato, mai passato come sintassi di ricerca. L'ultima parola vale anche come prefisso.
+- **pdf.js 6.5.438**:
+  - nessun fetch esterno, script, form o XFA; i decodificatori wasm sono disattivati;
+  - i link nei PDF non sono cliccabili;
+  - la 5.x è stata scartata per una vulnerabilità nota.
+- **Polling** dello stato dei job ogni secondo, solo mentre c'è un'estrazione in corso. Non servono permessi per gli eventi.
 
 ## Limiti noti
 
-- La sidebar in sovrapposizione nelle finestre strette non è modale: Tab raggiunge il contenuto dietro lo sfondo scuro. Esc, clic sullo sfondo o navigazione la chiudono.
-- La vista corrente non viene ricordata: l'app riapre sempre su Progetti.
-- Un cambio di tema fatto un istante prima di una chiusura forzata potrebbe non essere salvato, perché la webview scrive `localStorage` in modo asincrono. Non verificato.
-- Lo stato sincronizzato con il tema di sistema è verificato solo nei test Vitest e nel browser, non nella webview nativa.
+- **PDF:**
+  - Il testo dentro le form XObject non viene estratto, per sicurezza.
+  - L'ordine di lettura segue il contenuto del PDF.
+  - I PDF protetti da password non vengono estratti.
+  - Le immagini JPEG 2000 e JBIG2 nei PDF non vengono mostrate, perché servirebbe abilitare il wasm.
+  - I font non incorporati usano i font di sistema.
+- **Viewer PDF:** mostra una pagina alla volta, senza scorrimento continuo.
+- **Duplicati:** reimportare un file già presente non ripara una copia mancante o alterata nell'archivio.
+- **Job:** un'estrazione andata in timeout lascia il suo thread attivo finché termina da sola.
+- **Memoria:** un import tiene l'intero file in memoria, fino a 200 MB.
+- **Riprova:** l'elenco dei job è limitato agli ultimi 200, quindi il pulsante «Riprova» può mancare per errori molto vecchi.
+- **Interfaccia:**
+  - La sidebar in sovrapposizione nelle finestre strette non è modale.
+  - La vista corrente non viene ricordata.
+
+## Non verificato
+
+- macOS, Windows e build di release con installer.
+- Drag & drop reale da un file manager: WebDriver non lo permette e l'import è stato provato con il selettore di file.
+- Limite di 200 MB nell'app nativa: coperto solo dai test Rust.
+- Ripresa dei job interrotti da un crash e timeout di 300 s: coperti solo dai test Rust.
+- Layout stretto e zoom al 200% nella webview nativa con un PDF aperto: provati solo in Chromium.
+- Screen reader.
 
 ## Come verificare ciò che qui non è stato provato
 
-Su macOS o Windows, o su Linux con display:
+1. Avvia con `npm run tauri dev` (vedi README) su macOS o Windows, oppure su Linux con display.
+2. Trascina nella Libreria un PDF, un DOCX e un'immagine da un file manager: devono comparire, il PDF deve diventare «Ricercabile», l'immagine «Non ricercabile».
+3. Cerca una parola del PDF senza accenti e apri il risultato: il viewer deve aprirsi sulla pagina giusta.
+4. Riduci la finestra al minimo con il PDF aperto e prova lo zoom del sistema: non deve comparire lo scorrimento orizzontale.
 
-1. Installa i prerequisiti e avvia con `npm run tauri dev` (vedi README).
-2. Crea un progetto dall'onboarding, prova un nome vuoto, scegli il tema Scuro.
-3. Chiudi e riapri: progetto e tema devono esserci.
-4. Elimina: Annulla non cambia nulla; Elimina lo rimuove; riapri e controlla che non ricompaia.
-5. Massimizza e metti a schermo intero; poi riduci la finestra al minimo (480×400): nessuno scorrimento orizzontale, sidebar richiudibile.
+## Prossimo passo: 0.3 — Chat locale con fonti
 
-## Prossimo passo: 0.2 — Libreria documenti
-
-Primo lavoro: decidere e documentare il modello di archiviazione (copia degli originali nello storage dell'app oppure riferimenti ai file esterni), con migrazione 2 per documenti e versioni con hash, e import di file TXT e Markdown come primo formato. Poi PDF, DOCX, immagini, FTS5 e job queue. Vedi `docs/ROADMAP.md`.
+Primo lavoro: integrazione con LM Studio, cioè rilevare il server locale e i modelli disponibili e scegliere il modello, senza fallback silenziosi. Poi un retrieval iniziale su FTS5 che registra le evidenze passate al modello. Gli embedding locali vanno dichiarati solo quando esistono davvero. Vedi `docs/ROADMAP.md`.
