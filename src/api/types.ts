@@ -1,4 +1,4 @@
-// Contract between the React frontend and the Tauri backend (v0.1).
+// Contract between the React frontend and the Tauri backend (v0.1 projects, v0.2 library).
 // Owner: main agent. Mirrors the serde types in src-tauri/src/commands.rs.
 
 export interface Project {
@@ -29,7 +29,7 @@ export interface AppError {
   code: AppErrorCode;
   /** Short, user-facing message in Italian. */
   message: string;
-  /** Field concerned, for validation/duplicate errors ("name" | "description"). */
+  /** Field concerned, when tied to an input: "name", "description", "file", "parentId", "folderId". */
   field?: string;
   /** Technical diagnostics: never shown in the normal UI, only in an expandable detail. */
   detail?: string;
