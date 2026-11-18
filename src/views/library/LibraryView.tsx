@@ -71,6 +71,30 @@ function Library({ project, sidebarToggle }: { project: Project; sidebarToggle: 
   const stacked = useMediaQuery(LIBRARY_STACKED_QUERY);
 
   const [folderId, setFolderId] = useState<string | null>(null);
+  const [pendingFolderFocus, setPendingFolderFocus] = useState<string | null>(null);
+  // Runs after every render until the newly created folder's node exists, then focuses it.
+  // (Runs after the dialog's layout effect, so it wins over the dialog's return-focus.)
+  // The tree may re-render the node (e.g. while ancestors expand), so keep re-applying focus
+  // for a short settle window instead of focusing once.
+  useEffect(() => {
+    if (!pendingFolderFocus) return;
+    const node = document.getElementById(folderNodeId(pendingFolderFocus));
+    if (node && document.activeElement !== node) node.focus();
+  });
+  useEffect(() => {
+    if (!pendingFolderFocus) return;
+    const id = pendingFolderFocus;
+    let frames = 0;
+    let raf = 0;
+    const tick = () => {
+      const node = document.getElementById(folderNodeId(id));
+      if (node && document.activeElement !== node) node.focus();
+      if (++frames < 10) raf = requestAnimationFrame(tick);
+      else setPendingFolderFocus(null);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [pendingFolderFocus]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [target, setTarget] = useState<ViewerTarget | null>(null);
   const [pane, setPane] = useState<"browser" | "viewer">("browser");
@@ -550,8 +574,8 @@ function Library({ project, sidebarToggle }: { project: Project; sidebarToggle: 
         onDone={(folder) => {
           setFolderDialog(null);
           setFolderId(folder.id);
-          // The node may appear only after its ancestors expand: focus it on the next frame.
-          requestAnimationFrame(() => document.getElementById(folderNodeId(folder.id))?.focus());
+          // The node may appear only after its ancestors expand: focus it once rendered.
+          setPendingFolderFocus(folder.id);
         }}
         focusAfterDone={() => null}
       />

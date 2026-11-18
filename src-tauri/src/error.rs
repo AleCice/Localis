@@ -8,6 +8,10 @@ pub enum ErrorCode {
     Validation,
     Duplicate,
     NotFound,
+    Conflict,
+    Unsupported,
+    TooLarge,
+    Integrity,
     Storage,
     Internal,
 }
@@ -25,6 +29,17 @@ pub struct AppError {
 }
 
 impl AppError {
+    /// A malformed request from the webview (bad header or body): not a user mistake,
+    /// so the message is generic and the specifics go in `detail`.
+    pub fn bad_request(detail: impl Into<String>) -> Self {
+        AppError {
+            code: ErrorCode::Validation,
+            message: "Richiesta non valida.".to_owned(),
+            field: None,
+            detail: Some(detail.into()),
+        }
+    }
+
     pub fn internal(detail: impl Into<String>) -> Self {
         AppError {
             code: ErrorCode::Internal,
@@ -41,6 +56,10 @@ impl From<CoreError> for AppError {
             CoreError::Validation { .. } => ErrorCode::Validation,
             CoreError::Duplicate { .. } => ErrorCode::Duplicate,
             CoreError::NotFound { .. } => ErrorCode::NotFound,
+            CoreError::Conflict { .. } => ErrorCode::Conflict,
+            CoreError::Unsupported { .. } => ErrorCode::Unsupported,
+            CoreError::TooLarge { .. } => ErrorCode::TooLarge,
+            CoreError::Integrity { .. } => ErrorCode::Integrity,
             CoreError::Storage { .. } => ErrorCode::Storage,
             CoreError::Internal(_) => ErrorCode::Internal,
         };

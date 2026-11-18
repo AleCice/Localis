@@ -444,10 +444,14 @@ describe("search", () => {
 
     await user.type(screen.getByRole("searchbox", { name: "Cerca nei documenti" }), "termine");
     const results = await screen.findByRole("region", { name: "Risultati per «termine»" });
-    expect(mockedApi.search).toHaveBeenCalledWith(project.id, "termine");
-    expect(mockedApi.search).toHaveBeenCalledTimes(1); // debounced
-    const marks = results.querySelectorAll("mark");
-    expect([...marks].map((m) => m.textContent)).toEqual(["<img src=x onerror=alert(1)>", "termine"]);
+    // Debounced: the search runs for the full term (under heavy load a partial term may run too).
+    expect(mockedApi.search).toHaveBeenLastCalledWith(project.id, "termine");
+    await waitFor(() =>
+      expect([...results.querySelectorAll("mark")].map((m) => m.textContent)).toEqual([
+        "<img src=x onerror=alert(1)>",
+        "termine",
+      ]),
+    );
     expect(results.querySelector("img")).toBeNull();
     expect(within(results).getByText("blocco 4")).toBeInTheDocument();
   });

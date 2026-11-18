@@ -19,6 +19,18 @@ pub enum CoreError {
     /// The requested record does not exist.
     #[error("{message}")]
     NotFound { message: String },
+    /// The operation is not allowed in the current state (e.g. folder not empty).
+    #[error("{message}")]
+    Conflict { message: String },
+    /// File format not supported, or extension and content do not match.
+    #[error("{message}")]
+    Unsupported { message: String },
+    /// File over the import size limit.
+    #[error("{message}")]
+    TooLarge { message: String },
+    /// Stored original missing or not matching its hash.
+    #[error("{message}")]
+    Integrity { message: String, detail: String },
     /// The database could not be opened, read or written.
     #[error("{message}")]
     Storage { message: String, detail: String },
@@ -36,6 +48,24 @@ impl CoreError {
         CoreError::Validation {
             field,
             message: message.to_owned(),
+        }
+    }
+
+    pub(crate) fn not_found(message: &str) -> Self {
+        CoreError::NotFound {
+            message: message.to_owned(),
+        }
+    }
+
+    pub(crate) fn conflict(message: &str) -> Self {
+        CoreError::Conflict {
+            message: message.to_owned(),
+        }
+    }
+
+    pub(crate) fn unsupported(message: impl Into<String>) -> Self {
+        CoreError::Unsupported {
+            message: message.into(),
         }
     }
 
@@ -57,7 +87,7 @@ impl CoreError {
     /// Technical diagnostics, never meant for the main UI message.
     pub fn detail(&self) -> Option<&str> {
         match self {
-            CoreError::Storage { detail, .. } => Some(detail),
+            CoreError::Storage { detail, .. } | CoreError::Integrity { detail, .. } => Some(detail),
             CoreError::Internal(detail) => Some(detail),
             _ => None,
         }
