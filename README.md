@@ -1,17 +1,18 @@
 # Localis
 
-App desktop local-first per studio e ricerca. Ogni **progetto** è un contenitore libero (un corso, una tesi, una ricerca) in cui, nelle prossime versioni, raccoglierai documenti e lezioni, farai domande con citazioni verificabili e produrrai materiali di studio collegati alle fonti.
+App desktop local-first per studio e ricerca. Ogni **progetto** è un contenitore libero (un corso, una tesi, una ricerca) in cui raccogli documenti e fai domande con citazioni verificabili. Nelle prossime versioni arriveranno lezioni registrate, OCR e materiali di studio collegati alle fonti.
 
-**Versione 0.2 — Libreria documenti.** Oggi Localis permette di:
+**Versione 0.3 — Chat locale con fonti.** Oggi Localis permette di:
 - creare, ritrovare ed eliminare progetti (onboarding, tema chiaro/scuro);
 - importare in un progetto PDF, TXT, Markdown, DOCX e immagini (PNG, JPEG, GIF, WebP), fino a 200 MB per file, con il pulsante «Importa» o trascinandoli nella finestra;
 - organizzarli in cartelle e caricarne nuove versioni;
 - aprirli: PDF e immagini nel viewer, gli altri formati come testo estratto;
-- cercare nel testo estratto, con l'indicazione della pagina o del blocco.
+- cercare nel testo estratto, con l'indicazione della pagina o del blocco;
+- fare domande sui documenti di un progetto a un modello che gira sul tuo computer in LM Studio. Le risposte citano le fonti con `[n]` e ogni citazione apre il documento alla pagina o al blocco giusto.
 
-La Chat compare nella navigazione ma non è ancora disponibile. Visione e versioni: [`docs/ROADMAP.md`](docs/ROADMAP.md). Stato verificato: [`docs/STATUS.md`](docs/STATUS.md).
+Visione e versioni: [`docs/ROADMAP.md`](docs/ROADMAP.md). Stato verificato: [`docs/STATUS.md`](docs/STATUS.md).
 
-Tutti i dati restano sul tuo computer. Nessun account, nessun servizio esterno, nessuna telemetria.
+Tutti i dati restano sul tuo computer. Nessun account, nessun servizio esterno, nessuna telemetria. L'unica connessione di rete è quella verso LM Studio sul tuo stesso computer (indirizzo locale); altri indirizzi vengono rifiutati.
 
 ## Prerequisiti
 
@@ -65,6 +66,25 @@ Solo interfaccia nel browser, con un backend finto in memoria (utile per lavorar
 npm run dev:mock
 ```
 
+## Chat con LM Studio
+
+La Chat usa [LM Studio](https://lmstudio.ai) come server locale dei modelli. LM Studio va installato a parte; Localis non scarica modelli.
+
+1. In LM Studio scarica un modello di chat, per esempio un modello instruct da 7–8B se il computer lo regge, e avvia il server locale dalla scheda «Developer»/«Server». L'indirizzo predefinito è `http://127.0.0.1:1234`.
+2. In Localis, **Impostazioni → Modelli locali (LM Studio)**: premi «Verifica connessione» e scegli il modello di chat.
+3. Facoltativo: scegli anche un modello di **embedding**, per esempio `nomic-embed-text`. Localis indicizza i passaggi in background (vedi «indicizzati X di Y») e da quel momento la ricerca diventa **ibrida**, cioè lessicale più semantica. Senza modello di embedding la ricerca resta **lessicale** (FTS5) e la chat lo indica.
+
+Come risponde la chat:
+- **Fonti:** il modello riceve solo passaggi dei documenti del progetto, numerati. Le risposte li citano con `[n]` e solo i numeri che corrispondono a fonti davvero passate sono cliccabili. Sotto ogni risposta trovi «Fonti citate» e «Fonti consultate»; il pannello «Dettagli» mostra modalità, ambito, query, risultati grezzi, evidenze e citazioni.
+- **Domande sui documenti** («Quali documenti ho caricato?»): risponde Localis dall'elenco, senza modello.
+- **Nessun passaggio pertinente:** Localis lo dice e non chiama il modello.
+- **Ambito della ricerca:**
+  - se nomini un documento, la ricerca si limita a quello; se il nome è ambiguo, Localis chiede quale intendi;
+  - «Limita a documenti…» restringe la domanda a una selezione;
+  - «questo documento» si riferisce a quello della risposta precedente.
+- **«Riassumi questo documento»:** non ci sono parole da cercare, quindi il modello riceve le parti iniziali del documento ed è avvisato che non si tratta del testo completo. Le fonti lo indicano come «Passaggio iniziale».
+- **Formule e testo:** sono supportate formule LaTeX (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`), tabelle e codice. L'HTML nelle risposte non viene mai eseguito e i link non si aprono.
+
 ## Dove sono i dati
 
 Il database SQLite `localis.db` sta nella directory dati dell'app, mai nel repository:
@@ -85,10 +105,11 @@ Localis **copia** ogni file importato nel proprio archivio, la sottocartella `or
 - Lo stesso file importato due volte nello stesso progetto viene riconosciuto come «già presente». In progetti diversi è consentito e la copia viene condivisa.
 - Il testo estratto e l'indice di ricerca stanno nel database, separati dagli originali. Non vengono generate anteprime.
 - Un PDF senza testo (per esempio una scansione) si apre ma non è ricercabile: l'OCR non c'è ancora. Le immagini si aprono ma non sono ricercabili.
+- Conversazioni, passaggi indicizzati, embedding e fonti di ogni risposta (anche dopo la cancellazione di un documento) stanno nello stesso database.
 
 ### Cancellazioni e reset
 
-Eliminare un documento o un progetto rimuove i record e le copie di Localis che nessun altro documento usa più. **I file sul tuo disco non vengono mai toccati.**
+Eliminare un documento o un progetto rimuove i record e le copie di Localis che nessun altro documento usa più. Eliminare un progetto elimina anche le sue conversazioni. **I file sul tuo disco non vengono mai toccati.**
 
 Per ripartire da zero, chiudi Localis e cancella la cartella `app.localis.desktop` indicata sopra. Così rimuovi database e archivio e, su Linux, anche le preferenze.
 
@@ -135,6 +156,12 @@ node e2e/native.mjs
 ```bash
 node e2e/library.mjs
 ```
+
+```bash
+node e2e/chat.mjs
+```
+
+`e2e/chat.mjs` usa `e2e/fake-lmstudio.mjs`, un **finto** server LM Studio per i test. Non è un modello: costruisce le risposte meccanicamente dal prompt. `e2e/chat-ui.mjs` controlla layout e tastiera della chat nel browser (Playwright).
 
 ## Struttura
 

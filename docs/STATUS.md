@@ -1,10 +1,86 @@
 # Stato di Localis
 
-**Versione corrente: 0.2 — Libreria documenti.** Completata e verificata su Linux, in un container senza display (Xvfb). Non verificata su macOS e Windows.
+**Versione corrente: 0.3 — Chat locale con fonti.** Verificata su Linux, in un container senza display, con un **finto server LM Studio** (`e2e/fake-lmstudio.mjs`, che non è un modello). **Il funzionamento con un LM Studio reale e con modelli reali non è verificato**: nel container non ce n'erano. Non verificata su macOS e Windows.
 
-Ultimo aggiornamento: 18 novembre 2026.
+Ultimo aggiornamento: 19 novembre 2026.
 
-## 0.2 — Requisiti della roadmap
+## 0.3 — Requisiti della roadmap
+
+| Requisito | Stato | Evidenza |
+|---|---|---|
+| Integrazione LM Studio | ⚠️ solo con il server finto | Elenco modelli (`/api/v0/models`, con ripiego su `/v1/models`), embedding e chat in streaming SSE. Errori (server spento, HTTP 500, nessun modello) mostrati come `llm_unavailable` con indicazioni. URL accettato solo su indirizzo locale: 10 casi limite rifiutati, `[::1]` accettato. Le variabili proxy vengono ignorate e il traffico osservato andava solo a loopback. |
+| Selettore del modello | ✅ (server finto) | Impostazioni e intestazione della chat mostrano solo i modelli segnalati da LM Studio, disattivati se il server non è raggiungibile. |
+| Embedding locale | ⚠️ solo con il server finto | L'indicizzazione in background arriva a «14 di 14» e riprova con attesa crescente se LM Studio non risponde. La modalità «Ibrida» compare solo se esistono vettori per l'ambito **e** l'embedding della domanda è riuscito. |
+| Retrieval iniziale | ✅ | FTS5 in OR senza stopword italiane, coseno sui vettori, fusione RRF, al massimo 8 evidenze entro 6000 caratteri. |
+| Chat RAG | ✅ (meccanismi) | La risposta salvata coincide byte per byte con l'output del modello; la qualità con un modello reale non è verificata. |
+| ID di fonti ed evidenze registrati | ✅ | Tre livelli nel database (risultati grezzi, passati nel prompt, citati), identici dopo il riavvio. Sono copie fissate al momento della risposta, quindi restano leggibili anche dopo la cancellazione del documento («Documento non più disponibile»). |
+| Documento identificato → ricerca solo su quello | ✅ | Ambito per titolo, per selezione e dalla conversazione, verificato nell'app vera. |
+| Riferimento ambiguo → chiarimento | ✅ | Due candidati, nessuna chiamata al modello; la scelta reinvia la domanda limitata a quel documento. In un progetto con un solo documento «questo documento» indica quello. |
+| Inventario («Quali documenti ho caricato?») | ✅ | Funziona anche senza LM Studio; elenca i documenti reali con lo stato del testo, per esempio «senza testo ricercabile». |
+| Grezzi, evidenze e citazioni separati | ✅ | `[1]` è citato; `[99]` e `[2]` dentro il codice no. «Fonti citate» e «Fonti consultate» sono separate; i risultati grezzi stanno solo nel pannello «Dettagli». |
+| Deduplica senza perdere pagine | ✅ (test Rust) | `select_evidence` e RRF tengono pagine diverse dello stesso documento. Non provato nell'app nativa. |
+| La citazione apre file e pagina o blocco giusti | ✅ versione corrente | PDF alla pagina 2 di 2, testo al blocco 2, con pannello dello snippet e «Torna alla chat». L'apertura di una versione precedente citata non è provata nell'app nativa. |
+| Layout della chat | ✅ | Composer sempre visibile a 480, 720, 1280 e 1920 px e con zoom al 200%. Fonti chiuse di default. Il pannello «Dettagli» chiuso non occupa spazio. «Elaborazione…» non resta nella cronologia. |
+| Markdown/GFM e KaTeX con i 4 delimitatori | ✅ | `$…$`, `$$…$$`, `\(…\)` e `\[…\]` sono renderizzati, anche le tabelle. Il codice con `$` o `\(` resta letterale. Nessuna violazione della CSP: i font KaTeX non sono più incorporati come `data:`. |
+| Testo originale preservato, niente HTML eseguito | ✅ | Una risposta ostile viene salvata identica e resta inerte nell'app nativa: `<script>`, `<img onerror>`, `<svg onload>`, link `javascript:`, `\href`. I link non si aprono. |
+| Scroll locale | ✅ | Tabelle, codice e formule lunghe scorrono dentro il proprio riquadro; la pagina non scorre in orizzontale. |
+| Interruzione e recupero | ✅ | «Interrompi» conserva il testo parziale (con le citazioni valide); un secondo invio durante la generazione dà `conflict`. Dopo un SIGKILL a metà risposta, il riavvio mostra «Risposta interrotta.». |
+
+## Verifiche eseguite (ultima esecuzione)
+
+| Comando | Esito |
+|---|---|
+| `npm run typecheck` | ok |
+| `npm test` (3 esecuzioni) | 86/86 ogni volta |
+| `npm run build` | ok; codice del backend finto assente dal bundle; font KaTeX come file locali |
+| `npm audit` | 0 vulnerabilità (KaTeX forzato alla 0.19.1 con `overrides`) |
+| `cargo fmt --all --check` | ok |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ok |
+| `cargo test --workspace` | 158/158: 27 nell'app Tauri, 63 unitari del core, 25 di integrazione della chat, 27 della libreria, 16 dei progetti |
+| `npm run tauri build -- --debug --no-bundle` | ok |
+| `node e2e/chat.mjs` (app nativa e server LM Studio finto) | 100/100 |
+| `node e2e/chat-ui.mjs` (Playwright su `dev:mock`) | 31/31 |
+| `node e2e/library.mjs` | 98/98 |
+| `node e2e/native.mjs` | 39/39 |
+
+## Decisioni 0.3
+
+- **Rete:** solo il backend parla con LM Studio, solo su loopback (`127.0.0.1`, `localhost`, `[::1]`), con `ureq` senza TLS, senza proxy e senza redirect. La webview non fa richieste di rete e la CSP resta invariata.
+- **Passaggi (chunk):**
+  - derivati dal testo estratto, al massimo circa 1200 caratteri, su confini di paragrafo o frase;
+  - creati alla fine dell'estrazione e, per i documenti importati con la 0.2, recuperati al primo avvio della 0.3.
+- **Embedding:**
+  - vettori f32 normalizzati in SQLite, per modello;
+  - si usano solo quelli del modello configurato e nessun Qdrant;
+  - i risultati semantici molto peggiori del migliore (oltre 0,15 di coseno) vengono scartati.
+- **Senza termini da cercare non si usa la ricerca semantica:** la similarità da sola trova sempre qualcosa di vagamente simile. «Riassumi tutto» sull'intero progetto risponde quindi «nessun passaggio pertinente». Con un ambito su un documento si passano invece le sue parti iniziali, dichiarate come tali al modello e nell'interfaccia (`via: "position"`).
+- **Regole deterministiche, senza LLM,** per inventario, titolo nominato, ambiguità e «questo documento».
+- **Prompt:**
+  - sistema in italiano;
+  - fonti come dati non affidabili, racchiuse da delimitatori con un codice casuale per richiesta, così un documento non può chiudere la propria fonte;
+  - nella cronologia, le ultime 3 coppie domanda/risposta.
+- **Citazioni** `[n]`, `[n, m]`, `[n-m]` riconosciute fuori da codice e formule. Contano solo i numeri passati nel prompt. Il testo raw non viene mai modificato.
+- **Dipendenze nuove:**
+  - Rust: `ureq` 3.5 (senza TLS) e `serde_json`;
+  - frontend: `react-markdown`, `remark-gfm`, `remark-math`, `rehype-katex`, `katex` 0.19.1.
+
+## Limiti noti 0.3
+
+- **LM Studio reale non verificato.** Restano da provare la qualità delle risposte, le particolarità dello streaming reale, la distribuzione reale delle similarità e il timeout di lettura di 300 s su prompt lunghi.
+- **Titoli:** un titolo di una sola parola di 4 o più lettere (per esempio «note.md») limita l'ambito a quel documento ogni volta che la parola compare nella domanda.
+- **Viewer PDF:** una citazione apre la pagina e mostra lo snippet, ma non evidenzia il passaggio sulla pagina.
+- **Blocchi di codice indentati:** quelli con 4 spazi non vengono riconosciuti per la conversione dei delimitatori LaTeX. Quelli con ``` e il codice inline sì.
+- **Thread in background:** dopo un'interruzione, un server bloccato può tenere attivo il thread di lettura fino a 300 s. L'utente non resta bloccato.
+
+## Come provare con LM Studio reale
+
+1. Installa LM Studio, scarica un modello di chat e, se vuoi, uno di embedding (per esempio `nomic-embed-text`). Avvia il server locale.
+2. `npm run tauri dev`, poi Impostazioni → Modelli locali → «Verifica connessione». Scegli i modelli e aspetta «indicizzati X di X».
+3. In un progetto con qualche PDF fai una domanda sul contenuto. La risposta deve citare `[n]` e la citazione deve aprire la pagina giusta.
+4. Prova «Quali documenti ho caricato?», una domanda su un argomento assente (deve dire che non ha trovato passaggi) e «Riassumi questo documento» con un documento selezionato.
+5. Chiudi LM Studio e fai una domanda: deve comparire «LM Studio non è raggiungibile…».
+
+## 0.2 — Libreria documenti (verificata)
 
 | Requisito | Stato | Evidenza |
 |---|---|---|
@@ -26,73 +102,8 @@ Ultimo aggiornamento: 18 novembre 2026.
 
 ## 0.1 — Fondazioni
 
-Tutti gli 8 criteri di accettazione sono verificati: il dettaglio è nella cronologia Git di questo file. `e2e/native.mjs` passa ancora 39 controlli su 39 sulla 0.2.
+Tutti gli 8 criteri verificati; dettagli nella cronologia Git di questo file. `e2e/native.mjs` passa ancora 39/39.
 
-## Verifiche eseguite (ultima esecuzione)
+## Prossimo passo: 0.4 — FARO base
 
-| Comando | Esito |
-|---|---|
-| `npm run typecheck` | ok |
-| `npm test` (3 esecuzioni) | 43/43 ogni volta |
-| `npm run build` | ok; il backend finto non è nel bundle; pdf.js viene caricato solo quando si apre un PDF |
-| `npm audit` | 0 vulnerabilità |
-| `cargo fmt --all --check` | ok |
-| `cargo clippy --workspace --all-targets -- -D warnings` | ok |
-| `cargo test --workspace` | 94/94: 19 nell'app Tauri, 32 unitari del core, 27 di integrazione della libreria, 16 dei progetti |
-| `npm run tauri build -- --debug --no-bundle` | ok |
-| `node e2e/library.mjs` (app nativa) | 98/98 |
-| `node e2e/native.mjs` (app nativa) | 39/39 |
-| Playwright su `npm run dev:mock`: tastiera e layout a 480, 720, 1280 e 1920 px e zoom al 200% con un PDF aperto | 38/39; l'unico fallimento riguarda il comportamento di Chromium con Tab nei dialoghi, mentre nella webview nativa il focus resta nel dialogo. Lo script è del QA e non è nel repository. |
-
-## Decisioni 0.2
-
-- **Copia degli originali**, scelta dall'utente. L'archivio è indirizzato per contenuto: i file prendono il nome dal loro SHA-256, la scrittura è atomica (file temporaneo e poi rinomina) e l'hash viene verificato a ogni lettura.
-- **Import tramite byte**: l'interfaccia legge il file scelto e lo invia al backend. Il backend non legge mai percorsi sul disco e non usa i plugin `fs` o `dialog`. Il drag & drop nativo della finestra è disattivato, così il trascinamento arriva all'interfaccia.
-- **Estrazione** in un worker in background con la propria connessione al database:
-  - PDF per pagina, con `lopdf` e un estrattore proprio. Ho scartato `pdf-extract` perché può far crollare l'app su PDF malformati.
-  - DOCX per paragrafo, TXT e Markdown per blocco.
-  - Limiti, `catch_unwind` e un timeout di 300 s.
-  - Nessun nuovo tentativo automatico: le estrazioni falliscono sempre allo stesso modo, quindi c'è solo «Riprova».
-- **Ricerca**: FTS5 con `unicode61 remove_diacritics 2`. Quello che scrivi viene diviso in parole e citato, mai passato come sintassi di ricerca. L'ultima parola vale anche come prefisso.
-- **pdf.js 6.5.438**:
-  - nessun fetch esterno, script, form o XFA; i decodificatori wasm sono disattivati;
-  - i link nei PDF non sono cliccabili;
-  - la 5.x è stata scartata per una vulnerabilità nota.
-- **Polling** dello stato dei job ogni secondo, solo mentre c'è un'estrazione in corso. Non servono permessi per gli eventi.
-
-## Limiti noti
-
-- **PDF:**
-  - Il testo dentro le form XObject non viene estratto, per sicurezza.
-  - L'ordine di lettura segue il contenuto del PDF.
-  - I PDF protetti da password non vengono estratti.
-  - Le immagini JPEG 2000 e JBIG2 nei PDF non vengono mostrate, perché servirebbe abilitare il wasm.
-  - I font non incorporati usano i font di sistema.
-- **Viewer PDF:** mostra una pagina alla volta, senza scorrimento continuo.
-- **Duplicati:** reimportare un file già presente non ripara una copia mancante o alterata nell'archivio.
-- **Job:** un'estrazione andata in timeout lascia il suo thread attivo finché termina da sola.
-- **Memoria:** un import tiene l'intero file in memoria, fino a 200 MB.
-- **Riprova:** l'elenco dei job è limitato agli ultimi 200, quindi il pulsante «Riprova» può mancare per errori molto vecchi.
-- **Interfaccia:**
-  - La sidebar in sovrapposizione nelle finestre strette non è modale.
-  - La vista corrente non viene ricordata.
-
-## Non verificato
-
-- macOS, Windows e build di release con installer.
-- Drag & drop reale da un file manager: WebDriver non lo permette e l'import è stato provato con il selettore di file.
-- Limite di 200 MB nell'app nativa: coperto solo dai test Rust.
-- Ripresa dei job interrotti da un crash e timeout di 300 s: coperti solo dai test Rust.
-- Layout stretto e zoom al 200% nella webview nativa con un PDF aperto: provati solo in Chromium.
-- Screen reader.
-
-## Come verificare ciò che qui non è stato provato
-
-1. Avvia con `npm run tauri dev` (vedi README) su macOS o Windows, oppure su Linux con display.
-2. Trascina nella Libreria un PDF, un DOCX e un'immagine da un file manager: devono comparire, il PDF deve diventare «Ricercabile», l'immagine «Non ricercabile».
-3. Cerca una parola del PDF senza accenti e apri il risultato: il viewer deve aprirsi sulla pagina giusta.
-4. Riduci la finestra al minimo con il PDF aperto e prova lo zoom del sistema: non deve comparire lo scorrimento orizzontale.
-
-## Prossimo passo: 0.3 — Chat locale con fonti
-
-Primo lavoro: integrazione con LM Studio, cioè rilevare il server locale e i modelli disponibili e scegliere il modello, senza fallback silenziosi. Poi un retrieval iniziale su FTS5 che registra le evidenze passate al modello. Gli embedding locali vanno dichiarati solo quando esistono davvero. Vedi `docs/ROADMAP.md`.
+Primo lavoro: import di MP3 e MP4 con conservazione dell'originale e scelta del motore di trascrizione locale, da scaricare solo con la tua conferma. Poi segmenti con timestamp e salto al punto della registrazione. Vedi `docs/ROADMAP.md`.
