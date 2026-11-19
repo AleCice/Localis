@@ -20,6 +20,16 @@ fn main() {
             "search",
             "list_jobs",
             "retry_job",
+            "get_llm_settings",
+            "set_llm_settings",
+            "get_llm_status",
+            "get_embedding_status",
+            "list_conversations",
+            "create_conversation",
+            "delete_conversation",
+            "list_messages",
+            "send_message",
+            "cancel_generation",
         ]),
     ))
     .expect("failed to run tauri-build");

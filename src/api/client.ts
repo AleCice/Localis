@@ -1,7 +1,14 @@
 // The only module that talks to the backend. Components import from here.
 // Owner: main agent.
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
+  ChatEvent,
+  ChatMessage,
+  Conversation,
+  EmbeddingStatus,
+  LlmSettings,
+  LlmStatus,
+  SendMessageInput,
   DocumentVersion,
   Folder,
   ImportFileMeta,
@@ -47,6 +54,27 @@ export interface Api {
   listJobs(projectId: string): Promise<Job[]>;
   /** Requeues a failed job. */
   retryJob(id: number): Promise<Job>;
+
+  // v0.3 Local chat
+  getLlmSettings(): Promise<LlmSettings>;
+  /** Validates (loopback http only) and saves; changing the embedding model starts background embedding. */
+  setLlmSettings(settings: LlmSettings): Promise<LlmSettings>;
+  /** Contacts LM Studio and lists its models. Never throws for an unreachable server: see `reachable`. */
+  getLlmStatus(): Promise<LlmStatus>;
+  getEmbeddingStatus(projectId: string): Promise<EmbeddingStatus>;
+
+  listConversations(projectId: string): Promise<Conversation[]>;
+  createConversation(projectId: string): Promise<Conversation>;
+  deleteConversation(id: string): Promise<void>;
+  listMessages(conversationId: string): Promise<ChatMessage[]>;
+  /**
+   * Sends a question. Events stream through `onEvent`; resolves with the final assistant message
+   * (also for inventory/clarification/no_evidence/cancelled). Rejects only if the question itself
+   * could not be stored.
+   */
+  sendMessage(input: SendMessageInput, onEvent: (event: ChatEvent) => void): Promise<ChatMessage>;
+  /** Stops the generation in progress for the conversation (no-op if none). */
+  cancelGeneration(conversationId: string): Promise<void>;
 }
 
 function isTauri(): boolean {
@@ -105,6 +133,22 @@ const tauriApi: Api = {
 
   listJobs: (projectId) => call<Job[]>("list_jobs", { projectId }),
   retryJob: (id) => call<Job>("retry_job", { id }),
+
+  getLlmSettings: () => call<LlmSettings>("get_llm_settings"),
+  setLlmSettings: (settings) => call<LlmSettings>("set_llm_settings", { settings }),
+  getLlmStatus: () => call<LlmStatus>("get_llm_status"),
+  getEmbeddingStatus: (projectId) => call<EmbeddingStatus>("get_embedding_status", { projectId }),
+
+  listConversations: (projectId) => call<Conversation[]>("list_conversations", { projectId }),
+  createConversation: (projectId) => call<Conversation>("create_conversation", { projectId }),
+  deleteConversation: (id) => call<void>("delete_conversation", { id }),
+  listMessages: (conversationId) => call<ChatMessage[]>("list_messages", { conversationId }),
+  sendMessage: (input, onEvent) => {
+    const channel = new Channel<ChatEvent>();
+    channel.onmessage = onEvent;
+    return call<ChatMessage>("send_message", { input, onEvent: channel });
+  },
+  cancelGeneration: (conversationId) => call<void>("cancel_generation", { conversationId }),
 };
 
 // The in-memory mock exists only for UI development and browser tests

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window: only Localis' own commands (projects, library, jobs). No plugins.",
+  "description": "Main window: only Localis' own commands (projects, library, jobs, local chat). No plugins.",
   "windows": [
     "main"
   ],
@@ -23,6 +23,16 @@
     "allow-get-text",
     "allow-search",
     "allow-list-jobs",
-    "allow-retry-job"
+    "allow-retry-job",
+    "allow-get-llm-settings",
+    "allow-set-llm-settings",
+    "allow-get-llm-status",
+    "allow-get-embedding-status",
+    "allow-list-conversations",
+    "allow-create-conversation",
+    "allow-delete-conversation",
+    "allow-list-messages",
+    "allow-send-message",
+    "allow-cancel-generation"
   ]
 }
