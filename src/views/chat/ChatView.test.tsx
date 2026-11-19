@@ -399,3 +399,18 @@ describe("conversations", () => {
     expect(screen.queryByText("Prima")).not.toBeInTheDocument();
   });
 });
+
+describe("position sources", () => {
+  it("labels passages taken from the start of the document honestly", async () => {
+    const conversation = makeConversation("Riassunto");
+    const answer = makeMessage(conversation, "assistant", "Riassunto [1].", {
+      sources: [makeSource(notes, { via: "position", unit: 1 })],
+    });
+    const { user } = renderChat([conversation], [answer]);
+    await user.click(await screen.findByText("Fonti citate (1)"));
+    expect(screen.getByText(/Passaggio iniziale: inizio del documento \(nessun termine da cercare\)/)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Mostra dettagli della risposta" }));
+    const inspector = screen.getByRole("complementary", { name: "Dettagli della risposta" });
+    expect(within(inspector).getAllByText(/inizio del documento \(nessun termine da cercare\)/).length).toBeGreaterThan(0);
+  });
+});

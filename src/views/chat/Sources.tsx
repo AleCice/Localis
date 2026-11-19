@@ -1,5 +1,5 @@
 import type { Source } from "../../api/types";
-import { excerpt, unitLabel } from "./labels";
+import { excerpt, unitLabel, VIA_LABEL } from "./labels";
 
 interface SourcesProps {
   sources: Source[];
@@ -24,6 +24,8 @@ export function SourceItem({ source, onOpen, showN = true }: { source: Source; o
         <span className="source-unit">{unitLabel(source.unitKind, source.unit)}</span>
       </span>
       {source.available ? null : <span className="source-missing">Documento non più disponibile</span>}
+      {/* Not found by search: an opening passage of the document the question was limited to. */}
+      {source.via === "position" ? <span className="source-unit">Passaggio iniziale: {VIA_LABEL.position}</span> : null}
       <span className="source-snippet">{excerpt(source.text)}</span>
     </>
   );

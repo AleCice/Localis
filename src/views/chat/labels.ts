@@ -24,6 +24,7 @@ export const VIA_LABEL: Record<Source["via"], string> = {
   lexical: "lessicale",
   semantic: "semantica",
   both: "lessicale e semantica",
+  position: "inizio del documento (nessun termine da cercare)",
 };
 
 /** Short excerpt for compact lists. */
