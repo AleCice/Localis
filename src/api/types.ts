@@ -264,7 +264,8 @@ export interface Source {
   unitKind: UnitKind;
   /** Passage text as passed to the model (or the raw result excerpt). */
   text: string;
-  via: "lexical" | "semantic" | "both";
+  /** "position": not found by search, opening passage of a selected document (question without searchable terms). */
+  via: "lexical" | "semantic" | "both" | "position";
   /** False when the document or version no longer exists. */
   available: boolean;
 }

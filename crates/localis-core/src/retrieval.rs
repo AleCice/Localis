@@ -697,6 +697,9 @@ pub enum Via {
     Lexical,
     Semantic,
     Both,
+    /// Not found by a search: the opening passages of a selected document, used when the
+    /// question names a document but has no searchable terms (e.g. «riassumi questo documento»).
+    Position,
 }
 
 impl Via {
@@ -705,6 +708,7 @@ impl Via {
             Via::Lexical => "lexical",
             Via::Semantic => "semantic",
             Via::Both => "both",
+            Via::Position => "position",
         }
     }
 
@@ -713,6 +717,7 @@ impl Via {
             "lexical" => Via::Lexical,
             "semantic" => Via::Semantic,
             "both" => Via::Both,
+            "position" => Via::Position,
             _ => return None,
         })
     }
@@ -784,6 +789,33 @@ impl Store {
                 docs_json(document_ids),
                 RAW_MAX as i64
             ],
+            row_to_passage,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Opening passages (in reading order) of the documents in `document_ids`, at most
+    /// [`RAW_MAX`] overall. Used only as a declared fallback when a document-scoped question
+    /// has no searchable terms.
+    pub fn leading_passages(
+        &self,
+        project_id: &str,
+        document_ids: &[String],
+    ) -> Result<Vec<Passage>> {
+        if document_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PASSAGE_COLUMNS}
+             FROM chunks c
+             JOIN document_versions v ON v.id = c.version_id
+             JOIN documents d ON d.id = v.document_id
+             WHERE {SCOPE_SQL}
+             ORDER BY d.title, d.id, c.unit, c.ordinal
+             LIMIT ?4"
+        ))?;
+        let rows = stmt.query_map(
+            params!["", project_id, docs_json(document_ids), RAW_MAX as i64],
             row_to_passage,
         )?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

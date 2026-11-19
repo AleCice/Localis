@@ -193,7 +193,7 @@ const MIGRATIONS: &[&str] = &[
         unit         INTEGER NOT NULL,
         unit_kind    TEXT NOT NULL CHECK (unit_kind IN ('page', 'block')),
         text         TEXT NOT NULL,
-        via          TEXT NOT NULL CHECK (via IN ('lexical', 'semantic', 'both')),
+        via          TEXT NOT NULL CHECK (via IN ('lexical', 'semantic', 'both', 'position')),
         PRIMARY KEY (message_id, rank)
     );
 

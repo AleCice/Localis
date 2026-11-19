@@ -1232,3 +1232,31 @@ fn conversations_crud_and_project_delete_cascade() {
         );
     }
 }
+
+#[test]
+fn document_question_without_search_terms_uses_declared_opening_passages() {
+    let chat = Chat::new();
+    let analisi = chat.import("analisi.md", ANALISI.as_bytes());
+    let _storia = chat.import("storia.txt", STORIA.as_bytes());
+    let conv = chat.conversation();
+
+    // Explicit selection + no searchable terms → opening passages of that document only.
+    let (res, _) = chat.send(&conv, "Riassumi questo documento", &[&analisi.id]);
+    let m = res.unwrap();
+    assert_eq!(m.kind, MessageKind::Answer);
+    assert!(!m.sources.is_empty());
+    assert!(m.sources.iter().all(|s| s.document_id == analisi.id));
+    assert!(m
+        .sources
+        .iter()
+        .all(|s| s.via == localis_core::Via::Position));
+    assert_eq!(m.sources[0].n, Some(1));
+
+    // Project scope with no searchable terms is still honest: no evidence, no model call.
+    let m = chat.ask(&conv, "Riassumi");
+    assert_eq!(m.kind, MessageKind::NoEvidence);
+
+    // A document-scoped question with terms that are not in the document stays no_evidence.
+    let (res, _) = chat.send(&conv, "Cosa dice di Napoleone?", &[&analisi.id]);
+    assert_eq!(res.unwrap().kind, MessageKind::NoEvidence);
+}
