@@ -490,8 +490,9 @@ async function main() {
   await s.waitFor(`!document.querySelector('dialog[open]') && document.querySelector('.project-option')`, "project created");
   await goToLibrary(s);
   check("library opens for the new project (empty state)", await s.exec(`return !!document.querySelector('.library-empty');`));
-  check("Chat still marked unavailable in the sidebar", await s.exec(`const b = [...document.querySelectorAll('.nav-item')].find(x => x.textContent.includes('Chat'));
-    return !!b && (b.disabled || b.getAttribute('aria-disabled') === 'true');`));
+  // Since v0.3 the Chat is available (it was «Presto» in v0.1–0.2).
+  check("Chat available in the sidebar", await s.exec(`const b = [...document.querySelectorAll('.nav-item')].find(x => x.textContent.includes('Chat'));
+    return !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true';`));
 
   // ---- Import via the real <input type=file> (WebDriver file upload).
   const importNames = ["articolo.pdf", "scansione.pdf", "relazione.docx", "appunti.txt", "note.md", "foto.png"];
