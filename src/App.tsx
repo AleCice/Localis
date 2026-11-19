@@ -1,13 +1,17 @@
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { SidebarIcon } from "./components/Icons";
 import { Sidebar, type SidebarDisplay, type ViewId } from "./components/Sidebar";
 import { useMediaQuery } from "./hooks/useMediaQuery";
 import { useProjects } from "./hooks/useProjects";
 import { useTheme } from "./hooks/useTheme";
+import type { LibraryLink } from "./lib/navigation";
 import { readPref, STORAGE_KEYS, writePref } from "./lib/storage";
 import { LibraryView } from "./views/library/LibraryView";
 import { ProjectsView } from "./views/projects/ProjectsView";
 import { SettingsView } from "./views/SettingsView";
+
+// The chat (Markdown, KaTeX) is a separate chunk loaded on first use.
+const ChatView = lazy(() => import("./views/chat/ChatView").then((m) => ({ default: m.ChatView })));
 
 const SIDEBAR_PREFS = ["expanded", "collapsed", "hidden"] as const;
 type SidebarPref = (typeof SIDEBAR_PREFS)[number];
@@ -35,6 +39,11 @@ export function App() {
     readPref(STORAGE_KEYS.sidebar, SIDEBAR_PREFS, "expanded"),
   );
   const [overlayOpen, setOverlayOpen] = useState(false);
+  // The chat stays mounted once opened, so an answer keeps streaming while the user checks a source.
+  const [chatVisited, setChatVisited] = useState(false);
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [libraryLink, setLibraryLink] = useState<LibraryLink | null>(null);
+  const linkNonce = useRef(0);
   const narrow = useMediaQuery(NARROW_QUERY);
 
   const setSidebarPref = (pref: SidebarPref) => {
@@ -81,6 +90,16 @@ export function App() {
     if (narrow) setOverlayOpen((open) => !open);
     else setSidebarPref(sidebarPref === "expanded" ? "collapsed" : "expanded");
   };
+
+  useEffect(() => {
+    if (view === "chat") setChatVisited(true);
+  }, [view]);
+
+  const openSource = useCallback((link: Omit<LibraryLink, "nonce">) => {
+    linkNonce.current += 1;
+    setLibraryLink({ ...link, nonce: linkNonce.current });
+    setView("library");
+  }, []);
 
   const sidebarVisible = display !== "hidden";
   const sidebarToggle = (
@@ -135,10 +154,35 @@ export function App() {
             projectsStatus={store.status}
             onGoToProjects={() => setView("projects")}
             sidebarToggle={sidebarToggle}
+            link={libraryLink}
+            onLinkHandled={() => setLibraryLink(null)}
+            onBackToChat={chatVisited ? () => setView("chat") : undefined}
           />
-        ) : (
-          <SettingsView theme={theme} onThemeChange={setTheme} sidebarToggle={sidebarToggle} />
-        )}
+        ) : view === "settings" ? (
+          <SettingsView
+            theme={theme}
+            onThemeChange={setTheme}
+            sidebarToggle={sidebarToggle}
+            project={selectedProject}
+          />
+        ) : null}
+        {chatVisited || view === "chat" ? (
+          <div className="view-slot" hidden={view !== "chat"}>
+            <Suspense fallback={null}>
+              <ChatView
+                project={selectedProject}
+                projectsStatus={store.status}
+                onGoToProjects={() => setView("projects")}
+                sidebarToggle={sidebarToggle}
+                conversationId={conversationId}
+                onConversationChange={setConversationId}
+                onOpenSource={openSource}
+                onOpenSettings={() => setView("settings")}
+                active={view === "chat"}
+              />
+            </Suspense>
+          </div>
+        ) : null}
       </main>
     </div>
   );

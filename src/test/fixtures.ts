@@ -1,4 +1,6 @@
 import type {
+  ChatMessage,
+  Conversation,
   DocumentKind,
   DocumentVersion,
   Folder,
@@ -6,6 +8,7 @@ import type {
   LibraryDocument,
   Project,
   SearchHit,
+  Source,
   TextStatus,
 } from "../api/types";
 
@@ -124,3 +127,54 @@ export function makeHit(doc: LibraryDocument, unit: number, snippet: string): Se
 }
 
 export const LIBRARY_PROJECT_ID = PROJECT_ID;
+
+// ---------------------------------------------------------------- v0.3 chat
+
+export function makeConversation(title: string, overrides: Partial<Conversation> = {}): Conversation {
+  const at = stamp();
+  return { id: uuid("c0"), projectId: PROJECT_ID, title, createdAt: at, updatedAt: at, ...overrides };
+}
+
+export function makeSource(doc: LibraryDocument, overrides: Partial<Source> = {}): Source {
+  return {
+    rank: 1,
+    n: 1,
+    cited: true,
+    documentId: doc.id,
+    versionId: doc.current.id,
+    title: doc.title,
+    unit: 2,
+    unitKind: doc.current.kind === "pdf" ? "page" : "block",
+    text: "Il teorema degli zeri afferma che una funzione continua che cambia segno ha uno zero.",
+    via: "lexical",
+    available: true,
+    ...overrides,
+  };
+}
+
+export function makeMessage(
+  conversation: Conversation,
+  role: ChatMessage["role"],
+  content: string,
+  overrides: Partial<ChatMessage> = {},
+): ChatMessage {
+  const at = stamp();
+  return {
+    id: uuid("a0"),
+    conversationId: conversation.id,
+    role,
+    kind: role === "user" ? "question" : "answer",
+    content,
+    status: "complete",
+    error: null,
+    model: role === "assistant" ? "qwen2.5-7b-instruct" : null,
+    createdAt: at,
+    retrieval:
+      role === "assistant"
+        ? { mode: "lexical", scope: "project", documentIds: [], scopeReason: null, embeddingModel: null, query: '"teorema"* OR "zeri"' }
+        : null,
+    sources: [],
+    candidates: [],
+    ...overrides,
+  };
+}

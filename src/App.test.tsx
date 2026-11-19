@@ -15,6 +15,11 @@ vi.mock("./api/client", () => ({
     listFolders: vi.fn(),
     listDocuments: vi.fn(),
     listJobs: vi.fn(),
+    getLlmSettings: vi.fn(),
+    getLlmStatus: vi.fn(),
+    getEmbeddingStatus: vi.fn(),
+    listConversations: vi.fn(),
+    listMessages: vi.fn(),
   },
 }));
 
@@ -36,6 +41,11 @@ beforeEach(() => {
   mockedApi.listDocuments.mockResolvedValue([]);
   mockedApi.listFolders.mockResolvedValue([]);
   mockedApi.listJobs.mockResolvedValue([]);
+  mockedApi.getLlmSettings.mockResolvedValue({ baseUrl: "http://127.0.0.1:1234", chatModel: null, embeddingModel: null });
+  mockedApi.getLlmStatus.mockResolvedValue({ reachable: false, message: "LM Studio non risponde.", detail: null, models: [] });
+  mockedApi.getEmbeddingStatus.mockResolvedValue({ state: "disabled", model: null, total: 0, embedded: 0, message: null });
+  mockedApi.listConversations.mockResolvedValue([]);
+  mockedApi.listMessages.mockResolvedValue([]);
 });
 
 describe("onboarding", () => {
@@ -330,22 +340,26 @@ describe("settings", () => {
 });
 
 describe("shell", () => {
-  it("marks only Chat as unavailable and does nothing when activated", async () => {
-    withProjects([makeProject("Corso")]);
+  it("opens the Chat of the selected project and keeps it while visiting other views", async () => {
+    const project = makeProject("Tesi");
+    withProjects([makeProject("Corso"), project]);
     const user = renderApp();
-    await screen.findByRole("option", { name: "Corso" });
+    await user.click(await screen.findByRole("option", { name: "Tesi" }));
 
     const chat = screen.getByRole("button", { name: "Chat" });
-    expect(chat).toHaveAttribute("aria-disabled", "true");
-    expect(chat).toHaveAccessibleDescription("Disponibile in una versione futura");
+    expect(chat).not.toHaveAttribute("aria-disabled");
+    expect(screen.queryByText("Presto")).not.toBeInTheDocument();
     await user.click(chat);
-    expect(chat).not.toHaveAttribute("aria-current");
-    expect(screen.getByRole("button", { name: "Progetti" })).toHaveAttribute("aria-current", "page");
-    expect(screen.getByRole("heading", { level: 1, name: "Progetti" })).toBeInTheDocument();
+    expect(chat).toHaveAttribute("aria-current", "page");
+    expect(await screen.findByRole("heading", { level: 1, name: "Chat" })).toBeInTheDocument();
+    expect(screen.getByText("Tesi", { selector: ".view-context" })).toBeInTheDocument();
+    expect(mockedApi.listConversations).toHaveBeenCalledWith(project.id);
 
-    const library = screen.getByRole("button", { name: "Libreria" });
-    expect(library).not.toHaveAttribute("aria-disabled");
-    expect(library).not.toHaveAccessibleDescription();
+    await user.click(screen.getByRole("button", { name: "Progetti" }));
+    expect(screen.queryByRole("heading", { level: 1, name: "Chat" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Chat" }));
+    expect(screen.getByRole("heading", { level: 1, name: "Chat" })).toBeInTheDocument();
+    expect(mockedApi.listConversations).toHaveBeenCalledTimes(1);
   });
 
   it("opens the Libreria of the selected project", async () => {

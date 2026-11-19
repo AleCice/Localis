@@ -39,6 +39,7 @@ export function useLibrary(projectId: string): LibraryStore {
   // Separate sequence numbers: a poll (documents + jobs) must not discard a newer folder list.
   const requestId = useRef(0);
   const folderRequestId = useRef(0);
+  const reloadId = useRef(0);
 
   const fetchAll = useCallback(
     async (withFolders: boolean) => {
@@ -59,11 +60,17 @@ export function useLibrary(projectId: string): LibraryStore {
   );
 
   const reload = useCallback(() => {
+    // Only the latest reload settles the status: an older one (e.g. the effect running twice in
+    // development) must not mark the store ready before its data is in.
+    const id = ++reloadId.current;
     setStatus("loading");
     setLoadError(null);
     fetchAll(true).then(
-      () => setStatus("ready"),
+      () => {
+        if (id === reloadId.current) setStatus("ready");
+      },
       (err: unknown) => {
+        if (id !== reloadId.current) return;
         setLoadError(toAppError(err));
         setStatus("error");
       },

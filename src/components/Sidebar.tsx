@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { BooksIcon, ChatIcon, ChevronIcon, FolderIcon, SettingsIcon } from "./Icons";
 
-export type ViewId = "projects" | "library" | "settings";
+export type ViewId = "projects" | "library" | "chat" | "settings";
 
 /** How the sidebar is drawn right now. "overlay" is the expanded sidebar over narrow content. */
 export type SidebarDisplay = "expanded" | "collapsed" | "overlay" | "hidden";
@@ -17,17 +17,15 @@ interface SidebarProps {
 interface NavEntry {
   label: string;
   icon: ReactNode;
-  view?: ViewId;
+  view: ViewId;
 }
 
 const ENTRIES: NavEntry[] = [
   { label: "Progetti", icon: <FolderIcon />, view: "projects" },
   { label: "Libreria", icon: <BooksIcon />, view: "library" },
-  { label: "Chat", icon: <ChatIcon /> },
+  { label: "Chat", icon: <ChatIcon />, view: "chat" },
   { label: "Impostazioni", icon: <SettingsIcon />, view: "settings" },
 ];
-
-const UNAVAILABLE_HINT_ID = "nav-unavailable-hint";
 
 export function Sidebar({ id, display, view, onNavigate, onToggleLabels }: SidebarProps) {
   const showLabels = display === "expanded" || display === "overlay";
@@ -64,37 +62,21 @@ export function Sidebar({ id, display, view, onNavigate, onToggleLabels }: Sideb
 
       <nav aria-label="Principale">
         <ul className="nav-list">
-          {ENTRIES.map((entry) => {
-            const available = entry.view !== undefined;
-            const current = available && entry.view === view;
-            return (
-              <li key={entry.label}>
-                <button
-                  type="button"
-                  className="nav-item"
-                  aria-current={current ? "page" : undefined}
-                  aria-disabled={available ? undefined : true}
-                  aria-describedby={available ? undefined : UNAVAILABLE_HINT_ID}
-                  title={available ? (showLabels ? undefined : entry.label) : `${entry.label} · Disponibile in una versione futura`}
-                  onClick={() => {
-                    if (entry.view) onNavigate(entry.view);
-                  }}
-                >
-                  {entry.icon}
-                  <span className="nav-label">{entry.label}</span>
-                  {!available ? (
-                    <span className="nav-hint" aria-hidden="true">
-                      Presto
-                    </span>
-                  ) : null}
-                </button>
-              </li>
-            );
-          })}
+          {ENTRIES.map((entry) => (
+            <li key={entry.view}>
+              <button
+                type="button"
+                className="nav-item"
+                aria-current={entry.view === view ? "page" : undefined}
+                title={showLabels ? undefined : entry.label}
+                onClick={() => onNavigate(entry.view)}
+              >
+                {entry.icon}
+                <span className="nav-label">{entry.label}</span>
+              </button>
+            </li>
+          ))}
         </ul>
-        <span id={UNAVAILABLE_HINT_ID} className="visually-hidden">
-          Disponibile in una versione futura
-        </span>
       </nav>
     </aside>
   );

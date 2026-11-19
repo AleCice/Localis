@@ -7,6 +7,7 @@ import { ErrorBanner } from "../../components/ErrorBanner";
 import { FolderPlusIcon, PanelIcon, SearchIcon, UploadIcon } from "../../components/Icons";
 import { Spinner } from "../../components/Spinner";
 import { useDelayedFlag } from "../../hooks/useDelayedFlag";
+import type { LibraryLink } from "../../lib/navigation";
 import { useLibrary } from "../../hooks/useLibrary";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import type { LoadStatus } from "../../hooks/useProjects";
@@ -28,10 +29,34 @@ interface LibraryViewProps {
   projectsStatus: LoadStatus;
   onGoToProjects: () => void;
   sidebarToggle: ReactNode;
+  /** Open this document at this point (e.g. a cited source from the chat). */
+  link?: LibraryLink | null;
+  /** Called once `link` has been applied. */
+  onLinkHandled?: () => void;
+  /** Present when the chat is open in the background. */
+  onBackToChat?: () => void;
 }
 
-export function LibraryView({ project, projectsStatus, onGoToProjects, sidebarToggle }: LibraryViewProps) {
-  if (project) return <Library key={project.id} project={project} sidebarToggle={sidebarToggle} />;
+export function LibraryView({
+  project,
+  projectsStatus,
+  onGoToProjects,
+  sidebarToggle,
+  link = null,
+  onLinkHandled,
+  onBackToChat,
+}: LibraryViewProps) {
+  if (project)
+    return (
+      <Library
+        key={project.id}
+        project={project}
+        sidebarToggle={sidebarToggle}
+        link={link}
+        onLinkHandled={onLinkHandled}
+        onBackToChat={onBackToChat}
+      />
+    );
   return (
     <div className="view">
       <div className="view-header">
@@ -65,7 +90,15 @@ function hasFiles(event: DragEvent): boolean {
   return Array.from(event.dataTransfer?.types ?? []).includes("Files");
 }
 
-function Library({ project, sidebarToggle }: { project: Project; sidebarToggle: ReactNode }) {
+interface LibraryProps {
+  project: Project;
+  sidebarToggle: ReactNode;
+  link: LibraryLink | null;
+  onLinkHandled?: () => void;
+  onBackToChat?: () => void;
+}
+
+function Library({ project, sidebarToggle, link, onLinkHandled, onBackToChat }: LibraryProps) {
   const store = useLibrary(project.id);
   const { folders, documents, jobs } = store;
   const stacked = useMediaQuery(LIBRARY_STACKED_QUERY);
@@ -214,6 +247,27 @@ function Library({ project, sidebarToggle }: { project: Project; sidebarToggle: 
     }
     openDocument(doc, { unit: hit.unit, unitKind: hit.unitKind });
   };
+
+  // ---- External link (a source cited in the chat): open that document and version at that point.
+  const handledLink = useRef<number | null>(null);
+  useEffect(() => {
+    if (!link || store.status !== "ready" || handledLink.current === link.nonce) return;
+    handledLink.current = link.nonce;
+    const doc = documents.find((d) => d.id === link.documentId);
+    if (doc) {
+      setQuery("");
+      setSubmitted("");
+      setNotice(null);
+      setSelectedId(doc.id);
+      setTarget({ unit: link.unit, unitKind: link.unitKind, versionId: link.versionId, snippet: link.snippet });
+      setPane("viewer");
+      setFolderId(doc.folderId ?? null);
+      requestAnimationFrame(() => document.getElementById(VIEWER_HEADING_ID)?.focus());
+    } else {
+      setNotice({ code: "not_found", message: "Il documento citato non esiste più." });
+    }
+    onLinkHandled?.();
+  }, [link, store.status, documents, onLinkHandled]);
 
   const backToBrowser = () => {
     setPane("browser");
@@ -559,6 +613,8 @@ function Library({ project, sidebarToggle }: { project: Project; sidebarToggle: 
                       onDelete={() => setDeletingDoc(selected)}
                       onChanged={store.refresh}
                       onBack={stacked ? backToBrowser : undefined}
+                      onBackToChat={onBackToChat}
+                      onDismissTarget={() => setTarget(null)}
                     />
                   </>
                 ) : (

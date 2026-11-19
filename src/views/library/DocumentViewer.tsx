@@ -3,7 +3,7 @@ import { api } from "../../api/client";
 import type { AppError, DocumentVersion, LibraryDocument } from "../../api/types";
 import { IMPORT_MAX_BYTES, toAppError } from "../../api/types";
 import { ErrorBanner } from "../../components/ErrorBanner";
-import { ArrowLeftIcon, CopyIcon, InfoIcon } from "../../components/Icons";
+import { ArrowLeftIcon, CloseIcon, CopyIcon, InfoIcon } from "../../components/Icons";
 import { Spinner } from "../../components/Spinner";
 import { useDelayedFlag } from "../../hooks/useDelayedFlag";
 import { formatBytes, formatDateTime } from "../../lib/format";
@@ -18,6 +18,10 @@ const PdfViewer = lazy(() => import("./PdfViewer").then((m) => ({ default: m.Pdf
 export interface ViewerTarget {
   unit: number;
   unitKind: "page" | "block";
+  /** Version the target refers to (default: the current one). */
+  versionId?: string;
+  /** Passage to show next to the document (a source cited in the chat). */
+  snippet?: string | null;
 }
 
 interface DocumentViewerProps {
@@ -33,6 +37,10 @@ interface DocumentViewerProps {
   onChanged: () => Promise<void>;
   /** Present in the narrow (stacked) layout. */
   onBack?: () => void;
+  /** Present when the chat is open in the background. */
+  onBackToChat?: () => void;
+  /** Hides the cited passage. */
+  onDismissTarget?: () => void;
 }
 
 export const VIEWER_HEADING_ID = "viewer-title";
@@ -81,20 +89,24 @@ export function DocumentViewer({
   onDelete,
   onChanged,
   onBack,
+  onBackToChat,
+  onDismissTarget,
 }: DocumentViewerProps) {
   const [infoOpen, setInfoOpen] = useState(false);
   const [versions, setVersions] = useState<DocumentVersion[] | null>(null);
   const [versionsError, setVersionsError] = useState<AppError | null>(null);
-  const [viewedId, setViewedId] = useState<string | null>(null);
+  const [viewedId, setViewedId] = useState<string | null>(() =>
+    target?.versionId && target.versionId !== doc.current.id ? target.versionId : null,
+  );
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<AppError | null>(null);
   const [uploadNotice, setUploadNotice] = useState<string | null>(null);
   const [copied, setCopied] = useState<"ok" | "error" | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  // A search result always refers to the current version.
+  // A search result refers to the current version; a cited source to the version it came from.
   useEffect(() => {
-    if (target) setViewedId(null);
+    if (target) setViewedId(target.versionId && target.versionId !== doc.current.id ? target.versionId : null);
   }, [target]);
 
   // Versions are needed for the panel and when an older version is shown.
@@ -116,6 +128,10 @@ export function DocumentViewer({
   // Keep the text status of the current version live (it changes while polling).
   const version = viewed.id === doc.current.id ? doc.current : viewed;
   const isCurrent = version.id === doc.current.id;
+  // The requested version is not among the versions of the document any more.
+  const versionMissing = viewedId !== null && versions !== null && !versions.some((v) => v.id === viewedId);
+  const targetVersionId = target?.versionId ?? doc.current.id;
+  const onTargetVersion = version.id === targetVersionId;
   const original = useOriginal(version);
   // Stable per search selection: re-renders (e.g. polling) must not jump back to the target.
   const pageTarget = useMemo(
@@ -164,7 +180,10 @@ export function DocumentViewer({
   };
 
   let body;
-  if (version.kind === "pdf" || version.kind === "image") {
+  if (viewedId !== null && versions === null && !versionsError) {
+    // Waiting for the list of versions before showing an older one.
+    body = null;
+  } else if (version.kind === "pdf" || version.kind === "image") {
     if (original.error) {
       body = <ErrorBanner error={original.error} action={{ label: "Riprova", onClick: original.retry }} />;
     } else if (!original.data) {
@@ -181,7 +200,7 @@ export function DocumentViewer({
             key={version.id}
             data={original.data}
             title={doc.title}
-            target={isCurrent ? pageTarget : null}
+            target={onTargetVersion ? pageTarget : null}
           />
         </Suspense>
       );
@@ -204,7 +223,7 @@ export function DocumentViewer({
         versionId={version.id}
         kind={version.kind}
         status={version.textStatus}
-        target={isCurrent ? blockTarget : null}
+        target={onTargetVersion ? blockTarget : null}
       />
     );
   }
@@ -262,6 +281,42 @@ export function DocumentViewer({
             Mostra la versione corrente
           </button>
         </div>
+      ) : null}
+
+      {versionMissing ? (
+        <p className="notice" role="status">
+          La versione citata non esiste più: viene mostrata la versione corrente.
+        </p>
+      ) : null}
+
+      {target?.snippet && (onTargetVersion || versionMissing) ? (
+        <aside className="cited-passage" aria-labelledby={`${panelId}-passage`}>
+          <div className="cited-passage-head">
+            <h3 id={`${panelId}-passage`} className="cited-passage-title">
+              Passaggio citato · {target.unitKind === "page" ? `pagina ${target.unit}` : `blocco ${target.unit}`}
+              {!isCurrent ? ` · versione ${version.versionNo}` : ""}
+            </h3>
+            {onBackToChat ? (
+              <button type="button" className="link-btn" onClick={onBackToChat}>
+                Torna alla chat
+              </button>
+            ) : null}
+            {onDismissTarget ? (
+              <button
+                type="button"
+                className="icon-btn icon-btn-sm"
+                aria-label="Nascondi passaggio citato"
+                title="Nascondi passaggio citato"
+                onClick={onDismissTarget}
+              >
+                <CloseIcon />
+              </button>
+            ) : null}
+          </div>
+          <p className="cited-passage-text" tabIndex={0}>
+            {target.snippet}
+          </p>
+        </aside>
       ) : null}
 
       <div className="viewer-layout">

@@ -1,10 +1,14 @@
 import type { ReactNode } from "react";
+import type { Project } from "../api/types";
 import type { ThemePref } from "../hooks/useTheme";
+import { LlmSettingsSection } from "./settings/LlmSettingsSection";
 
 interface SettingsViewProps {
   theme: ThemePref;
   onThemeChange: (theme: ThemePref) => void;
   sidebarToggle: ReactNode;
+  /** Selected project, for the indexing status. */
+  project: Project | null;
 }
 
 const OPTIONS: { value: ThemePref; label: string }[] = [
@@ -13,7 +17,7 @@ const OPTIONS: { value: ThemePref; label: string }[] = [
   { value: "dark", label: "Scuro" },
 ];
 
-export function SettingsView({ theme, onThemeChange, sidebarToggle }: SettingsViewProps) {
+export function SettingsView({ theme, onThemeChange, sidebarToggle, project }: SettingsViewProps) {
   return (
     <div className="view">
       <div className="view-header">
@@ -39,6 +43,7 @@ export function SettingsView({ theme, onThemeChange, sidebarToggle }: SettingsVi
           </div>
           <p className="hint">«Sistema» segue l'aspetto chiaro o scuro del sistema operativo.</p>
         </fieldset>
+        <LlmSettingsSection project={project} />
       </div>
     </div>
   );

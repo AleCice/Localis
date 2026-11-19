@@ -9,8 +9,23 @@
 // split into blocks like the backend; PDF text is extracted in the browser with pdf.js
 // (the desktop app uses its own Rust extractor, so results can differ); DOCX extraction
 // is not implemented here and its jobs fail with an explicit "mock" detail.
+//
+// Chat (v0.3): LM Studio is never contacted. By default it is reported as not reachable, so
+// answers end with `llm_unavailable` (inventory, clarification and no_evidence still work, like
+// in the app). With VITE_MOCK_LLM=1 a fake model writes canned answers that say they come from
+// the mock and cite the passages really found by the mock's lexical search. Retrieval here is
+// always lexical: embedding progress is simulated and labelled as such, never used.
 import type {
   AppError,
+  ChatEvent,
+  ChatMessage,
+  Conversation,
+  EmbeddingStatus,
+  LlmSettings,
+  LlmStatus,
+  RetrievalInfo,
+  SendMessageInput,
+  Source,
   DocumentKind,
   DocumentVersion,
   Folder,
@@ -410,6 +425,385 @@ function searchUnit(text: string, terms: string[]): string | null {
   return out;
 }
 
+// ------------------------------------------------------------------ chat (v0.3)
+
+const MOCK_LLM = import.meta.env.VITE_MOCK_LLM === "1";
+const MOCK_CHAT_MODEL = "backend-di-prova/chat-finto";
+const MOCK_EMBEDDING_MODEL = "backend-di-prova/embedding-finto";
+const MOCK_DETAIL =
+  "backend di prova (npm run dev:mock): LM Studio non viene contattato. Con VITE_MOCK_LLM=1 un modello finto produce risposte di prova.";
+
+const chat = {
+  settings: { baseUrl: "http://127.0.0.1:1234", chatModel: null, embeddingModel: null } as LlmSettings,
+  conversations: [] as Conversation[],
+  messages: [] as ChatMessage[],
+  generating: new Set<string>(),
+  cancelled: new Set<string>(),
+  /** Simulated embedding progress: start time per project + model. */
+  embeddingStart: new Map<string, number>(),
+};
+
+function validateBaseUrl(raw: string): string {
+  const invalid = (): never =>
+    fail({
+      code: "validation",
+      field: "baseUrl",
+      message: "Usa un indirizzo http di questo computer, ad esempio http://127.0.0.1:1234.",
+    });
+  let url: URL;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    return invalid();
+  }
+  if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) invalid();
+  if (url.username || url.password || url.search || url.hash || (url.pathname !== "/" && url.pathname !== "")) invalid();
+  return `${url.protocol}//${url.host}`;
+}
+
+interface Chunk {
+  documentId: string;
+  versionId: string;
+  title: string;
+  unit: number;
+  unitKind: "page" | "block";
+  text: string;
+}
+
+/** Splits a unit into passages of at most ~1200 characters on paragraph/sentence/word boundaries. */
+function splitPassages(text: string, max = 1200): string[] {
+  const out: string[] = [];
+  let rest = text.trim();
+  while (rest.length > max) {
+    const window = rest.slice(0, max);
+    let cut = Math.max(window.lastIndexOf("\n\n"), window.lastIndexOf(". "), window.lastIndexOf("\n"));
+    if (cut < max * 0.4) cut = window.lastIndexOf(" ");
+    if (cut <= 0) cut = max;
+    out.push(rest.slice(0, cut + 1).trim());
+    rest = rest.slice(cut + 1).trim();
+  }
+  if (rest) out.push(rest);
+  return out;
+}
+
+function projectChunks(projectId: string, documentIds?: Set<string>): Chunk[] {
+  const chunks: Chunk[] = [];
+  for (const doc of lib.documents.filter((d) => d.projectId === projectId)) {
+    if (documentIds && !documentIds.has(doc.id)) continue;
+    const current = versionsOf(doc.id)[0]!;
+    for (const unit of lib.text.get(current.id) ?? []) {
+      for (const text of splitPassages(unit.text)) {
+        chunks.push({
+          documentId: doc.id,
+          versionId: current.id,
+          title: doc.title,
+          unit: unit.unit,
+          unitKind: current.kind === "pdf" ? "page" : "block",
+          text,
+        });
+      }
+    }
+  }
+  return chunks;
+}
+
+const STOPWORDS = new Set(
+  (
+    "il lo la i gli le un uno una di a da in con su per tra fra e o ma se che chi cosa come dove quando quale quali " +
+    "del dello della dei degli delle al allo alla ai agli alle dal dallo dalla dai dagli dalle nel nello nella nei " +
+    "negli nelle sul sullo sulla sui sugli sulle è sono mi ti si ci vi ne non piu più anche questo questa questi " +
+    "queste quello quella quelli quelle mio tuo suo nostro loro dimmi spiega spiegami parla documento documenti file"
+  ).split(" "),
+);
+
+function questionTerms(question: string): string[] {
+  const words = normalize(question).match(WORD) ?? [];
+  return [...new Set(words.filter((w) => w.length >= 2 && !STOPWORDS.has(w)))];
+}
+
+function chunkScore(text: string, terms: string[]): number {
+  const words = (normalize(text).match(WORD) ?? []) as string[];
+  let score = 0;
+  for (const term of terms) {
+    if (words.some((w) => (term.length >= 4 ? w.startsWith(term) : w === term))) score += 1;
+  }
+  return score;
+}
+
+function titleWords(title: string): string[] {
+  const base = title.replace(/\.[a-z0-9]{1,5}$/i, "");
+  return normalize(base).match(WORD) ?? [];
+}
+
+/** Documents the question names reliably (whole title as a word sequence, or all significant words). */
+function documentsNamed(projectId: string, question: string): StoredDocument[] {
+  const q = ` ${(normalize(question).match(WORD) ?? []).join(" ")} `;
+  const qWords = new Set(q.trim().split(" "));
+  return lib.documents.filter((doc) => {
+    if (doc.projectId !== projectId) return false;
+    const words = titleWords(doc.title);
+    if (words.length === 0) return false;
+    if (q.includes(` ${words.join(" ")} `)) return true;
+    const significant = words.filter((w) => w.length >= 3);
+    return significant.length >= 2 && significant.every((w) => qWords.has(w));
+  });
+}
+
+const INVENTORY = /\b(quali|che|elenca|elenco|lista|mostrami)\b.*\b(documenti|file|materiali)\b|\bcosa ho caricato\b/;
+const DEICTIC = /\b(questo|quel|quello|il)\s+(documento|file|pdf|testo)\b/;
+
+function citedNumbers(content: string): Set<number> {
+  const prose = content.replace(/```[\s\S]*?```/g, " ").replace(/`[^`]*`/g, " ");
+  const found = new Set<number>();
+  for (const m of prose.matchAll(/\[(\d+(?:\s*[,;]\s*\d+)*|\d+\s*[-–]\s*\d+)\]/g)) {
+    const parts = m[1]!.split(/\s*[,;\-–]\s*/).map(Number);
+    if (/[-–]/.test(m[1]!) && parts.length === 2) for (let n = parts[0]!; n <= parts[1]!; n++) found.add(n);
+    else parts.forEach((n) => found.add(n));
+  }
+  return found;
+}
+
+function excerptOf(text: string, max = 160): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max).trimEnd()}…` : flat;
+}
+
+function cannedAnswer(question: string, evidence: Source[]): string {
+  const head =
+    "**Risposta di prova del backend finto: non è stata generata da un modello.** " +
+    "Riporta i passaggi trovati dalla ricerca lessicale del backend di prova.";
+  if (question.trim().startsWith("/demo")) {
+    return [
+      head,
+      "",
+      "Contenuto dimostrativo per verificare la resa di Markdown e formule (non viene dai documenti):",
+      "",
+      `Inline \\(e^{i\\pi} + 1 = 0\\) e $a^2 + b^2 = c^2$; primo passaggio trovato [1].`,
+      "",
+      "\\[",
+      "\\int_0^1 f(x)\\,dx = \\lim_{n\\to\\infty} \\sum_{k=1}^{n} f\\left(\\tfrac{k}{n}\\right)\\tfrac{1}{n} + \\sum_{k=1}^{n} \\binom{n}{k} x^k (1-x)^{n-k} + \\sum_{j=1}^{m} \\frac{\\partial^2 u}{\\partial x_j^2} + \\Gamma(z) = \\int_0^\\infty t^{z-1} e^{-t}\\,dt",
+      "\\]",
+      "",
+      "$$",
+      "\\begin{pmatrix} a & b \\\\[2pt] c & d \\end{pmatrix}",
+      "$$",
+      "",
+      "| Colonna 1 | Colonna 2 | Colonna 3 | Colonna 4 | Colonna 5 | Colonna 6 | Colonna 7 | Colonna 8 |",
+      "|---|---|---|---|---|---|---|---|",
+      "| valore molto lungo uno | valore molto lungo due | valore molto lungo tre | valore molto lungo quattro | cinque | sei | sette | otto |",
+      "",
+      "```python",
+      "def esempio(x):  # \\(non convertito\\) e $nemmeno$ qui [1]",
+      "    return [x ** 2 for x in range(100) if x % 3 == 0 and x % 5 == 0 and x % 7 == 0 and x % 11 == 0]",
+      "```",
+      "",
+      "Codice inline `\\(x\\)` e `$y$` restano letterali. Link: [esempio](https://example.com). Riferimento inesistente: [99].",
+    ].join("\n");
+  }
+  const lines = evidence.slice(0, 3).map((s) => `- «${excerptOf(s.text)}» [${s.n}]`);
+  return [head, "", ...lines, "", "Un riferimento a una fonte inesistente resta testo semplice: [99]."].join("\n");
+}
+
+function storeMessage(message: ChatMessage) {
+  const at = chat.messages.findIndex((m) => m.id === message.id);
+  if (at >= 0) chat.messages[at] = message;
+  else chat.messages.push(message);
+}
+
+function withAvailability(message: ChatMessage): ChatMessage {
+  return {
+    ...message,
+    sources: message.sources.map((s) => ({
+      ...s,
+      available: lib.versions.some((v) => v.id === s.versionId && v.documentId === s.documentId),
+    })),
+  };
+}
+
+async function runChat(input: SendMessageInput, onEvent: (event: ChatEvent) => void): Promise<ChatMessage> {
+  await delay(80);
+  const conversation =
+    chat.conversations.find((c) => c.id === input.conversationId) ??
+    fail({ code: "not_found", message: "La conversazione non esiste più." });
+  const question = input.text.trim();
+  if (!question) fail({ code: "validation", field: "text", message: "Scrivi una domanda." });
+  if (chat.generating.has(conversation.id))
+    fail({ code: "conflict", message: "È già in corso una risposta in questa conversazione." });
+
+  const stamp = now();
+  const base = { conversationId: conversation.id, error: null, model: null, retrieval: null, sources: [], candidates: [] };
+  const userMessage: ChatMessage = { ...base, id: crypto.randomUUID(), role: "user", kind: "question", content: question, status: "complete", createdAt: stamp };
+  const previous = chat.messages.filter((m) => m.conversationId === conversation.id);
+  storeMessage(userMessage);
+  if (conversation.title === "Nuova conversazione") conversation.title = question.length > 60 ? `${question.slice(0, 60).trimEnd()}…` : question;
+  conversation.updatedAt = stamp;
+
+  let assistant: ChatMessage = { ...base, id: crypto.randomUUID(), role: "assistant", kind: "answer", content: "", status: "streaming", createdAt: now() };
+  storeMessage(assistant);
+  chat.generating.add(conversation.id);
+  onEvent({ type: "accepted", userMessage: { ...userMessage }, assistantMessageId: assistant.id });
+
+  const complete = (patch: Partial<ChatMessage>): ChatMessage => {
+    assistant = { ...assistant, status: "complete", ...patch };
+    storeMessage(assistant);
+    chat.generating.delete(conversation.id);
+    chat.cancelled.delete(conversation.id);
+    return withAvailability(assistant);
+  };
+
+  try {
+    await delay(150);
+    onEvent({ type: "phase", phase: "retrieving" });
+    const projectId = conversation.projectId;
+    const projectDocs = lib.documents.filter((d) => d.projectId === projectId);
+    const normQuestion = (normalize(question).match(WORD) ?? []).join(" ");
+
+    // Inventory: built by Localis from the library, no model.
+    if (!input.documentIds?.length && INVENTORY.test(normQuestion)) {
+      const lines = projectDocs
+        .sort((a, b) => collator.compare(a.title, b.title))
+        .map((d) => {
+          const v = versionsOf(d.id)[0]!;
+          const folder = d.folderId ? (lib.folders.find((f) => f.id === d.folderId)?.name ?? "") : "cartella principale";
+          const status =
+            v.textStatus === "extracted" ? "" : v.textStatus === "no_text" ? " · senza testo ricercabile" : v.textStatus === "not_applicable" ? " · immagine, non ricercabile" : v.textStatus === "pending" ? " · estrazione in corso" : " · estrazione non riuscita";
+          return `- **${d.title}** · ${v.kind.toUpperCase()} · ${folder}${status}`;
+        });
+      const content =
+        lines.length === 0
+          ? "Il progetto non contiene documenti."
+          : `Il progetto contiene ${lines.length === 1 ? "1 documento" : `${lines.length} documenti`}:\n\n${lines.join("\n")}`;
+      const final = complete({ kind: "inventory", content });
+      onEvent({ type: "done", message: final });
+      return final;
+    }
+
+    // Scope.
+    let scope: RetrievalInfo["scope"] = "project";
+    let scopeReason: RetrievalInfo["scopeReason"] = null;
+    let documentIds: string[] = [];
+    if (input.documentIds?.length) {
+      scope = "documents";
+      scopeReason = "selection";
+      documentIds = input.documentIds.filter((id) => projectDocs.some((d) => d.id === id));
+    } else {
+      const named = documentsNamed(projectId, question);
+      if (named.length > 1) {
+        const final = complete({
+          kind: "clarification",
+          content: "La domanda può riferirsi a più documenti. Quale intendi?",
+          candidates: named.map((d) => ({ documentId: d.id, title: d.title })),
+        });
+        onEvent({ type: "done", message: final });
+        return final;
+      }
+      if (named.length === 1) {
+        scope = "documents";
+        scopeReason = "title";
+        documentIds = [named[0]!.id];
+      } else if (DEICTIC.test(normQuestion)) {
+        const last = [...previous].reverse().find((m) => m.role === "assistant" && m.retrieval);
+        if (last?.retrieval?.scope === "documents" && last.retrieval.documentIds.length === 1) {
+          scope = "documents";
+          scopeReason = "history";
+          documentIds = [...last.retrieval.documentIds];
+        } else {
+          const recent = [...new Set(previous.flatMap((m) => m.sources.filter((s) => s.cited).map((s) => s.documentId)))];
+          const candidates = (recent.length > 0 ? projectDocs.filter((d) => recent.includes(d.id)) : projectDocs.length <= 6 ? projectDocs : []).map((d) => ({ documentId: d.id, title: d.title }));
+          const final = complete({ kind: "clarification", content: "A quale documento ti riferisci?", candidates });
+          onEvent({ type: "done", message: final });
+          return final;
+        }
+      }
+    }
+
+    // Lexical retrieval over passages of current versions.
+    const terms = questionTerms(question);
+    const query = terms.map((t) => (t.length >= 4 ? `"${t}"*` : `"${t}"`)).join(" OR ");
+    const chunks = projectChunks(projectId, scope === "documents" ? new Set(documentIds) : undefined);
+    const ranked = chunks
+      .map((c) => ({ c, score: chunkScore(c.text, terms) }))
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 30);
+    const sources: Source[] = ranked.map(({ c }, i) => ({
+      rank: i + 1,
+      n: null,
+      cited: false,
+      documentId: c.documentId,
+      versionId: c.versionId,
+      title: c.title,
+      unit: c.unit,
+      unitKind: c.unitKind,
+      text: c.text,
+      via: "lexical",
+      available: true,
+    }));
+    let budget = 6000;
+    let n = 0;
+    for (const s of sources) {
+      if (n >= 8 || s.text.length > budget) continue;
+      n += 1;
+      s.n = n;
+      budget -= s.text.length;
+    }
+    const retrieval: RetrievalInfo = { mode: "lexical", scope, documentIds, scopeReason, embeddingModel: null, query };
+
+    if (sources.length === 0) {
+      const scoped = scope === "documents" ? projectDocs.filter((d) => documentIds.includes(d.id)) : projectDocs;
+      const withoutText = scoped.some((d) => ["no_text", "not_applicable"].includes(versionsOf(d.id)[0]!.textStatus));
+      const final = complete({
+        kind: "no_evidence",
+        retrieval,
+        content:
+          "Non ho trovato nei documenti di questo progetto passaggi pertinenti." +
+          (withoutText ? " Alcuni documenti non hanno testo ricercabile." : ""),
+      });
+      onEvent({ type: "done", message: final });
+      return final;
+    }
+
+    const model = chat.settings.chatModel;
+    if (!MOCK_LLM || !model) {
+      const error: AppError = MOCK_LLM
+        ? { code: "llm_unavailable", message: "Nessun modello di chat selezionato.", detail: MOCK_DETAIL }
+        : { code: "llm_unavailable", message: `LM Studio non è raggiungibile su ${chat.settings.baseUrl}.`, detail: MOCK_DETAIL };
+      const final = complete({ status: "error", error, retrieval, sources });
+      onEvent({ type: "error", error, message: final });
+      return final;
+    }
+
+    onEvent({ type: "phase", phase: "generating" });
+    await delay(400);
+    const text = cannedAnswer(question, sources.filter((s) => s.n != null));
+    const pieces = text.match(/\S+\s*|\s+/g) ?? [];
+    let content = "";
+    for (const piece of pieces) {
+      if (chat.cancelled.has(conversation.id)) {
+        const error: AppError = { code: "cancelled", message: "Risposta interrotta." };
+        const final = complete({ status: "cancelled", error, content, retrieval, sources, model });
+        onEvent({ type: "error", error, message: final });
+        return final;
+      }
+      content += piece;
+      onEvent({ type: "delta", text: piece });
+      await delay(35);
+    }
+    const valid = citedNumbers(content);
+    const final = complete({
+      content,
+      retrieval,
+      model,
+      sources: sources.map((s) => ({ ...s, cited: s.n != null && valid.has(s.n) })),
+    });
+    onEvent({ type: "done", message: final });
+    return final;
+  } finally {
+    chat.generating.delete(conversation.id);
+    chat.cancelled.delete(conversation.id);
+  }
+}
+
 // ------------------------------------------------------------------ API
 
 export const mockBackend: Api = {
@@ -445,6 +839,9 @@ export const mockBackend: Api = {
     save(items.filter((p) => p.id !== id));
     removeDocuments(new Set(lib.documents.filter((d) => d.projectId === id).map((d) => d.id)));
     lib.folders = lib.folders.filter((f) => f.projectId !== id);
+    const conversations = new Set(chat.conversations.filter((c) => c.projectId === id).map((c) => c.id));
+    chat.conversations = chat.conversations.filter((c) => !conversations.has(c.id));
+    chat.messages = chat.messages.filter((m) => !conversations.has(m.conversationId));
   },
 
   async listFolders(projectId) {
@@ -623,5 +1020,91 @@ export const mockBackend: Api = {
     setStatus(job.versionId, "pending");
     runJob(job.id);
     return { ...job };
+  },
+
+  async getLlmSettings() {
+    await delay(40);
+    return { ...chat.settings };
+  },
+  async setLlmSettings(settings) {
+    await delay();
+    const baseUrl = validateBaseUrl(settings.baseUrl);
+    const chatModel = settings.chatModel?.trim() || null;
+    const embeddingModel = settings.embeddingModel?.trim() || null;
+    chat.settings = { baseUrl, chatModel, embeddingModel };
+    return { ...chat.settings };
+  },
+  async getLlmStatus(): Promise<LlmStatus> {
+    await delay(300);
+    if (!MOCK_LLM)
+      return { reachable: false, message: `LM Studio non risponde su ${chat.settings.baseUrl}.`, detail: MOCK_DETAIL, models: [] };
+    return {
+      reachable: true,
+      message: null,
+      detail: null,
+      models: [
+        { id: MOCK_CHAT_MODEL, kind: "llm", state: "loaded" },
+        { id: MOCK_EMBEDDING_MODEL, kind: "embedding", state: "loaded" },
+      ],
+    };
+  },
+  async getEmbeddingStatus(projectId): Promise<EmbeddingStatus> {
+    await delay(60);
+    projectExists(projectId);
+    const total = projectChunks(projectId).length;
+    const model = chat.settings.embeddingModel;
+    if (!model) return { state: "disabled", model: null, total, embedded: 0, message: null };
+    if (!MOCK_LLM)
+      return {
+        state: "unreachable",
+        model,
+        total,
+        embedded: 0,
+        message: "LM Studio non è raggiungibile: l'indicizzazione riprenderà quando risponde.",
+      };
+    const key = `${projectId}|${model}`;
+    if (!chat.embeddingStart.has(key)) chat.embeddingStart.set(key, Date.now());
+    const embedded = Math.min(total, Math.floor((Date.now() - chat.embeddingStart.get(key)!) / 400));
+    return {
+      state: embedded < total ? "running" : "idle",
+      model,
+      total,
+      embedded,
+      message: "Backend di prova: avanzamento simulato, nessun embedding viene calcolato o usato.",
+    };
+  },
+
+  async listConversations(projectId) {
+    await delay(60);
+    return chat.conversations
+      .filter((c) => c.projectId === projectId)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+      .map((c) => ({ ...c }));
+  },
+  async createConversation(projectId) {
+    await delay();
+    projectExists(projectId);
+    const stamp = now();
+    const conversation: Conversation = { id: crypto.randomUUID(), projectId, title: "Nuova conversazione", createdAt: stamp, updatedAt: stamp };
+    chat.conversations.push(conversation);
+    return { ...conversation };
+  },
+  async deleteConversation(id) {
+    await delay();
+    if (!chat.conversations.some((c) => c.id === id)) fail({ code: "not_found", message: "La conversazione non esiste più." });
+    chat.cancelled.add(id);
+    chat.conversations = chat.conversations.filter((c) => c.id !== id);
+    chat.messages = chat.messages.filter((m) => m.conversationId !== id);
+  },
+  async listMessages(conversationId) {
+    await delay(60);
+    if (!chat.conversations.some((c) => c.id === conversationId))
+      fail({ code: "not_found", message: "La conversazione non esiste più." });
+    return chat.messages.filter((m) => m.conversationId === conversationId).map(withAvailability);
+  },
+  sendMessage: runChat,
+  async cancelGeneration(conversationId) {
+    await delay(40);
+    if (chat.generating.has(conversationId)) chat.cancelled.add(conversationId);
   },
 };

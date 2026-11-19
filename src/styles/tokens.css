@@ -22,6 +22,7 @@
   --danger-text: #ffffff;
   --danger-soft: #fbeceb;
   --danger-soft-border: #efc3c0;
+  --success: #2e7d32;
   --focus: #2f6db0;
   --scrim: rgb(16 22 30 / 0.36);
   --shadow-dialog: 0 18px 48px rgb(16 22 30 / 0.18), 0 2px 6px rgb(16 22 30 / 0.08);
@@ -87,6 +88,7 @@
   --danger-text: #2a0a07;
   --danger-soft: #3a2020;
   --danger-soft-border: #6a3532;
+  --success: #81c784;
   --focus: #8cb8e6;
   --scrim: rgb(0 0 0 / 0.5);
   --shadow-dialog: 0 18px 48px rgb(0 0 0 / 0.5), 0 2px 6px rgb(0 0 0 / 0.3);

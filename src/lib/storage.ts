@@ -6,6 +6,7 @@ export const STORAGE_KEYS = {
   theme: "localis.theme",
   sidebar: "localis.sidebar",
   onboarded: "localis.onboarded",
+  chatConversations: "localis.chat.conversations",
 } as const;
 
 export function readPref<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
