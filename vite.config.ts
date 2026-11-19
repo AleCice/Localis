@@ -15,6 +15,8 @@ export default defineConfig({
   envPrefix: ["VITE_", "TAURI_ENV_"],
   build: {
     target: "es2022",
+    // Never inline fonts as data: URLs: the app CSP allows fonts only from 'self' (KaTeX).
+    assetsInlineLimit: (filePath: string) => (/\.(woff2?|ttf|otf)$/i.test(filePath) ? false : undefined),
     sourcemap: false,
   },
   test: {

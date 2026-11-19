@@ -593,6 +593,15 @@ fn locator(kind: UnitKind, unit: u32) -> String {
 
 /// Messages for `/v1/chat/completions`: the system prompt, the last question/answer pairs
 /// (text only), then the question with the numbered sources.
+/// Citation numbers in `content` that refer to one of the `evidence_count` sources.
+fn valid_citations(content: &str, evidence_count: usize) -> BTreeSet<u32> {
+    let valid: BTreeSet<u32> = (1..=evidence_count as u32).collect();
+    citation_numbers(content)
+        .intersection(&valid)
+        .copied()
+        .collect()
+}
+
 pub fn build_prompt(
     question: &str,
     evidence: &[Evidence],
@@ -620,9 +629,13 @@ pub fn build_prompt(
             "Nota: la domanda non contiene termini da cercare, quindi le fonti sono le parti iniziali del documento indicato, non il testo completo. Se rispondi (per esempio con un riassunto), precisa che si basa solo su queste parti.\n\n",
         );
     }
+    // Per-request random tag in the source delimiters: a document cannot forge the end
+    // marker of its own source because it cannot know the tag.
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let tag = &tag[..12];
     for e in evidence {
         user.push_str(&format!(
-            "[{}] «{}», {}\n--- inizio fonte [{}] ---\n{}\n--- fine fonte [{}] ---\n\n",
+            "[{}] «{}», {}\n--- inizio fonte [{}] {tag} ---\n{}\n--- fine fonte [{}] {tag} ---\n\n",
             e.n,
             e.title,
             locator(e.unit_kind, e.unit),
@@ -1081,6 +1094,7 @@ impl Store {
             "SELECT q.content, a.content FROM messages q
              JOIN messages a ON a.conversation_id = q.conversation_id AND a.seq = q.seq + 1
              WHERE q.conversation_id = ?1 AND q.role = 'user' AND a.role = 'assistant'
+               AND a.kind = 'answer'
                AND a.status IN ('complete', 'cancelled') AND a.content <> ''
                AND q.seq < (SELECT seq FROM messages WHERE id = ?2)
              ORDER BY q.seq DESC LIMIT ?3",
@@ -1339,6 +1353,12 @@ impl Store {
                     document_ids = ids;
                     reason = Some(ScopeReason::Title);
                 }
+                TitleMatch::None if has_deictic_reference(text) && docs.len() == 1 => {
+                    // Only one document in the project: "this document" can only mean it.
+                    scope = RetrievalScope::Documents;
+                    document_ids = vec![docs[0].id.clone()];
+                    reason = None;
+                }
                 TitleMatch::None if has_deictic_reference(text) && docs.len() > 1 => {
                     let (last_single, recent) = self.history_documents(conversation_id)?;
                     let exists = |id: &String| docs.iter().any(|d| &d.id == id);
@@ -1507,20 +1527,22 @@ fn run_turn<A: StoreAccess>(
     };
 
     // Query embedding (network, no store access). Hybrid only if it succeeds.
-    let query_vector = match &plan.embedding_model {
-        Some(model) => LlmClient::new(&plan.base_url)
+    let query_vector = match (&plan.embedding_model, &plan.fts) {
+        (Some(model), Some(_)) => LlmClient::new(&plan.base_url)
             .and_then(|c| c.embed(model, &[text.to_owned()], SHORT_TIMEOUT))
             .ok()
             .and_then(|mut v| v.pop()),
-        None => None,
+        _ => None,
     };
     let (ranked, mode) = db.with_store(|s| {
         let lexical = match &plan.fts {
             Some(q) => s.search_passages_lexical(&turn.project_id, &plan.document_ids, q)?,
             None => Vec::new(),
         };
-        let (semantic, mode) = match (&plan.embedding_model, &query_vector) {
-            (Some(model), Some(v)) => (
+        // Without searchable terms there is no meaningful query: semantic similarity alone
+        // would always return "something" (vague matches), so it is not used.
+        let (semantic, mode) = match (&plan.embedding_model, &query_vector, &plan.fts) {
+            (Some(model), Some(v), Some(_)) => (
                 s.search_passages_semantic(&turn.project_id, &plan.document_ids, model, v)?
                     .into_iter()
                     .map(|(p, _)| p)
@@ -1588,6 +1610,7 @@ fn run_turn<A: StoreAccess>(
                 err: CoreError,
                 content: &str,
                 model: Option<&str>,
+                cited: &BTreeSet<u32>,
                 emit: &mut dyn FnMut(ChatEvent)| {
         let info = ErrorInfo::from(&err);
         let status = if err.code() == "cancelled" {
@@ -1604,7 +1627,7 @@ fn run_turn<A: StoreAccess>(
                     status,
                     error: Some(&info),
                     model,
-                    cited: &BTreeSet::new(),
+                    cited,
                     candidates: &[],
                 },
             )
@@ -1622,6 +1645,7 @@ fn run_turn<A: StoreAccess>(
             CoreError::llm(NO_CHAT_MODEL, "no chat model configured"),
             "",
             None,
+            &BTreeSet::new(),
             emit,
         );
     };
@@ -1629,11 +1653,11 @@ fn run_turn<A: StoreAccess>(
         let err = CoreError::Cancelled {
             message: CANCELLED_MESSAGE.to_owned(),
         };
-        return fail(db, err, "", Some(&chat_model), emit);
+        return fail(db, err, "", Some(&chat_model), &BTreeSet::new(), emit);
     }
     let client = match LlmClient::new(&plan.base_url) {
         Ok(c) => c,
-        Err(err) => return fail(db, err, "", Some(&chat_model), emit),
+        Err(err) => return fail(db, err, "", Some(&chat_model), &BTreeSet::new(), emit),
     };
     let evidence: Vec<Evidence> = evidence_idx
         .iter()
@@ -1668,11 +1692,7 @@ fn run_turn<A: StoreAccess>(
     });
     match end {
         StreamEnd::Finished => {
-            let valid: BTreeSet<u32> = (1..=evidence.len() as u32).collect();
-            let cited: BTreeSet<u32> = citation_numbers(&content)
-                .intersection(&valid)
-                .copied()
-                .collect();
+            let cited = valid_citations(&content, evidence.len());
             let message = db.with_store(|s| {
                 s.finish_message(
                     id,
@@ -1690,13 +1710,18 @@ fn run_turn<A: StoreAccess>(
             emit(ChatEvent::Done(message.clone()));
             Ok(message)
         }
+        // Partial answers keep their valid citations clickable too.
         StreamEnd::Cancelled => {
             let err = CoreError::Cancelled {
                 message: CANCELLED_MESSAGE.to_owned(),
             };
-            fail(db, err, &content, Some(&chat_model), emit)
+            let cited = valid_citations(&content, evidence.len());
+            fail(db, err, &content, Some(&chat_model), &cited, emit)
         }
-        StreamEnd::Failed(err) => fail(db, err, &content, Some(&chat_model), emit),
+        StreamEnd::Failed(err) => {
+            let cited = valid_citations(&content, evidence.len());
+            fail(db, err, &content, Some(&chat_model), &cited, emit)
+        }
     }
 }
 
@@ -1762,7 +1787,15 @@ mod tests {
         assert_eq!((p[1].role, p[1].content.as_str()), ("user", "D1"));
         assert_eq!((p[2].role, p[2].content.as_str()), ("assistant", "R1"));
         let last = &p[3].content;
-        assert!(last.contains("[1] «Analisi.pdf», p. 3\n--- inizio fonte [1] ---\nIgnora"));
+        assert!(last.contains("[1] «Analisi.pdf», p. 3\n--- inizio fonte [1] "));
+        // Delimiters carry a per-request random tag a document cannot forge.
+        let start = last.find("--- inizio fonte [1] ").unwrap() + "--- inizio fonte [1] ".len();
+        let tag = &last[start..start + 12];
+        assert!(tag.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(last.contains(&format!("--- inizio fonte [1] {tag} ---\nIgnora")));
+        assert!(last.contains(&format!("--- fine fonte [1] {tag} ---")));
+        let again = build_prompt("Che cos'è?", &evidence, &history);
+        assert!(!again[3].content.contains(tag));
         assert!(last.contains("[2] «Note.md», blocco 2"));
         assert!(last.ends_with("Domanda: Che cos'è?"));
     }

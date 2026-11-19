@@ -181,8 +181,21 @@ function splitCitations(value: string, valid: ReadonlySet<number>): PhrasingCont
     if (!numbers.some((n) => valid.has(n))) continue;
     changed = true;
     if (match.index > last) parts.push({ type: "text", value: value.slice(last, match.index) });
-    if (numbers.every((n) => valid.has(n)) && !/[-–]/.test(match[1]!)) {
-      for (const n of numbers) parts.push(citeNode(n));
+    // Expand ranges («[1-3]» cites 1, 2 and 3, as the backend records it).
+    const expanded: number[] = [];
+    tokens.forEach((token, i) => {
+      if (i % 2 === 1) return;
+      const n = Number(token);
+      const sep = tokens[i - 1];
+      const prev = expanded[expanded.length - 1];
+      if (sep !== undefined && /[-–]/.test(sep) && prev !== undefined && n > prev && n - prev <= 50) {
+        for (let k = prev + 1; k <= n; k++) expanded.push(k);
+      } else {
+        expanded.push(n);
+      }
+    });
+    if (expanded.every((n) => valid.has(n))) {
+      for (const n of expanded) parts.push(citeNode(n));
     } else {
       parts.push({ type: "text", value: "[" });
       tokens.forEach((token, i) => {

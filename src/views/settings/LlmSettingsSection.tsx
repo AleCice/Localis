@@ -40,10 +40,12 @@ function useEmbeddingStatus(projectId: string | null, key: string | null) {
     };
   }, [projectId, key, tick]);
 
-  // Poll only while indexing is running.
+  // Poll while indexing is running, and slowly while LM Studio is unreachable (the embedder
+  // retries in the background, so the state can change without user action).
   useEffect(() => {
-    if (status?.state !== "running") return;
-    const timer = window.setTimeout(() => setTick((t) => t + 1), EMBEDDING_POLL_MS);
+    if (status?.state !== "running" && status?.state !== "unreachable") return;
+    const delay = status.state === "running" ? EMBEDDING_POLL_MS : EMBEDDING_POLL_MS * 10;
+    const timer = window.setTimeout(() => setTick((t) => t + 1), delay);
     return () => window.clearTimeout(timer);
   }, [status]);
 

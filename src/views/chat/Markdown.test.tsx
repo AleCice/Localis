@@ -94,6 +94,17 @@ describe("Markdown citations", () => {
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
+  it("expands a valid range into one button per cited source, like the backend", () => {
+    const citations = new Map<number, CitationInfo>([
+      [1, { label: "Fonte 1", onOpen: vi.fn() }],
+      [2, { label: "Fonte 2", onOpen: vi.fn() }],
+      [3, { label: "Fonte 3", onOpen: vi.fn() }],
+    ]);
+    renderMd("Intervallo [1-3].", citations);
+    expect(screen.getAllByRole("button").map((b) => b.getAttribute("aria-label") ?? b.textContent)).toHaveLength(3);
+    expect(screen.getByRole("button", { name: "Fonte 2" })).toBeInTheDocument();
+  });
+
   it("handles groups: valid numbers become buttons, others stay text", () => {
     const citations = new Map<number, CitationInfo>([
       [1, { label: "Fonte 1", onOpen: vi.fn() }],

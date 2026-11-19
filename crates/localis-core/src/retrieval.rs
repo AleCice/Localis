@@ -21,6 +21,9 @@ pub const EVIDENCE_BUDGET_CHARS: usize = 6000;
 pub const RRF_K: f64 = 60.0;
 /// Semantic results below this cosine similarity are ignored.
 pub const MIN_COSINE: f32 = 0.2;
+/// Semantic results more than this below the best match are ignored: absolute cosine values
+/// are not comparable across embedding models, the gap to the best match is more stable.
+pub const MAX_COSINE_GAP: f32 = 0.15;
 const MAX_QUERY_TERMS: usize = 32;
 const MAX_TERM_CHARS: usize = 100;
 /// Prefix matching only for terms of at least this many characters.
@@ -805,13 +808,16 @@ impl Store {
         if document_ids.is_empty() {
             return Ok(Vec::new());
         }
+        // Round-robin across the selected documents (first passage of each, then the second…),
+        // so selecting several documents does not cover only the first one.
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {PASSAGE_COLUMNS}
              FROM chunks c
              JOIN document_versions v ON v.id = c.version_id
              JOIN documents d ON d.id = v.document_id
              WHERE {SCOPE_SQL}
-             ORDER BY d.title, d.id, c.unit, c.ordinal
+             ORDER BY ROW_NUMBER() OVER (PARTITION BY d.id ORDER BY c.unit, c.ordinal),
+                      d.title, d.id
              LIMIT ?4"
         ))?;
         let rows = stmt.query_map(
@@ -878,6 +884,9 @@ impl Store {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.0.chunk_id.cmp(&b.0.chunk_id))
         });
+        if let Some(best) = scored.first().map(|(_, s)| *s) {
+            scored.retain(|(_, s)| *s >= best - MAX_COSINE_GAP);
+        }
         scored.truncate(RAW_MAX);
         Ok(scored)
     }

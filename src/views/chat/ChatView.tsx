@@ -22,7 +22,8 @@ import { ScopeDialog } from "./ScopeDialog";
 /** From this width the conversation list is a column; below it opens over the conversation. */
 export const CHAT_LIST_INLINE_QUERY = "(min-width: 64rem)";
 /** From this width the inspector is a column; below it opens over the conversation. */
-export const CHAT_INSPECTOR_INLINE_QUERY = "(min-width: 75rem)";
+// Inline only when the thread keeps a comfortable width next to both side panels.
+export const CHAT_INSPECTOR_INLINE_QUERY = "(min-width: 96rem)";
 /** Streamed text is rendered at most this often (ms). */
 const RENDER_INTERVAL_MS = 40;
 

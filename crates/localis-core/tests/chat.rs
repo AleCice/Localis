@@ -806,13 +806,19 @@ fn deictic_reference_uses_history_or_asks() {
     assert_eq!(r.scope_reason, Some(ScopeReason::History));
     assert_eq!(r.document_ids, std::slice::from_ref(&storia.id));
 
-    // A single-document project never needs a clarification.
+    // A single-document project never needs a clarification: "this document" is that one.
     let single = Chat::new();
-    single.import("analisi.md", ANALISI.as_bytes());
+    let only = single.import("analisi.md", ANALISI.as_bytes());
     let conv = single.conversation();
     let m = single.ask(&conv, "Cosa dice questo documento sulla derivata?");
     assert_eq!(m.kind, MessageKind::Answer);
-    assert_eq!(m.retrieval.unwrap().scope, RetrievalScope::Project);
+    let r = m.retrieval.unwrap();
+    assert_eq!(r.scope, RetrievalScope::Documents);
+    assert_eq!(r.document_ids, std::slice::from_ref(&only.id));
+    // …and «Riassumi questo documento» uses its declared opening passages.
+    let m = single.ask(&conv, "Riassumi questo documento");
+    assert_eq!(m.kind, MessageKind::Answer);
+    assert!(m.sources.iter().all(|s| s.via == Via::Position));
 }
 
 #[test]
@@ -1259,4 +1265,21 @@ fn document_question_without_search_terms_uses_declared_opening_passages() {
     // A document-scoped question with terms that are not in the document stays no_evidence.
     let (res, _) = chat.send(&conv, "Cosa dice di Napoleone?", &[&analisi.id]);
     assert_eq!(res.unwrap().kind, MessageKind::NoEvidence);
+}
+
+#[test]
+fn hybrid_mode_does_not_answer_questions_without_search_terms() {
+    let chat = Chat::new();
+    chat.import("analisi.md", ANALISI.as_bytes());
+    chat.import("storia.txt", STORIA.as_bytes());
+    chat.settings(|s| s.embedding_model = Some(EMBED_MODEL.into()));
+    chat.embed_all();
+    let conv = chat.conversation();
+    let before = chat.fake.requests("/v1/embeddings").len();
+    let m = chat.ask(&conv, "Riassumi tutto");
+    assert_eq!(m.kind, MessageKind::NoEvidence);
+    assert_eq!(m.retrieval.unwrap().mode, RetrievalMode::Lexical);
+    assert!(chat.fake.requests("/v1/chat/completions").is_empty());
+    // No query embedding was even requested.
+    assert_eq!(chat.fake.requests("/v1/embeddings").len(), before);
 }
