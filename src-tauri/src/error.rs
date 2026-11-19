@@ -12,8 +12,29 @@ pub enum ErrorCode {
     Unsupported,
     TooLarge,
     Integrity,
+    LlmUnavailable,
+    Cancelled,
     Storage,
     Internal,
+}
+
+impl ErrorCode {
+    /// Parses a code as produced by `CoreError::code` (unknown → `Internal`).
+    pub fn parse(code: &str) -> Self {
+        match code {
+            "validation" => ErrorCode::Validation,
+            "duplicate" => ErrorCode::Duplicate,
+            "not_found" => ErrorCode::NotFound,
+            "conflict" => ErrorCode::Conflict,
+            "unsupported" => ErrorCode::Unsupported,
+            "too_large" => ErrorCode::TooLarge,
+            "integrity" => ErrorCode::Integrity,
+            "llm_unavailable" => ErrorCode::LlmUnavailable,
+            "cancelled" => ErrorCode::Cancelled,
+            "storage" => ErrorCode::Storage,
+            _ => ErrorCode::Internal,
+        }
+    }
 }
 
 /// Structured error returned by every command (`AppError` in `src/api/types.ts`).
@@ -50,6 +71,32 @@ impl AppError {
     }
 }
 
+impl From<&localis_core::ErrorInfo> for AppError {
+    /// An error stored on a chat message or sent in a chat event (already logged, if at all).
+    fn from(info: &localis_core::ErrorInfo) -> Self {
+        AppError {
+            code: ErrorCode::parse(&info.code),
+            message: info.message.clone(),
+            field: None,
+            detail: info.detail.clone(),
+        }
+    }
+}
+
+impl From<AppError> for CoreError {
+    /// For the chat pipeline, which takes the store through `localis_core::StoreAccess`:
+    /// only store-opening errors travel this way.
+    fn from(err: AppError) -> Self {
+        match err.code {
+            ErrorCode::Internal => CoreError::Internal(err.detail.unwrap_or(err.message)),
+            _ => CoreError::Storage {
+                message: err.message,
+                detail: err.detail.unwrap_or_default(),
+            },
+        }
+    }
+}
+
 impl From<CoreError> for AppError {
     fn from(err: CoreError) -> Self {
         let code = match err {
@@ -60,6 +107,8 @@ impl From<CoreError> for AppError {
             CoreError::Unsupported { .. } => ErrorCode::Unsupported,
             CoreError::TooLarge { .. } => ErrorCode::TooLarge,
             CoreError::Integrity { .. } => ErrorCode::Integrity,
+            CoreError::LlmUnavailable { .. } => ErrorCode::LlmUnavailable,
+            CoreError::Cancelled { .. } => ErrorCode::Cancelled,
             CoreError::Storage { .. } => ErrorCode::Storage,
             CoreError::Internal(_) => ErrorCode::Internal,
         };

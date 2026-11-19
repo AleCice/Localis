@@ -8,6 +8,8 @@ use std::time::Duration;
 use localis_core::{ImportFile, ImportOutcome, LibraryDocument, NewProject, Project, Store};
 use tempfile::TempDir;
 
+pub mod fake_lm;
+
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A temporary data directory with `localis.db` and `originals/` inside.

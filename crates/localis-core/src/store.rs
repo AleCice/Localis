@@ -104,6 +104,106 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX jobs_state ON jobs (state, id);
     CREATE INDEX jobs_version ON jobs (version_id);",
+    // 3: local chat with sources (settings, passages + FTS, embeddings, conversations)
+    "CREATE TABLE settings (
+        key    TEXT PRIMARY KEY NOT NULL,
+        value  TEXT NOT NULL
+    );
+
+    CREATE TABLE chunks (
+        id          INTEGER PRIMARY KEY,
+        version_id  TEXT NOT NULL REFERENCES document_versions (id) ON DELETE CASCADE,
+        unit        INTEGER NOT NULL,
+        ordinal     INTEGER NOT NULL,
+        char_start  INTEGER NOT NULL,
+        char_end    INTEGER NOT NULL,
+        text        TEXT NOT NULL,
+        UNIQUE (version_id, unit, ordinal)
+    );
+
+    CREATE VIRTUAL TABLE chunks_fts USING fts5 (
+        text,
+        content = 'chunks',
+        content_rowid = 'id',
+        tokenize = 'unicode61 remove_diacritics 2'
+    );
+    CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+        INSERT INTO chunks_fts (rowid, text) VALUES (new.id, new.text);
+    END;
+    CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
+        INSERT INTO chunks_fts (chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    END;
+    CREATE TRIGGER chunks_au AFTER UPDATE ON chunks BEGIN
+        INSERT INTO chunks_fts (chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
+        INSERT INTO chunks_fts (rowid, text) VALUES (new.id, new.text);
+    END;
+
+    CREATE TABLE chunk_embeddings (
+        chunk_id  INTEGER NOT NULL REFERENCES chunks (id) ON DELETE CASCADE,
+        model     TEXT NOT NULL,
+        dim       INTEGER NOT NULL CHECK (dim > 0),
+        vector    BLOB NOT NULL,
+        PRIMARY KEY (chunk_id, model)
+    );
+    CREATE INDEX chunk_embeddings_model ON chunk_embeddings (model);
+
+    CREATE TABLE conversations (
+        id          TEXT PRIMARY KEY NOT NULL,
+        project_id  TEXT NOT NULL REFERENCES projects (id) ON DELETE CASCADE,
+        title       TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL
+    );
+    CREATE INDEX conversations_project ON conversations (project_id, updated_at);
+
+    CREATE TABLE messages (
+        id                  TEXT PRIMARY KEY NOT NULL,
+        conversation_id     TEXT NOT NULL REFERENCES conversations (id) ON DELETE CASCADE,
+        seq                 INTEGER NOT NULL,
+        role                TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+        kind                TEXT NOT NULL CHECK (kind IN
+                                ('question', 'answer', 'inventory', 'clarification', 'no_evidence')),
+        content             TEXT NOT NULL,
+        status              TEXT NOT NULL CHECK (status IN
+                                ('complete', 'streaming', 'cancelled', 'error')),
+        error_code          TEXT,
+        error_message       TEXT,
+        error_detail        TEXT,
+        model               TEXT,
+        retrieval_mode      TEXT CHECK (retrieval_mode IN ('lexical', 'hybrid')),
+        retrieval_scope     TEXT CHECK (retrieval_scope IN ('project', 'documents')),
+        scope_reason        TEXT CHECK (scope_reason IN ('selection', 'title', 'history')),
+        scope_document_ids  TEXT,
+        embedding_model     TEXT,
+        retrieval_query     TEXT,
+        created_at          TEXT NOT NULL,
+        updated_at          TEXT NOT NULL,
+        UNIQUE (conversation_id, seq)
+    );
+    CREATE INDEX messages_status ON messages (status);
+
+    CREATE TABLE message_sources (
+        message_id   TEXT NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+        rank         INTEGER NOT NULL CHECK (rank >= 1),
+        n            INTEGER CHECK (n >= 1),
+        cited        INTEGER NOT NULL DEFAULT 0 CHECK (cited IN (0, 1)),
+        document_id  TEXT NOT NULL,
+        version_id   TEXT NOT NULL,
+        title        TEXT NOT NULL,
+        unit         INTEGER NOT NULL,
+        unit_kind    TEXT NOT NULL CHECK (unit_kind IN ('page', 'block')),
+        text         TEXT NOT NULL,
+        via          TEXT NOT NULL CHECK (via IN ('lexical', 'semantic', 'both')),
+        PRIMARY KEY (message_id, rank)
+    );
+
+    CREATE TABLE message_candidates (
+        message_id   TEXT NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+        position     INTEGER NOT NULL,
+        document_id  TEXT NOT NULL,
+        title        TEXT NOT NULL,
+        PRIMARY KEY (message_id, position)
+    );",
 ];
 
 /// Schema version this build of the app knows about.
@@ -345,7 +445,8 @@ impl Store {
         Ok(project)
     }
 
-    /// Deletes the project with its folders, documents, versions, text and jobs, then
+    /// Deletes the project with its folders, documents, versions, text, jobs and
+    /// conversations, then
     /// removes the originals no other project references. Never touches user files.
     pub fn delete_project(&mut self, id: &str) -> Result<()> {
         let tx = self

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 
+use crate::chunks::replace_chunks;
 use crate::error::{CoreError, Result};
 use crate::extract::{extract_guarded, ExtractError, ExtractResult};
 use crate::formats::DocumentKind;
@@ -232,6 +233,8 @@ impl Store {
                         insert.execute(params![job.version_id, unit, text])?;
                     }
                 }
+                // Passages for chat retrieval, in the same transaction as the text.
+                replace_chunks(&tx, &job.version_id, &extracted.units)?;
                 let status = if extracted.units.is_empty() {
                     TextStatus::NoText
                 } else {
@@ -251,6 +254,10 @@ impl Store {
                 )?;
             }
             Err(err) => {
+                tx.execute(
+                    "DELETE FROM chunks WHERE version_id = ?1",
+                    params![job.version_id],
+                )?;
                 tx.execute(
                     "UPDATE document_versions SET text_status = 'failed' WHERE id = ?1",
                     params![job.version_id],
@@ -305,7 +312,8 @@ impl Default for WorkerConfig {
 /// Worker loop: runs queued jobs one at a time on its own connection, then sleeps until
 /// woken through `wake` or `poll_interval` elapses. Returns when every sender of `wake`
 /// is dropped. On startup (and after any storage error) it reopens the store and
-/// requeues jobs left `running`, since this loop is the only job runner.
+/// requeues jobs left `running`, since this loop is the only job runner, and creates the
+/// passages of text extracted by older versions ([`Store::backfill_chunks`]).
 pub fn run_worker(
     mut open: impl FnMut() -> Result<Store>,
     wake: Receiver<()>,
@@ -316,7 +324,13 @@ pub fn run_worker(
         if store.is_none() {
             match open() {
                 Ok(mut opened) => match opened.requeue_interrupted_jobs() {
-                    Ok(_) => store = Some(opened),
+                    Ok(_) => {
+                        // Passages for text extracted before 0.3 (idempotent).
+                        if let Err(err) = opened.backfill_chunks() {
+                            log_error("cannot create passages for existing text", &err);
+                        }
+                        store = Some(opened)
+                    }
                     Err(err) => log_error("cannot requeue interrupted jobs", &err),
                 },
                 Err(err) => log_error("cannot open database", &err),

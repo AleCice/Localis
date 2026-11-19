@@ -610,3 +610,439 @@ mod library {
         assert!(rx.try_recv().is_err(), "wake-ups coalesce");
     }
 }
+
+// ---------------------------------------------------------------- v0.3 Local chat
+
+mod chat {
+    use localis_core::{ChatEvent, CoreError, ErrorInfo, NewProject, SendInput, Store};
+
+    use super::to_json;
+    use crate::commands::{
+        AppState, CandidateDto, ChatEventDto, ChatMessageDto, ConversationDto, EmbeddingStatusDto,
+        LlmSettingsDto, LlmStatusDto, ModelInfoDto, RetrievalInfoDto, SendMessageInput, SourceDto,
+    };
+    use crate::error::{AppError, ErrorCode};
+
+    fn answer() -> ChatMessageDto {
+        ChatMessageDto {
+            id: "a1".into(),
+            conversation_id: "c1".into(),
+            role: "assistant",
+            kind: "answer",
+            content: "Vero [1].".into(),
+            status: "complete",
+            error: None,
+            model: Some("qwen".into()),
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            retrieval: Some(RetrievalInfoDto {
+                mode: "hybrid",
+                scope: "documents",
+                document_ids: vec!["d1".into()],
+                scope_reason: Some("title"),
+                embedding_model: Some("nomic".into()),
+                query: "\"vero\"*".into(),
+            }),
+            sources: vec![SourceDto {
+                rank: 1,
+                n: Some(1),
+                cited: true,
+                document_id: "d1".into(),
+                version_id: "v1".into(),
+                title: "a.pdf".into(),
+                unit: 3,
+                unit_kind: "page",
+                text: "testo".into(),
+                via: "both",
+                available: false,
+            }],
+            candidates: vec![],
+        }
+    }
+
+    const ANSWER_JSON: &str = concat!(
+        r#"{"id":"a1","conversationId":"c1","role":"assistant","kind":"answer","#,
+        r#""content":"Vero [1].","status":"complete","error":null,"model":"qwen","#,
+        r#""createdAt":"2026-01-01T00:00:00.000Z","#,
+        r#""retrieval":{"mode":"hybrid","scope":"documents","documentIds":["d1"],"#,
+        r#""scopeReason":"title","embeddingModel":"nomic","query":"\"vero\"*"},"#,
+        r#""sources":[{"rank":1,"n":1,"cited":true,"documentId":"d1","versionId":"v1","#,
+        r#""title":"a.pdf","unit":3,"unitKind":"page","text":"testo","via":"both","#,
+        r#""available":false}],"candidates":[]}"#
+    );
+
+    #[test]
+    fn chat_message_json_shape() {
+        assert_eq!(to_json(answer()), ANSWER_JSON);
+        let clarification = ChatMessageDto {
+            kind: "clarification",
+            status: "complete",
+            model: None,
+            retrieval: None,
+            sources: vec![],
+            candidates: vec![CandidateDto {
+                document_id: "d2".into(),
+                title: "b.md".into(),
+            }],
+            ..answer()
+        };
+        let json = to_json(clarification);
+        assert!(
+            json.contains(
+                r#""retrieval":null,"sources":[],"candidates":[{"documentId":"d2","title":"b.md"}]"#
+            ),
+            "{json}"
+        );
+        let failed = ChatMessageDto {
+            status: "error",
+            error: Some(AppError::from(&ErrorInfo {
+                code: "llm_unavailable".into(),
+                message: "LM Studio non risponde.".into(),
+                detail: Some("connection refused".into()),
+            })),
+            ..answer()
+        };
+        assert!(to_json(failed).contains(
+            r#""status":"error","error":{"code":"llm_unavailable","message":"LM Studio non risponde.","detail":"connection refused"}"#
+        ));
+        let mut no_reason = answer();
+        no_reason.retrieval.as_mut().unwrap().scope_reason = None;
+        no_reason.retrieval.as_mut().unwrap().embedding_model = None;
+        assert!(to_json(no_reason).contains(r#""scopeReason":null,"embeddingModel":null"#));
+    }
+
+    #[test]
+    fn chat_event_variants_are_tagged_by_type() {
+        let cases = [
+            (
+                ChatEventDto::Accepted {
+                    user_message: ChatMessageDto {
+                        role: "user",
+                        kind: "question",
+                        retrieval: None,
+                        sources: vec![],
+                        model: None,
+                        ..answer()
+                    },
+                    assistant_message_id: "a2".into(),
+                },
+                r#"{"type":"accepted","userMessage":{"id":"a1","#,
+            ),
+            (
+                ChatEventDto::Phase {
+                    phase: "retrieving",
+                },
+                r#"{"type":"phase","phase":"retrieving"}"#,
+            ),
+            (
+                ChatEventDto::Phase {
+                    phase: "generating",
+                },
+                r#"{"type":"phase","phase":"generating"}"#,
+            ),
+            (
+                ChatEventDto::Delta {
+                    text: "ciao".into(),
+                },
+                r#"{"type":"delta","text":"ciao"}"#,
+            ),
+            (
+                ChatEventDto::Done { message: answer() },
+                r#"{"type":"done","message":{"id":"a1","#,
+            ),
+            (
+                ChatEventDto::Error {
+                    error: AppError::from(&ErrorInfo {
+                        code: "cancelled".into(),
+                        message: "Risposta interrotta dall'utente.".into(),
+                        detail: None,
+                    }),
+                    message: None,
+                },
+                r#"{"type":"error","error":{"code":"cancelled","message":"Risposta interrotta dall'utente."},"message":null}"#,
+            ),
+        ];
+        for (event, prefix) in cases {
+            let json = to_json(event);
+            assert!(json.starts_with(prefix), "{json}");
+        }
+        let accepted = to_json(ChatEventDto::Accepted {
+            user_message: answer(),
+            assistant_message_id: "a2".into(),
+        });
+        assert!(
+            accepted.ends_with(r#","assistantMessageId":"a2"}"#),
+            "{accepted}"
+        );
+        assert_eq!(
+            to_json(ChatEventDto::Done { message: answer() }),
+            format!(r#"{{"type":"done","message":{ANSWER_JSON}}}"#)
+        );
+    }
+
+    #[test]
+    fn core_events_convert() {
+        assert_eq!(
+            ChatEventDto::from(ChatEvent::Phase(localis_core::ChatPhase::Generating)),
+            ChatEventDto::Phase {
+                phase: "generating"
+            }
+        );
+        assert_eq!(
+            ChatEventDto::from(ChatEvent::Delta("x".into())),
+            ChatEventDto::Delta { text: "x".into() }
+        );
+    }
+
+    #[test]
+    fn settings_status_and_conversation_json_shapes() {
+        let settings = LlmSettingsDto {
+            base_url: "http://127.0.0.1:1234".into(),
+            chat_model: Some("qwen".into()),
+            embedding_model: None,
+        };
+        assert_eq!(
+            to_json(settings.clone()),
+            r#"{"baseUrl":"http://127.0.0.1:1234","chatModel":"qwen","embeddingModel":null}"#
+        );
+        let parsed: LlmSettingsDto = serde_json::from_str(
+            r#"{"baseUrl":"http://127.0.0.1:1234","chatModel":"qwen","embeddingModel":null}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed, settings);
+        let minimal: LlmSettingsDto =
+            serde_json::from_str(r#"{"baseUrl":"http://localhost:1234"}"#).unwrap();
+        assert_eq!(minimal.chat_model, None);
+
+        assert_eq!(
+            to_json(LlmStatusDto {
+                reachable: true,
+                message: None,
+                detail: None,
+                models: vec![
+                    ModelInfoDto {
+                        id: "qwen".into(),
+                        kind: "llm",
+                        state: Some("loaded".into())
+                    },
+                    ModelInfoDto {
+                        id: "m".into(),
+                        kind: "unknown",
+                        state: None
+                    },
+                ],
+            }),
+            r#"{"reachable":true,"message":null,"detail":null,"models":[{"id":"qwen","kind":"llm","state":"loaded"},{"id":"m","kind":"unknown","state":null}]}"#
+        );
+        assert_eq!(
+            to_json(EmbeddingStatusDto {
+                state: "running",
+                model: Some("nomic".into()),
+                total: 10,
+                embedded: 4,
+                message: None,
+            }),
+            r#"{"state":"running","model":"nomic","total":10,"embedded":4,"message":null}"#
+        );
+        assert_eq!(
+            to_json(ConversationDto {
+                id: "c1".into(),
+                project_id: "p1".into(),
+                title: "Nuova conversazione".into(),
+                created_at: "c".into(),
+                updated_at: "u".into(),
+            }),
+            r#"{"id":"c1","projectId":"p1","title":"Nuova conversazione","createdAt":"c","updatedAt":"u"}"#
+        );
+    }
+
+    #[test]
+    fn send_message_input_parses() {
+        let full: SendMessageInput = serde_json::from_str(
+            r#"{"conversationId":"c1","text":"ciao","documentIds":["d1","d2"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            SendInput::from(full),
+            SendInput {
+                conversation_id: "c1".into(),
+                text: "ciao".into(),
+                document_ids: vec!["d1".into(), "d2".into()],
+            }
+        );
+        for json in [
+            r#"{"conversationId":"c1","text":"ciao"}"#,
+            r#"{"conversationId":"c1","text":"ciao","documentIds":null}"#,
+            r#"{"conversationId":"c1","text":"ciao","documentIds":[]}"#,
+        ] {
+            let input: SendMessageInput = serde_json::from_str(json).unwrap();
+            assert!(SendInput::from(input).document_ids.is_empty(), "{json}");
+        }
+    }
+
+    #[test]
+    fn dto_strings_match_core_enums() {
+        use localis_core::{
+            ChatPhase, EmbeddingState, MessageKind, MessageStatus, ModelKind, RetrievalMode,
+            RetrievalScope, Role, ScopeReason, Via,
+        };
+        assert_eq!(
+            [
+                MessageKind::Question,
+                MessageKind::Answer,
+                MessageKind::Inventory,
+                MessageKind::Clarification,
+                MessageKind::NoEvidence
+            ]
+            .map(MessageKind::as_str),
+            [
+                "question",
+                "answer",
+                "inventory",
+                "clarification",
+                "no_evidence"
+            ]
+        );
+        assert_eq!(
+            [
+                MessageStatus::Complete,
+                MessageStatus::Streaming,
+                MessageStatus::Cancelled,
+                MessageStatus::Error
+            ]
+            .map(MessageStatus::as_str),
+            ["complete", "streaming", "cancelled", "error"]
+        );
+        assert_eq!(
+            [Role::User, Role::Assistant].map(Role::as_str),
+            ["user", "assistant"]
+        );
+        assert_eq!(
+            [RetrievalMode::Lexical, RetrievalMode::Hybrid].map(RetrievalMode::as_str),
+            ["lexical", "hybrid"]
+        );
+        assert_eq!(
+            [RetrievalScope::Project, RetrievalScope::Documents].map(RetrievalScope::as_str),
+            ["project", "documents"]
+        );
+        assert_eq!(
+            [
+                ScopeReason::Selection,
+                ScopeReason::Title,
+                ScopeReason::History
+            ]
+            .map(ScopeReason::as_str),
+            ["selection", "title", "history"]
+        );
+        assert_eq!(
+            [Via::Lexical, Via::Semantic, Via::Both].map(Via::as_str),
+            ["lexical", "semantic", "both"]
+        );
+        assert_eq!(
+            [ChatPhase::Retrieving, ChatPhase::Generating].map(ChatPhase::as_str),
+            ["retrieving", "generating"]
+        );
+        assert_eq!(
+            [ModelKind::Llm, ModelKind::Embedding, ModelKind::Unknown].map(ModelKind::as_str),
+            ["llm", "embedding", "unknown"]
+        );
+        assert_eq!(
+            [
+                EmbeddingState::Disabled,
+                EmbeddingState::Idle,
+                EmbeddingState::Running,
+                EmbeddingState::Unreachable
+            ]
+            .map(EmbeddingState::as_str),
+            ["disabled", "idle", "running", "unreachable"]
+        );
+    }
+
+    #[test]
+    fn new_error_codes() {
+        let llm: AppError = CoreError::LlmUnavailable {
+            message: "LM Studio non risponde su http://127.0.0.1:1234.".into(),
+            detail: "connection refused".into(),
+        }
+        .into();
+        assert_eq!(
+            to_json(llm),
+            r#"{"code":"llm_unavailable","message":"LM Studio non risponde su http://127.0.0.1:1234.","detail":"connection refused"}"#
+        );
+        let cancelled: AppError = CoreError::Cancelled {
+            message: "Risposta interrotta dall'utente.".into(),
+        }
+        .into();
+        assert_eq!(
+            to_json(cancelled),
+            r#"{"code":"cancelled","message":"Risposta interrotta dall'utente."}"#
+        );
+        // Every core code round-trips through ErrorCode::parse.
+        for code in [
+            "validation",
+            "duplicate",
+            "not_found",
+            "conflict",
+            "unsupported",
+            "too_large",
+            "integrity",
+            "llm_unavailable",
+            "cancelled",
+            "storage",
+            "internal",
+        ] {
+            let json = to_json(ErrorCode::parse(code));
+            assert_eq!(json, format!("\"{code}\""));
+        }
+        assert_eq!(ErrorCode::parse("bogus"), ErrorCode::Internal);
+        let url: AppError = Store::open_in_memory()
+            .unwrap()
+            .set_llm_settings(&localis_core::LlmSettings {
+                base_url: "http://127.0.0.1.evil.com".into(),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .into();
+        assert_eq!(url.code, ErrorCode::Validation);
+        assert_eq!(url.field.as_deref(), Some("baseUrl"));
+    }
+
+    /// The pipeline runs through `AppState` (StoreAccess) and the DTO conversion, without
+    /// network (an inventory answer needs no model).
+    #[test]
+    fn send_message_through_app_state() {
+        let state = AppState::new(|| Ok(Store::open_in_memory().unwrap()));
+        let conversation = state
+            .with_store(|s| {
+                let p = s.create_project(NewProject {
+                    name: "P".into(),
+                    description: None,
+                })?;
+                Ok(s.create_conversation(&p.id)?.id)
+            })
+            .unwrap();
+        let mut events = Vec::new();
+        let message = localis_core::send_message(
+            &state,
+            &state.chat,
+            SendInput {
+                conversation_id: conversation.clone(),
+                text: "Quali documenti ho caricato?".into(),
+                document_ids: vec![],
+            },
+            &mut |e| events.push(to_json(ChatEventDto::from(e))),
+        )
+        .unwrap();
+        assert_eq!(message.kind.as_str(), "inventory");
+        assert_eq!(events.len(), 3);
+        assert!(events[0].starts_with(r#"{"type":"accepted","userMessage":{"#));
+        assert_eq!(events[1], r#"{"type":"phase","phase":"retrieving"}"#);
+        assert!(events[2].starts_with(r#"{"type":"done","message":{"#));
+        assert!(events[2].contains(r#""kind":"inventory""#));
+        // Cancel with nothing running is a no-op.
+        state.chat.cancel(&conversation);
+        let listed = state
+            .with_store(|s| Ok(s.list_messages(&conversation)?))
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+    }
+}

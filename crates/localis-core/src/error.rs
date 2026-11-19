@@ -31,6 +31,12 @@ pub enum CoreError {
     /// Stored original missing or not matching its hash.
     #[error("{message}")]
     Integrity { message: String, detail: String },
+    /// LM Studio is not reachable, no model is selected, or the model failed.
+    #[error("{message}")]
+    LlmUnavailable { message: String, detail: String },
+    /// The operation was stopped by the user.
+    #[error("{message}")]
+    Cancelled { message: String },
     /// The database could not be opened, read or written.
     #[error("{message}")]
     Storage { message: String, detail: String },
@@ -76,6 +82,30 @@ impl CoreError {
         }
     }
 
+    pub(crate) fn llm(message: impl Into<String>, detail: impl ToString) -> Self {
+        CoreError::LlmUnavailable {
+            message: message.into(),
+            detail: detail.to_string(),
+        }
+    }
+
+    /// Error code shared with the frontend (`AppErrorCode` in `src/api/types.ts`).
+    pub fn code(&self) -> &'static str {
+        match self {
+            CoreError::Validation { .. } => "validation",
+            CoreError::Duplicate { .. } => "duplicate",
+            CoreError::NotFound { .. } => "not_found",
+            CoreError::Conflict { .. } => "conflict",
+            CoreError::Unsupported { .. } => "unsupported",
+            CoreError::TooLarge { .. } => "too_large",
+            CoreError::Integrity { .. } => "integrity",
+            CoreError::LlmUnavailable { .. } => "llm_unavailable",
+            CoreError::Cancelled { .. } => "cancelled",
+            CoreError::Storage { .. } => "storage",
+            CoreError::Internal(_) => "internal",
+        }
+    }
+
     /// Field concerned, for validation and duplicate errors.
     pub fn field(&self) -> Option<&'static str> {
         match self {
@@ -87,7 +117,9 @@ impl CoreError {
     /// Technical diagnostics, never meant for the main UI message.
     pub fn detail(&self) -> Option<&str> {
         match self {
-            CoreError::Storage { detail, .. } | CoreError::Integrity { detail, .. } => Some(detail),
+            CoreError::Storage { detail, .. }
+            | CoreError::Integrity { detail, .. }
+            | CoreError::LlmUnavailable { detail, .. } => Some(detail),
             CoreError::Internal(detail) => Some(detail),
             _ => None,
         }

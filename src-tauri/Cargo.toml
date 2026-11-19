@@ -17,3 +17,6 @@ tauri-build = { version = "2.7", features = [] }
 localis-core = { path = "../crates/localis-core" }
 tauri = { version = "2.12", features = [] }
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

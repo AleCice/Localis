@@ -1,13 +1,15 @@
 use std::sync::mpsc::SyncSender;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use localis_core::{
-    DocumentVersion, Folder, ImportFile, ImportOutcome, Job, LibraryDocument, NewFolder,
-    NewProject, Project, SearchHit, Store, TextUnit,
+    Candidate, ChatEvent, ChatMessage, ChatRuntime, Conversation, CoreError, DocumentVersion,
+    EmbedderShared, EmbeddingStatus, Folder, ImportFile, ImportOutcome, Job, LibraryDocument,
+    LlmClient, LlmSettings, LlmStatus, ModelInfo, NewFolder, NewProject, Project, RetrievalInfo,
+    SearchHit, SendInput, Source, Store, StoreAccess, TextUnit,
 };
 use serde::{Deserialize, Serialize};
-use tauri::ipc::{Request, Response};
-use tauri::State;
+use tauri::ipc::{Channel, Request, Response};
+use tauri::{AppHandle, Manager, State};
 
 use crate::error::AppError;
 use crate::headers::{raw_body, ImportHeaders, VersionHeaders};
@@ -22,6 +24,12 @@ pub struct AppState {
     store: Mutex<Option<Store>>,
     /// Wakes the background extraction worker (capacity 1: wake-ups coalesce).
     worker: Option<SyncSender<()>>,
+    /// Running generations and their cancel flags.
+    pub(crate) chat: ChatRuntime,
+    /// Wakes the background embedder (capacity 1).
+    embedder: Option<SyncSender<()>>,
+    /// What the embedder last reported (default: not running).
+    pub(crate) embedder_status: Arc<EmbedderShared>,
 }
 
 impl AppState {
@@ -31,6 +39,22 @@ impl AppState {
             opener: Box::new(opener),
             store: Mutex::new(store),
             worker: None,
+            chat: ChatRuntime::new(),
+            embedder: None,
+            embedder_status: EmbedderShared::new(),
+        }
+    }
+
+    pub fn with_embedder(mut self, wake: SyncSender<()>, status: Arc<EmbedderShared>) -> Self {
+        self.embedder = Some(wake);
+        self.embedder_status = status;
+        self
+    }
+
+    /// Signals the embedder that settings or passages changed. Never blocks.
+    pub(crate) fn wake_embedder(&self) {
+        if let Some(wake) = &self.embedder {
+            let _ = wake.try_send(());
         }
     }
 
@@ -61,6 +85,26 @@ impl AppState {
         match guard.as_mut() {
             Some(store) => f(store),
             None => Err(AppError::internal("store not available")),
+        }
+    }
+}
+
+/// The chat pipeline takes the store in short sections through this trait.
+impl StoreAccess for AppState {
+    fn with_store<R>(
+        &self,
+        f: impl FnOnce(&mut Store) -> localis_core::Result<R>,
+    ) -> localis_core::Result<R> {
+        let mut guard = self
+            .store
+            .lock()
+            .map_err(|_| CoreError::Internal("store mutex poisoned".into()))?;
+        if guard.is_none() {
+            *guard = Some((self.opener)().map_err(CoreError::from)?);
+        }
+        match guard.as_mut() {
+            Some(store) => f(store),
+            None => Err(CoreError::Internal("store not available".into())),
         }
     }
 }
@@ -490,4 +534,413 @@ pub async fn retry_job(state: State<'_, AppState>, id: i64) -> Result<JobDto, Ap
     let job = state.with_store(|store| Ok(store.retry_job(id)?))?;
     state.wake_worker();
     Ok(job.into())
+}
+
+// ---------------------------------------------------------------- v0.3 Local chat
+
+/// `LlmSettings` in `src/api/types.ts` (input and output).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmSettingsDto {
+    pub base_url: String,
+    #[serde(default)]
+    pub chat_model: Option<String>,
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+}
+
+impl From<LlmSettings> for LlmSettingsDto {
+    fn from(s: LlmSettings) -> Self {
+        LlmSettingsDto {
+            base_url: s.base_url,
+            chat_model: s.chat_model,
+            embedding_model: s.embedding_model,
+        }
+    }
+}
+
+impl From<LlmSettingsDto> for LlmSettings {
+    fn from(s: LlmSettingsDto) -> Self {
+        LlmSettings {
+            base_url: s.base_url,
+            chat_model: s.chat_model,
+            embedding_model: s.embedding_model,
+        }
+    }
+}
+
+/// `ModelInfo` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfoDto {
+    pub id: String,
+    pub kind: &'static str,
+    pub state: Option<String>,
+}
+
+impl From<ModelInfo> for ModelInfoDto {
+    fn from(m: ModelInfo) -> Self {
+        ModelInfoDto {
+            id: m.id,
+            kind: m.kind.as_str(),
+            state: m.state,
+        }
+    }
+}
+
+/// `LlmStatus` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmStatusDto {
+    pub reachable: bool,
+    pub message: Option<String>,
+    pub detail: Option<String>,
+    pub models: Vec<ModelInfoDto>,
+}
+
+impl From<LlmStatus> for LlmStatusDto {
+    fn from(s: LlmStatus) -> Self {
+        LlmStatusDto {
+            reachable: s.reachable,
+            message: s.message,
+            detail: s.detail,
+            models: map_all(s.models),
+        }
+    }
+}
+
+/// `EmbeddingStatus` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingStatusDto {
+    pub state: &'static str,
+    pub model: Option<String>,
+    pub total: u64,
+    pub embedded: u64,
+    pub message: Option<String>,
+}
+
+impl From<EmbeddingStatus> for EmbeddingStatusDto {
+    fn from(s: EmbeddingStatus) -> Self {
+        EmbeddingStatusDto {
+            state: s.state.as_str(),
+            model: s.model,
+            total: s.total,
+            embedded: s.embedded,
+            message: s.message,
+        }
+    }
+}
+
+/// `Conversation` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationDto {
+    pub id: String,
+    pub project_id: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<Conversation> for ConversationDto {
+    fn from(c: Conversation) -> Self {
+        ConversationDto {
+            id: c.id,
+            project_id: c.project_id,
+            title: c.title,
+            created_at: c.created_at,
+            updated_at: c.updated_at,
+        }
+    }
+}
+
+/// `RetrievalInfo` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetrievalInfoDto {
+    pub mode: &'static str,
+    pub scope: &'static str,
+    pub document_ids: Vec<String>,
+    pub scope_reason: Option<&'static str>,
+    pub embedding_model: Option<String>,
+    pub query: String,
+}
+
+impl From<RetrievalInfo> for RetrievalInfoDto {
+    fn from(r: RetrievalInfo) -> Self {
+        RetrievalInfoDto {
+            mode: r.mode.as_str(),
+            scope: r.scope.as_str(),
+            document_ids: r.document_ids,
+            scope_reason: r.scope_reason.map(|s| s.as_str()),
+            embedding_model: r.embedding_model,
+            query: r.query,
+        }
+    }
+}
+
+/// `Source` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceDto {
+    pub rank: u32,
+    pub n: Option<u32>,
+    pub cited: bool,
+    pub document_id: String,
+    pub version_id: String,
+    pub title: String,
+    pub unit: u32,
+    pub unit_kind: &'static str,
+    pub text: String,
+    pub via: &'static str,
+    pub available: bool,
+}
+
+impl From<Source> for SourceDto {
+    fn from(s: Source) -> Self {
+        SourceDto {
+            rank: s.rank,
+            n: s.n,
+            cited: s.cited,
+            document_id: s.document_id,
+            version_id: s.version_id,
+            title: s.title,
+            unit: s.unit,
+            unit_kind: s.unit_kind.as_str(),
+            text: s.text,
+            via: s.via.as_str(),
+            available: s.available,
+        }
+    }
+}
+
+/// Element of `ChatMessage.candidates` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateDto {
+    pub document_id: String,
+    pub title: String,
+}
+
+impl From<Candidate> for CandidateDto {
+    fn from(c: Candidate) -> Self {
+        CandidateDto {
+            document_id: c.document_id,
+            title: c.title,
+        }
+    }
+}
+
+/// `ChatMessage` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMessageDto {
+    pub id: String,
+    pub conversation_id: String,
+    pub role: &'static str,
+    pub kind: &'static str,
+    pub content: String,
+    pub status: &'static str,
+    pub error: Option<AppError>,
+    pub model: Option<String>,
+    pub created_at: String,
+    pub retrieval: Option<RetrievalInfoDto>,
+    pub sources: Vec<SourceDto>,
+    pub candidates: Vec<CandidateDto>,
+}
+
+impl From<ChatMessage> for ChatMessageDto {
+    fn from(m: ChatMessage) -> Self {
+        ChatMessageDto {
+            id: m.id,
+            conversation_id: m.conversation_id,
+            role: m.role.as_str(),
+            kind: m.kind.as_str(),
+            content: m.content,
+            status: m.status.as_str(),
+            error: m.error.as_ref().map(AppError::from),
+            model: m.model,
+            created_at: m.created_at,
+            retrieval: m.retrieval.map(RetrievalInfoDto::from),
+            sources: map_all(m.sources),
+            candidates: map_all(m.candidates),
+        }
+    }
+}
+
+/// `SendMessageInput` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendMessageInput {
+    pub conversation_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub document_ids: Option<Vec<String>>,
+}
+
+impl From<SendMessageInput> for SendInput {
+    fn from(i: SendMessageInput) -> Self {
+        SendInput {
+            conversation_id: i.conversation_id,
+            text: i.text,
+            document_ids: i.document_ids.unwrap_or_default(),
+        }
+    }
+}
+
+/// `ChatEvent` in `src/api/types.ts`: tagged by `type`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ChatEventDto {
+    Accepted {
+        user_message: ChatMessageDto,
+        assistant_message_id: String,
+    },
+    Phase {
+        phase: &'static str,
+    },
+    Delta {
+        text: String,
+    },
+    Done {
+        message: ChatMessageDto,
+    },
+    Error {
+        error: AppError,
+        message: Option<ChatMessageDto>,
+    },
+}
+
+impl From<ChatEvent> for ChatEventDto {
+    fn from(e: ChatEvent) -> Self {
+        match e {
+            ChatEvent::Accepted {
+                user_message,
+                assistant_message_id,
+            } => ChatEventDto::Accepted {
+                user_message: user_message.into(),
+                assistant_message_id,
+            },
+            ChatEvent::Phase(phase) => ChatEventDto::Phase {
+                phase: phase.as_str(),
+            },
+            ChatEvent::Delta(text) => ChatEventDto::Delta { text },
+            ChatEvent::Done(message) => ChatEventDto::Done {
+                message: message.into(),
+            },
+            ChatEvent::Error { error, message } => ChatEventDto::Error {
+                error: AppError::from(&error),
+                message: message.map(ChatMessageDto::from),
+            },
+        }
+    }
+}
+
+/// Runs blocking work (network, long generations) off the async runtime's workers.
+async fn blocking<R: Send + 'static>(
+    f: impl FnOnce() -> Result<R, AppError> + Send + 'static,
+) -> Result<R, AppError> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|err| AppError::internal(format!("background task failed: {err}")))?
+}
+
+#[tauri::command]
+pub async fn get_llm_settings(state: State<'_, AppState>) -> Result<LlmSettingsDto, AppError> {
+    state.with_store(|store| Ok(store.llm_settings()?.into()))
+}
+
+/// Validates (loopback http only) and saves; wakes the embedder.
+#[tauri::command]
+pub async fn set_llm_settings(
+    state: State<'_, AppState>,
+    settings: LlmSettingsDto,
+) -> Result<LlmSettingsDto, AppError> {
+    let saved = state.with_store(|store| Ok(store.set_llm_settings(&settings.into())?))?;
+    state.wake_embedder();
+    Ok(saved.into())
+}
+
+/// Contacts LM Studio without holding the store. Never fails for an unreachable server.
+#[tauri::command]
+pub async fn get_llm_status(state: State<'_, AppState>) -> Result<LlmStatusDto, AppError> {
+    let base_url = state.with_store(|store| Ok(store.llm_settings()?.base_url))?;
+    blocking(move || Ok(LlmClient::new(&base_url)?.status().into())).await
+}
+
+#[tauri::command]
+pub async fn get_embedding_status(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<EmbeddingStatusDto, AppError> {
+    let shared = Arc::clone(&state.embedder_status);
+    state.with_store(|store| Ok(store.embedding_status(&project_id, &shared)?.into()))
+}
+
+/// Most recently active first.
+#[tauri::command]
+pub async fn list_conversations(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Vec<ConversationDto>, AppError> {
+    state.with_store(|store| Ok(map_all(store.list_conversations(&project_id)?)))
+}
+
+#[tauri::command]
+pub async fn create_conversation(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<ConversationDto, AppError> {
+    state.with_store(|store| Ok(store.create_conversation(&project_id)?.into()))
+}
+
+/// Stops a running generation of the conversation, then deletes it.
+#[tauri::command]
+pub async fn delete_conversation(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+    state.chat.cancel(&id);
+    state.with_store(|store| Ok(store.delete_conversation(&id)?))
+}
+
+/// Chronological order.
+#[tauri::command]
+pub async fn list_messages(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Vec<ChatMessageDto>, AppError> {
+    state.with_store(|store| Ok(map_all(store.list_messages(&conversation_id)?)))
+}
+
+/// Streams `ChatEvent`s through `on_event`; resolves with the final assistant message.
+/// Runs on a blocking thread and takes the store only in short sections.
+#[tauri::command]
+pub async fn send_message(
+    app: AppHandle,
+    input: SendMessageInput,
+    on_event: Channel<ChatEventDto>,
+) -> Result<ChatMessageDto, AppError> {
+    blocking(move || {
+        let state = app.state::<AppState>();
+        let state: &AppState = &state;
+        let message = localis_core::send_message(state, &state.chat, input.into(), &mut |e| {
+            // A closed webview just stops receiving events; the answer is still stored.
+            let _ = on_event.send(ChatEventDto::from(e));
+        })?;
+        Ok(message.into())
+    })
+    .await
+}
+
+/// No-op when nothing is running.
+#[tauri::command]
+pub async fn cancel_generation(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<(), AppError> {
+    state.chat.cancel(&conversation_id);
+    Ok(())
 }
