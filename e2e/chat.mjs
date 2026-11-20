@@ -1,4 +1,5 @@
-// Native end-to-end test of the v0.3 local chat with sources: drives the real Localis desktop
+// Native end-to-end test of the v0.3 local chat with sources (updated to the v0.4 settings contract:
+// models are ModelRef objects, settings split into «Modelli locali» and «Modelli e instradamento»): drives the real Localis desktop
 // app (WebKitGTK webview + real SQLite + real extraction worker + real embedder) through
 // tauri-driver / WebKitWebDriver, against e2e/fake-lmstudio.mjs — a loopback TEST FIXTURE that
 // imitates LM Studio's HTTP API. It is not a model: its answers are assembled from the prompt it
@@ -40,6 +41,10 @@ const PORT = Number(process.env.E2E_PORT ?? 4464);
 const ARTIFACTS = process.env.E2E_ARTIFACTS ? resolve(process.env.E2E_ARTIFACTS) : null;
 const IDENTIFIER = "app.localis.desktop";
 const ENTER = "\uE007";
+/** v0.4: models are { provider, model } references; <select> values are "provider:model". */
+const lm = (model) => ({ provider: "lmstudio", model });
+const lmKey = (model) => `lmstudio:${model}`;
+const settingsOf = (baseUrl, chatModel, embeddingModel) => ({ baseUrl, chatModel, embeddingModel, routing: "manual", autoModels: [] });
 /** Wrapper that starts BIN with a dead proxy for every scheme and no exceptions: if the app
  * honoured proxy variables, its requests to the fake LM Studio would fail. GLib's own proxy
  * resolver is set to "dummy" so WebKit's inspector link (used by WebKitWebDriver) still works. */
@@ -394,7 +399,7 @@ async function citeOf(s, fromEnd = 1) {
 }
 async function setSelectByLabel(s, label, value) {
   return s.exec(
-    `const l = [...document.querySelectorAll('.llm-settings label')].find(x => x.textContent.trim() === arguments[0]);
+    `const l = [...document.querySelectorAll('.settings label')].find(x => x.textContent.trim() === arguments[0]);
      const sel = l && l.control; if (!sel || sel.disabled) return 'missing-or-disabled';
      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(sel, arguments[1]);
      sel.dispatchEvent(new Event('change', { bubbles: true })); return sel.value;`,
@@ -466,10 +471,12 @@ async function main() {
   // ---- Settings without LM Studio (default URL; nothing listens there in the container)
   await goSettings(s);
   const offline = await s.waitFor(`(() => { const t = document.querySelector('.llm-status-line')?.textContent.trim(); return t && !t.includes('Verifica in corso') ? t : false; })()`, "status line");
-  const selectsDisabled = await s.exec(`return [...document.querySelectorAll('.llm-settings select')].map(x => x.disabled);`);
+  // v0.4: the model selects live in «Modelli e instradamento» and are not disabled (cloud groups); with LM Studio
+  // down and no cloud keys they must offer no selectable model (only disabled placeholders / «Nessuno»).
+  const selectsDisabled = await s.exec(`const sels = [...document.querySelectorAll('.models-settings select')]; return sels.length >= 2 ? sels.map(x => [...x.options].filter(o => !o.disabled && o.value !== '').length === 0) : [false];`);
   const hintStart = await s.exec(`return [...document.querySelectorAll('.llm-settings .hint')].some(h => h.textContent.includes('Avvia LM Studio e il suo server locale'));`);
-  check("Impostazioni: unreachable state shown with guidance, model selects disabled (no fake buttons)",
-    /LM Studio non risponde su http:\/\/127\.0\.0\.1:1234/.test(offline) && selectsDisabled.every(Boolean) && hintStart, `${offline} | disabled=${selectsDisabled}`);
+  check("Impostazioni: unreachable state shown with guidance, model selects offer no selectable model (no fake entries)",
+    /LM Studio non risponde su http:\/\/127\.0\.0\.1:1234/.test(offline) && selectsDisabled.every(Boolean) && hintStart, `${offline} | noSelectable=${selectsDisabled}`);
   await s.screenshot("01-settings-offline");
 
   // Invalid (non-loopback) URL → error at the field, focus moved there; nothing saved.
@@ -496,10 +503,10 @@ async function main() {
     ["http://0x7f.0.0.1:1234", false],
     ["http://127.0.0.1:1234\n.evil.com", false],
   ]) {
-    const r = await s.invoke("set_llm_settings", { settings: { baseUrl: url, chatModel: null, embeddingModel: null } });
+    const r = await s.invoke("set_llm_settings", { settings: settingsOf(url, null, null) });
     check(`set_llm_settings ${JSON.stringify(url)} → ${ok ? "accepted" : "validation"}`, ok ? r.ok : !r.ok && r.err.code === "validation" && r.err.field === "baseUrl", JSON.stringify(r.ok ? r.value : r.err));
   }
-  await s.invoke("set_llm_settings", { settings: { baseUrl: lmUrl, chatModel: null, embeddingModel: null } });
+  check("set_llm_settings back to the test URL (v0.4 shape)", (await s.invoke("set_llm_settings", { settings: settingsOf(lmUrl, null, null) })).ok);
 
   // ---- Chat without LM Studio
   await goChat(s);
@@ -509,7 +516,10 @@ async function main() {
   check("chat empty state tells to start LM Studio and that the document list still works", /LM Studio non è raggiungibile/.test(emptyHint ?? "") && /elenco dei documenti/i.test(emptyHint ?? ""), emptyHint);
   let a = await ask(s, "Parlami di zefiro");
   check("no chat model → llm_unavailable guidance with «Apri Impostazioni»", /Nessun modello di chat selezionato/.test(a.errorText ?? "") && /Avvia LM Studio/.test(a.errorText ?? "") && /Apri Impostazioni/.test(a.errorText ?? ""), a.errorText);
-  await s.invoke("set_llm_settings", { settings: { baseUrl: lmUrl, chatModel: CHAT_MODEL, embeddingModel: null } });
+  const setChat = await s.invoke("set_llm_settings", { settings: settingsOf(lmUrl, lm(CHAT_MODEL), null) });
+  check("set_llm_settings with a ModelRef chat model accepted and echoed", setChat.ok && setChat.value.chatModel?.provider === "lmstudio" && setChat.value.chatModel?.model === CHAT_MODEL, JSON.stringify(setChat));
+  const legacy = await s.invoke("set_llm_settings", { settings: { baseUrl: lmUrl, chatModel: CHAT_MODEL, embeddingModel: null } });
+  check("set_llm_settings with the 0.3 string shape is rejected (no silent coercion)", !legacy.ok, JSON.stringify(legacy));
   a = await ask(s, "Parlami di zefiro");
   check("LM Studio down → llm_unavailable «LM Studio non risponde su …»", a.errorText?.includes(`LM Studio non risponde su ${lmUrl}`), a.errorText);
   let conv1 = (await convs(s, projectId))[0];
@@ -536,21 +546,21 @@ async function main() {
   await s.click(await s.findByText("button", "Verifica connessione"));
   const online = await s.waitFor(`(() => { const t = document.querySelector('.llm-status-line')?.textContent.trim(); return t && t.startsWith('Connesso') ? t : false; })()`, "connected");
   check("Impostazioni: connected, 2 models", online.includes("2 modelli"), online);
-  const chatOptions = await s.exec(`const l = [...document.querySelectorAll('.llm-settings label')].find(x => x.textContent.trim() === 'Modello di chat'); return [...l.control.options].map(o => o.value + '|' + o.textContent);`);
-  check("chat model select offers only the llm model", chatOptions.filter((o) => o.split("|")[0]).length === 1 && chatOptions.some((o) => o.startsWith(CHAT_MODEL)), chatOptions.join(", "));
-  check("pick chat model via the select", (await setSelectByLabel(s, "Modello di chat", CHAT_MODEL)) === CHAT_MODEL);
+  const chatOptions = await s.exec(`const l = [...document.querySelectorAll('.models-settings label')].find(x => x.textContent.trim() === 'Modello di chat'); return [...l.control.options].filter(o => !o.disabled && o.value).map(o => o.value + '|' + o.textContent + '|' + o.parentElement.label);`);
+  check("chat model select offers only the llm model (group «Locale (LM Studio)»)", chatOptions.length === 1 && chatOptions[0] === `${lmKey(CHAT_MODEL)}|${CHAT_MODEL}|Locale (LM Studio)`, chatOptions.join(", "));
+  check("pick chat model via the select", (await setSelectByLabel(s, "Modello di chat", lmKey(CHAT_MODEL))) === lmKey(CHAT_MODEL));
   await sleep(500);
-  const embSel = await setSelectByLabel(s, "Modello di embedding", EMBEDDING_MODEL);
+  const embSel = await setSelectByLabel(s, "Modello di embedding", lmKey(EMBEDDING_MODEL));
   await sleep(500);
   const savedEmb = (await s.invoke("get_llm_settings")).value;
-  check("pick embedding model via the select (saved)", savedEmb.embeddingModel === EMBEDDING_MODEL && savedEmb.chatModel === CHAT_MODEL, `${embSel} ${JSON.stringify(savedEmb)}`);
+  check("pick embedding model via the select (saved)", savedEmb.embeddingModel?.provider === "lmstudio" && savedEmb.embeddingModel?.model === EMBEDDING_MODEL && savedEmb.chatModel?.provider === "lmstudio" && savedEmb.chatModel?.model === CHAT_MODEL, `${embSel} ${JSON.stringify(savedEmb)}`);
   let es;
   for (let i = 0; i < 80; i++) {
     es = (await s.invoke("get_embedding_status", { projectId })).value;
     if (es.total > 0 && es.embedded === es.total) break;
     await sleep(250);
   }
-  check("embedding status reaches indexed X of X (backend)", es.total > 0 && es.embedded === es.total && es.state === "idle", JSON.stringify(es));
+  check("embedding status reaches indexed X of X (backend)", es.total > 0 && es.embedded === es.total && es.state === "idle" && es.provider === "lmstudio" && es.model === EMBEDDING_MODEL, JSON.stringify(es));
   let uiIndexed = null;
   try {
     uiIndexed = await s.waitFor(`(() => { const t = document.querySelector('.embedding-status')?.textContent ?? ''; return /Passaggi indicizzati: (\\d+) di \\1/.test(t) && t.includes('Completata') ? t : false; })()`, "UI indexed", 12000);
@@ -572,7 +582,7 @@ async function main() {
   await goChat(s);
   await s.waitFor(`!!document.querySelector('.chat-header .model-picker select')`, "model picker select");
   const pickerVal = await s.exec(`return document.querySelector('.chat-header .model-picker select').value;`);
-  check("header model picker shows the chat model", pickerVal === CHAT_MODEL, pickerVal);
+  check("header model picker shows the chat model", pickerVal === lmKey(CHAT_MODEL), pickerVal);
   await newConversation(s);
   await s.exec(`window.__qa.thinking = 0; window.__qa.streamLens = [];`);
   fake.mode.chunkDelayMs = 25;
@@ -600,7 +610,7 @@ async function main() {
   const evidence = ans.sources.filter((x) => x.n != null);
   check("stored tiers: raw ⊇ evidence ⊇ cited; only [1] cited ([99] invalid, [2] in code)", cited.length === 1 && cited[0].n === 1 && evidence.length >= 2 && ans.sources.length >= evidence.length,
     `raw=${ans.sources.length} evidence=${evidence.length} cited=${cited.map((x) => x.n)}`);
-  check("retrieval mode hybrid (embeddings exist and the query embedding succeeded)", ans.retrieval.mode === "hybrid" && ans.retrieval.embeddingModel === EMBEDDING_MODEL, JSON.stringify(ans.retrieval));
+  check("retrieval mode hybrid (embeddings exist and the query embedding succeeded)", ans.retrieval.mode === "hybrid" && ans.retrieval.embeddingModel === EMBEDDING_MODEL && ans.retrieval.embeddingProvider === "lmstudio", JSON.stringify(ans.retrieval));
   check("sources via semantic/both appear", ans.sources.some((x) => x.via === "both" || x.via === "semantic"), ans.sources.map((x) => x.via).join(","));
   // Prompt as received by the fake server.
   const msgs = chatReq.body.messages;
