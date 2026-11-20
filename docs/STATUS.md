@@ -1,10 +1,75 @@
 # Stato di Localis
 
-**Versione corrente: 0.3 — Chat locale con fonti.** Verificata su Linux, in un container senza display, con un **finto server LM Studio** (`e2e/fake-lmstudio.mjs`, che non è un modello). **Il funzionamento con un LM Studio reale e con modelli reali non è verificato**: nel container non ce n'erano. Non verificata su macOS e Windows.
+**Versione corrente: 0.4 — Cloud opzionale** (anticipata dalla 0.6 su richiesta dell'utente; FARO diventa 0.5, OCR 0.6). Verificata su Linux, in un container senza display, con **finti server** dei provider (`e2e/fake-cloud.mjs`) e di LM Studio, nessuno dei quali è un modello, e con il **portachiavi reale di Linux** (gnome-keyring su un bus D-Bus privato). **Non verificata con i provider reali**: in questo ambiente non c'erano API key né accesso alla rete. Non verificata su macOS e Windows.
 
-Ultimo aggiornamento: 19 novembre 2026.
+Ultimo aggiornamento: 20 novembre 2026.
 
-## 0.3 — Requisiti della roadmap
+## 0.4 — Requisiti della roadmap
+
+| Requisito | Stato | Evidenza |
+|---|---|---|
+| Model Mesh: chat con OpenAI, Anthropic, Gemini, DeepSeek, Qwen | ⚠️ solo con server finti | Un invio per provider. Percorso e header di autenticazione corretti (`Bearer`, `x-api-key` + `anthropic-version`, `x-goog-api-key`); formato per provider (system separato per Anthropic, `systemInstruction` e ruoli `user`/`model` per Gemini); streaming con conteggio dei token salvato. |
+| Embedding cloud (OpenAI, Gemini, Qwen) | ⚠️ | OpenAI end-to-end nell'app nativa: indicizzazione, embedding della domanda, risposta ibrida. Gemini e Qwen solo nei test Rust, compreso il limite di 10 testi per richiesta di Qwen. |
+| Chiavi nel portachiavi di sistema | ✅ Linux | La chiave salvata dall'interfaccia si rilegge identica con `secret-tool`; il campo si svuota. La chiave non si trova nel DOM, nelle risposte IPC, nei file SQLite (DB, WAL, SHM), nei file di dati, nei log dell'app o nel registro cloud. Resta dopo il riavvio; «Rimuovi chiave» la cancella. Senza portachiavi: `keyring_unavailable`, campi disattivati, nessun salvataggio in chiaro. macOS e Windows non verificati. |
+| Anteprima con provider, dati e costo prima di ogni invio | ✅ | Il dialogo mostra provider, indirizzo, modello, motivo, domanda, fonti con titoli e blocchi, cronologia, caratteri, token stimati e costo (o «non stimabile»). Il corpo della richiesta inviata coincide con l'anteprima (1364 caratteri dichiarati e inviati). La seconda domanda chiede di nuovo conferma. |
+| Consenso esplicito | ✅ | Progetti nuovi «Solo locale»; in quel caso nulla arriva ai provider finti. Abilitare il cloud richiede conferma. «Annulla», Esc e Invio su «Annulla» non inviano e non salvano nulla. Token falso, vuoto, riusato, per un altro testo o conversazione, con modello o criteri cambiati → `consent_required` senza invii né salvataggi. Una domanda non confermata non contatta nessun provider, nemmeno per l'embedding (test Rust). |
+| Nessun ripiego silenzioso | ✅ | 401, 429 e 500 danno ciascuno il proprio messaggio, con una sola richiesta allo stesso provider; nessun altro provider né LM Studio viene contattato. |
+| PRISM (instradamento) | ✅ | Con LM Studio attivo sceglie il modello locale, senza dialogo. Con LM Studio spento sceglie il candidato cloud più economico e lo motiva. Un progetto «Solo locale» in automatico non va mai in cloud. Prezzi in valute diverse non vengono confrontati. |
+| Modalità solo locale | ✅ | Bloccati chat, embedding della domanda e indicizzazione. Tornare a «Solo locale» revoca il consenso agli embedding; dopo la revoca non partono più richieste di embedding. |
+| Registro degli invii cloud | ✅ | 22 voci per 22 richieste, ciascuna con scopo, caratteri, token e costo; né contenuto né chiave. La tabella «Attività cloud» lo mostra e resta dopo il riavvio. |
+| Rete | ✅ | Solo connessioni loopback durante i test; la webview non fa richieste; host dei provider fissi, solo HTTPS, nessun redirect. L'override di test dei provider non è presente nella build di release (`strings` → 0). |
+
+## Verifiche eseguite (ultima esecuzione)
+
+| Comando | Esito |
+|---|---|
+| `npm run typecheck` | ok |
+| `npm test` (3 esecuzioni) | 115/115 ogni volta (il QA ha visto una volta 5 fallimenti con la macchina sotto carico, non riprodotti in 7 esecuzioni successive) |
+| `npm run build` | ok; codice del backend finto assente dal bundle |
+| `npm audit` | 0 vulnerabilità |
+| `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` | ok |
+| `cargo test --workspace` | 208/208 |
+| `cargo build -p localis --release` + `strings … \| grep -c LOCALIS_TEST_` | 0 |
+| `node e2e/cloud.mjs` (app nativa, provider finti, portachiavi reale) | 130/130 |
+| `node e2e/chat.mjs` | 103/103 |
+| `node e2e/library.mjs` | 98/98 |
+| `node e2e/native.mjs` | 39/39 |
+| `node e2e/cloud-ui.mjs`, `node e2e/chat-ui.mjs` (Playwright) | 38/38, 32/32 |
+
+## Decisioni 0.4
+
+- **Rete:**
+  - HTTPS con `ureq` 3.5, `rustls` e verifica dei certificati sul trust store del sistema (`rustls-platform-verifier`);
+  - un solo host fisso per provider, nessun URL configurabile, nessun redirect;
+  - per i provider cloud si usano i proxy delle variabili d'ambiente, per LM Studio no.
+- **Chiavi:** `keyring` 4.2 (Secret Service via zbus su Linux). Servizio `app.localis.desktop`, account uguale all'id del provider.
+- **Conferma:** a ogni domanda, scelta dell'utente.
+  - `prepare_cloud_send` prepara il prompt esatto e restituisce un token monouso valido 10 minuti, legato a conversazione, domanda, selezione e modello.
+  - `send_message` invia solo quel prompt.
+- **Embedding della domanda:** se il progetto ha il consenso agli embedding cloud, la domanda viene inviata al provider di embedding già durante l'anteprima. L'anteprima lo dichiara come «Già inviato», quindi «Annulla» annulla solo la richiesta di chat.
+- **Prezzi:** Localis non ne contiene; li inserisce l'utente. Le stime contano un token ogni 4 caratteri; il costo va da «solo input» a «input + 2048 token di output».
+- **OpenAI:** le richieste non inviano `temperature`, perché i modelli di ragionamento rifiutano valori diversi da quello predefinito. Gli altri provider usano 0,2.
+
+## Limiti noti 0.4
+
+- **Provider reali mai contattati.** Restano da provare:
+  - formati reali di richieste, risposte ed errori;
+  - elenchi reali dei modelli e conteggi reali dei token;
+  - il comportamento dei modelli di ragionamento: il limite di 2048 token di output può essere consumato dal ragionamento.
+- **Gemini:** i token di output includono quelli di «thinking»; da verificare sulla fatturazione reale.
+- **Scadenza del token** (10 minuti): coperta solo dai test Rust.
+- **Revoca degli embedding:** una richiesta di indicizzazione già partita al momento della revoca si completa.
+- **Proxy aziendali** non verificati.
+
+## Come provare con i provider reali
+
+1. `npm run tauri dev`, poi Impostazioni → Provider cloud. Salva una chiave (per esempio OpenAI) e controlla che sia nel portachiavi del sistema: «Accesso Portachiavi» su macOS, «Gestione credenziali» su Windows.
+2. «Carica modelli», scegli un modello e, se vuoi, inserisci il suo prezzo dal listino.
+3. In un progetto: «Uso del cloud» → «Consenti cloud». In chat scegli il modello cloud e fai una domanda; controlla che l'anteprima elenchi le fonti giuste, poi «Invia a …».
+4. Verifica sotto la risposta token e costo e confrontali con la dashboard del provider; controlla «Attività cloud».
+5. Prova una chiave sbagliata: deve comparire «Chiave API non valida…» e nessun altro provider deve essere contattato.
+
+## 0.3 — Chat locale con fonti (verificata con LM Studio finto)
 
 | Requisito | Stato | Evidenza |
 |---|---|---|
@@ -26,7 +91,7 @@ Ultimo aggiornamento: 19 novembre 2026.
 | Scroll locale | ✅ | Tabelle, codice e formule lunghe scorrono dentro il proprio riquadro; la pagina non scorre in orizzontale. |
 | Interruzione e recupero | ✅ | «Interrompi» conserva il testo parziale (con le citazioni valide); un secondo invio durante la generazione dà `conflict`. Dopo un SIGKILL a metà risposta, il riavvio mostra «Risposta interrotta.». |
 
-## Verifiche eseguite (ultima esecuzione)
+### Verifiche 0.3 (al rilascio della 0.3)
 
 | Comando | Esito |
 |---|---|
@@ -43,7 +108,7 @@ Ultimo aggiornamento: 19 novembre 2026.
 | `node e2e/library.mjs` | 98/98 |
 | `node e2e/native.mjs` | 39/39 |
 
-## Decisioni 0.3
+### Decisioni 0.3
 
 - **Rete:** solo il backend parla con LM Studio, solo su loopback (`127.0.0.1`, `localhost`, `[::1]`), con `ureq` senza TLS, senza proxy e senza redirect. La webview non fa richieste di rete e la CSP resta invariata.
 - **Passaggi (chunk):**
@@ -64,7 +129,7 @@ Ultimo aggiornamento: 19 novembre 2026.
   - Rust: `ureq` 3.5 (senza TLS) e `serde_json`;
   - frontend: `react-markdown`, `remark-gfm`, `remark-math`, `rehype-katex`, `katex` 0.19.1.
 
-## Limiti noti 0.3
+### Limiti noti 0.3
 
 - **LM Studio reale non verificato.** Restano da provare la qualità delle risposte, le particolarità dello streaming reale, la distribuzione reale delle similarità e il timeout di lettura di 300 s su prompt lunghi.
 - **Titoli:** un titolo di una sola parola di 4 o più lettere (per esempio «note.md») limita l'ambito a quel documento ogni volta che la parola compare nella domanda.
@@ -72,7 +137,7 @@ Ultimo aggiornamento: 19 novembre 2026.
 - **Blocchi di codice indentati:** quelli con 4 spazi non vengono riconosciuti per la conversione dei delimitatori LaTeX. Quelli con ``` e il codice inline sì.
 - **Thread in background:** dopo un'interruzione, un server bloccato può tenere attivo il thread di lettura fino a 300 s. L'utente non resta bloccato.
 
-## Come provare con LM Studio reale
+### Come provare con LM Studio reale
 
 1. Installa LM Studio, scarica un modello di chat e, se vuoi, uno di embedding (per esempio `nomic-embed-text`). Avvia il server locale.
 2. `npm run tauri dev`, poi Impostazioni → Modelli locali → «Verifica connessione». Scegli i modelli e aspetta «indicizzati X di X».
@@ -104,6 +169,6 @@ Ultimo aggiornamento: 19 novembre 2026.
 
 Tutti gli 8 criteri verificati; dettagli nella cronologia Git di questo file. `e2e/native.mjs` passa ancora 39/39.
 
-## Prossimo passo: 0.4 — FARO base
+## Prossimo passo: 0.5 — FARO base
 
-Primo lavoro: import di MP3 e MP4 con conservazione dell'originale e scelta del motore di trascrizione locale, da scaricare solo con la tua conferma. Poi segmenti con timestamp e salto al punto della registrazione. Vedi `docs/ROADMAP.md`.
+Primo lavoro: import di MP3 e MP4 con conservazione dell'originale e scelta del motore di trascrizione locale (per esempio whisper.cpp), con download del modello solo dopo la tua conferma. Poi segmenti con timestamp e salto al punto della registrazione. Vedi `docs/ROADMAP.md`.

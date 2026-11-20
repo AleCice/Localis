@@ -2,17 +2,20 @@
 
 App desktop local-first per studio e ricerca. Ogni **progetto** è un contenitore libero (un corso, una tesi, una ricerca) in cui raccogli documenti e fai domande con citazioni verificabili. Nelle prossime versioni arriveranno lezioni registrate, OCR e materiali di studio collegati alle fonti.
 
-**Versione 0.3 — Chat locale con fonti.** Oggi Localis permette di:
+**Versione 0.4 — Cloud opzionale.** Oggi Localis permette di:
 - creare, ritrovare ed eliminare progetti (onboarding, tema chiaro/scuro);
 - importare in un progetto PDF, TXT, Markdown, DOCX e immagini (PNG, JPEG, GIF, WebP), fino a 200 MB per file, con il pulsante «Importa» o trascinandoli nella finestra;
 - organizzarli in cartelle e caricarne nuove versioni;
 - aprirli: PDF e immagini nel viewer, gli altri formati come testo estratto;
 - cercare nel testo estratto, con l'indicazione della pagina o del blocco;
-- fare domande sui documenti di un progetto a un modello che gira sul tuo computer in LM Studio. Le risposte citano le fonti con `[n]` e ogni citazione apre il documento alla pagina o al blocco giusto.
+- fare domande sui documenti di un progetto a un modello che gira sul tuo computer in LM Studio. Le risposte citano le fonti con `[n]` e ogni citazione apre il documento alla pagina o al blocco giusto;
+- se lo scegli, usare modelli cloud con la tua API key (OpenAI, Anthropic, Google Gemini, DeepSeek, Qwen), anche per gli embedding. Va abilitato progetto per progetto e chiede conferma a ogni invio.
 
 Visione e versioni: [`docs/ROADMAP.md`](docs/ROADMAP.md). Stato verificato: [`docs/STATUS.md`](docs/STATUS.md).
 
-Tutti i dati restano sul tuo computer. Nessun account, nessun servizio esterno, nessuna telemetria. L'unica connessione di rete è quella verso LM Studio sul tuo stesso computer (indirizzo locale); altri indirizzi vengono rifiutati.
+Per impostazione predefinita tutti i dati restano sul tuo computer. Nessun account, nessuna telemetria. Localis si collega solo:
+- a LM Studio sul tuo stesso computer;
+- se lo abiliti, ai cinque provider cloud, ognuno su un unico indirizzo HTTPS fisso, solo per i progetti in cui hai consentito il cloud e solo dopo la tua conferma.
 
 ## Prerequisiti
 
@@ -84,6 +87,29 @@ Come risponde la chat:
   - «questo documento» si riferisce a quello della risposta precedente.
 - **«Riassumi questo documento»:** non ci sono parole da cercare, quindi il modello riceve le parti iniziali del documento ed è avvisato che non si tratta del testo completo. Le fonti lo indicano come «Passaggio iniziale».
 - **Formule e testo:** sono supportate formule LaTeX (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`), tabelle e codice. L'HTML nelle risposte non viene mai eseguito e i link non si aprono.
+
+## Modelli cloud (facoltativi)
+
+Ogni progetto nasce **«Solo locale»**: in quel caso nessun suo dato può andare a un provider cloud, e il blocco vale anche nel backend, non solo nell'interfaccia.
+
+1. **Impostazioni → Provider cloud:** incolla la API key del provider e premi «Salva». La chiave va **solo nel portachiavi di sistema** (Credential Manager su Windows, Keychain su macOS, Secret Service su Linux). Non finisce mai nel database o nei log e Localis non la rimostra. Se il portachiavi non è disponibile, Localis lo dice e non salva la chiave altrove.
+2. **«Carica modelli»** contatta il provider con la tua chiave e ne elenca i modelli.
+3. **Prezzi:** Localis non contiene prezzi, perché cambiano spesso. Se vuoi le stime di costo, inseriscili in Impostazioni dal listino del provider (per milione di token, input e output). Senza prezzo vedi solo i token stimati.
+4. **Progetti → dettaglio → «Uso del cloud» → «Consenti cloud».**
+5. **In chat**, scegli un modello cloud. Prima di **ogni** domanda compare un'anteprima con:
+   - provider e indirizzo, modello e perché è stato scelto;
+   - domanda, fonti con titoli e pagine, cronologia;
+   - caratteri, token stimati e costo stimato.
+
+   Parte solo con «Invia a …» e viene inviato esattamente ciò che hai visto. «Annulla» non invia nulla.
+
+Altre funzioni:
+- **Instradamento automatico** (facoltativo): con un elenco di modelli candidati, Localis preferisce un modello locale se LM Studio risponde; altrimenti sceglie il modello cloud più economico secondo i tuoi prezzi. Il motivo della scelta è sempre mostrato.
+- **Nessun ripiego silenzioso:** se un modello fallisce (chiave non valida, limite di richieste, provider irraggiungibile) Localis lo dice e non riprova con un altro.
+- **Embedding cloud** (OpenAI, Gemini, Qwen): l'indicizzazione dei passaggi richiede un **consenso esplicito per progetto**, dato dopo aver visto una stima di passaggi, token e costo. Si può revocare. Tornare a «Solo locale» revoca anche il consenso.
+- **Attività cloud** (Impostazioni): registro locale di ogni richiesta inviata (provider, modello, scopo, caratteri, token, costo, esito). Il contenuto non viene registrato.
+
+Per lo sviluppo: le build **di debug** permettono di puntare i provider a server finti in locale con le variabili `LOCALIS_TEST_<PROVIDER>_BASE_URL`, usate dagli E2E. Nelle build di release questo codice non esiste.
 
 ## Dove sono i dati
 
@@ -161,7 +187,13 @@ node e2e/library.mjs
 node e2e/chat.mjs
 ```
 
+```bash
+node e2e/cloud.mjs
+```
+
 `e2e/chat.mjs` usa `e2e/fake-lmstudio.mjs`, un **finto** server LM Studio per i test. Non è un modello: costruisce le risposte meccanicamente dal prompt. `e2e/chat-ui.mjs` controlla layout e tastiera della chat nel browser (Playwright).
+
+`e2e/cloud.mjs` usa `e2e/fake-cloud.mjs`, cioè finti provider cloud (anche questi non sono modelli), e un portachiavi privato. Richiede `dbus-daemon`, `gnome-keyring-daemon` e `secret-tool` (Debian/Ubuntu: `dbus`, `gnome-keyring`, `libsecret-tools`) e una `TMPDIR` corta: va bene `/tmp`. `e2e/cloud-ui.mjs` controlla l'interfaccia cloud nel browser.
 
 ## Struttura
 
