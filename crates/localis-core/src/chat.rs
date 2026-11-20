@@ -1630,6 +1630,9 @@ fn prepare<A: StoreAccess>(
     conversation_id: &str,
     text: &str,
     selection: &[String],
+    // False when the caller has no chat confirmation yet and only needs to know whether a
+    // model is needed: then the question is not sent to a cloud embedding provider either.
+    allow_cloud_query_embedding: bool,
 ) -> Result<Prepared> {
     let plan = db.with_store(|s| s.plan_turn(&ctx.project_id, conversation_id, text, selection))?;
     let plan = match plan {
@@ -1651,8 +1654,10 @@ fn prepare<A: StoreAccess>(
     let mut query_embedded_by = None;
     let query_vector = match (&plan.embedding_model, &plan.fts) {
         (Some(model), Some(_)) => {
-            if model.is_cloud() && ctx.policy != CloudPolicy::CloudAllowed {
-                None // defense in depth: plan_turn already excludes this
+            if model.is_cloud()
+                && (ctx.policy != CloudPolicy::CloudAllowed || !allow_cloud_query_embedding)
+            {
+                None // lexical only (plan_turn already excludes local-only projects)
             } else {
                 let (vector, sent) =
                     embed_query(db, cloud, ctx, conversation_id, model, &plan.base_url, text);
@@ -1837,6 +1842,7 @@ pub fn prepare_cloud_send<A: StoreAccess>(
         &input.conversation_id,
         &text,
         &input.document_ids,
+        true,
     )?;
     if !prepared.needs_model() {
         return Ok(None);
@@ -1952,6 +1958,7 @@ pub fn send_message<A: StoreAccess>(
             &input.conversation_id,
             &text,
             &input.document_ids,
+            false,
         )?;
         if prepared.needs_model() {
             return Err(CoreError::consent(CONFIRMATION_REQUIRED));
@@ -2038,6 +2045,7 @@ fn run_turn<A: StoreAccess>(
             &input.conversation_id,
             text,
             &input.document_ids,
+            true,
         )?,
     };
     let searched = match prepared {

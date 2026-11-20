@@ -62,8 +62,7 @@ pub use llm::{
     CONNECT_TIMEOUT, EMBED_BATCH_MAX, SHORT_TIMEOUT,
 };
 pub use mesh::{
-    client_for, is_rate_limited, missing_key_message, CloudClient, ModelClient,
-    CLOUD_MAX_OUTPUT_TOKENS, TEMPERATURE,
+    client_for, missing_key_message, CloudClient, ModelClient, CLOUD_MAX_OUTPUT_TOKENS, TEMPERATURE,
 };
 pub use prices::{estimate_tokens, validate_price, ModelPrice, Money, Usage, PRICE_MAX};
 pub use prism::{

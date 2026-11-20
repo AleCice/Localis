@@ -14,6 +14,8 @@
 //
 // Prerequisites (Linux): as e2e/chat.mjs, plus for the real keychain path:
 //   dbus-daemon, gnome-keyring-daemon, secret-tool (Debian/Ubuntu: dbus, gnome-keyring, libsecret-tools)
+//   Keep $TMPDIR short (the default /tmp is fine): the private bus and keyring sockets live in the
+//   temp dir and Unix socket paths are limited to ~108 characters, otherwise the keyring is skipped.
 // The script starts a PRIVATE session bus and a PRIVATE gnome-keyring (in its temp dir, test-only
 // password) so nothing touches the user's real keychain. Without them it still runs the
 // keyring_unavailable checks and skips what needs stored keys.

@@ -425,7 +425,7 @@ fn step(
         let cost = store
             .price_of(&model)?
             .and_then(|p| p.cost_of(&usage, false));
-        store.log_cloud_request(&CloudLogEntry {
+        let entry = CloudLogEntry {
             provider,
             model: Some(model.model.clone()),
             purpose: CloudPurpose::IndexEmbedding,
@@ -435,10 +435,21 @@ fn step(
             usage,
             cost,
             error: result.as_ref().err().map(|e| e.to_string()),
-        })?;
-        let (vectors, _) = result?;
-        let items: Vec<(i64, Vec<f32>)> = batch.iter().map(|(id, _)| *id).zip(vectors).collect();
-        store.save_embeddings(&key, &items)?;
+        };
+        // Save the (already paid for) vectors before logging, so a log write failure can
+        // never cause the batch to be sent again.
+        let saved = match result {
+            Ok((vectors, _)) => {
+                let items: Vec<(i64, Vec<f32>)> =
+                    batch.iter().map(|(id, _)| *id).zip(vectors).collect();
+                store.save_embeddings(&key, &items)
+            }
+            Err(err) => Err(err),
+        };
+        if let Err(err) = store.log_cloud_request(&entry) {
+            eprintln!("localis: cloud log write failed: {err}");
+        }
+        saved?;
         return Ok(Step::Embedded);
     }
     let (vectors, _) = client.embed(&model.model, &texts, config.batch_timeout)?;

@@ -443,7 +443,33 @@ fn query_escape(s: &str) -> String {
 
 /// `llm_unavailable` for a network failure or a 5xx answer.
 pub(crate) fn unreachable_error(provider: CloudProvider, detail: String) -> CoreError {
-    CoreError::llm(format!("{} non raggiungibile.", provider.name()), detail)
+    CoreError::llm(
+        format!("{} non raggiungibile.", provider.name()),
+        strip_url_userinfo(&detail),
+    )
+}
+
+/// Removes `user:password@` from any URL in `text` (e.g. an authenticated proxy mentioned in
+/// a transport error), so credentials never reach `detail`.
+pub(crate) fn strip_url_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("://") {
+        let (head, tail) = rest.split_at(pos + 3);
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| c == '/' || c.is_whitespace() || c == '"' || c == '\'')
+            .unwrap_or(tail.len());
+        match tail[..end].rfind('@') {
+            Some(at) => {
+                out.push_str("***@");
+                rest = &tail[at + 1..];
+            }
+            None => rest = tail,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `llm_unavailable` for an HTTP error status. With 401/403 the body is not kept at all
@@ -470,11 +496,6 @@ pub(crate) fn status_error(
             redact(&http_detail(status, body), key),
         ),
     }
-}
-
-/// Whether an error is a provider's rate limit (HTTP 429).
-pub fn is_rate_limited(err: &CoreError) -> bool {
-    matches!(err, CoreError::LlmUnavailable { detail, .. } if detail.starts_with("HTTP 429"))
 }
 
 impl ModelClient for CloudClient {
@@ -687,7 +708,14 @@ pub(crate) fn parse_gemini_event(data: &str) -> Vec<Chunk> {
     if let Some(u) = value.get("usageMetadata") {
         out.push(Chunk::Usage(Usage {
             input_tokens: u.get("promptTokenCount").and_then(Value::as_u64),
-            output_tokens: u.get("candidatesTokenCount").and_then(Value::as_u64),
+            // Thinking models bill their reasoning as output too.
+            output_tokens: match (
+                u.get("candidatesTokenCount").and_then(Value::as_u64),
+                u.get("thoughtsTokenCount").and_then(Value::as_u64),
+            ) {
+                (None, None) => None,
+                (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+            },
         }));
     }
     out
@@ -895,17 +923,19 @@ mod tests {
             assert!(!detail.contains(key), "{status}: {detail}");
             assert!(!err.to_string().contains(key));
         }
-        assert!(is_rate_limited(&status_error(
-            CloudProvider::Qwen,
-            429,
-            "",
-            key
-        )));
-        assert!(!is_rate_limited(&status_error(
-            CloudProvider::Qwen,
-            500,
-            "",
-            key
-        )));
+    }
+
+    #[test]
+    fn userinfo_is_removed_from_transport_errors() {
+        assert_eq!(
+            strip_url_userinfo("proxy http://alice:s3cret@proxy.local:8080/ failed"),
+            "proxy http://***@proxy.local:8080/ failed"
+        );
+        assert_eq!(
+            strip_url_userinfo("POST https://api.openai.com/v1/x: timeout"),
+            "POST https://api.openai.com/v1/x: timeout"
+        );
+        let e = unreachable_error(CloudProvider::OpenAi, "via http://u:p@h:1 refused".into());
+        assert!(!e.to_string().contains("u:p") && !format!("{e:?}").contains("u:p"));
     }
 }

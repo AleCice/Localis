@@ -1372,3 +1372,35 @@ fn listing_models_sends_only_the_key_on_request_and_is_logged() {
         && e.project_id.is_none()));
     assert!(!log[0].ok && log[1].ok);
 }
+
+#[test]
+fn unconfirmed_cloud_send_contacts_no_provider_at_all() {
+    let t = T::new(CloudPolicy::CloudAllowed);
+    t.import("analisi.md", ANALISI);
+    t.settings(|s| {
+        s.embedding_model = Some(ModelRef::new(OPENAI, EMBED));
+        s.chat_model = Some(cloud_model(CloudProvider::OpenAi));
+    });
+    t.store()
+        .set_cloud_embedding_consent(&t.project, true)
+        .unwrap();
+    let embedder = t.start_embedder(fast());
+    embedder.wake();
+    wait_until("indexed", || {
+        let st = t
+            .store()
+            .embedding_status(&t.project, &embedder.shared)
+            .unwrap();
+        st.state == EmbeddingState::Idle && st.embedded == st.total && st.total > 0
+    });
+    drop(embedder);
+    std::thread::sleep(Duration::from_millis(200));
+    let before = t.fake(CloudProvider::OpenAi).count();
+
+    // A question that needs the model, sent without confirmation: refused before any
+    // network call — not even the query embedding goes out.
+    let conv = t.conversation();
+    let (r, _) = t.send(&conv, "Che cos'è la derivata di una funzione?", None);
+    assert_consent(r, None);
+    assert_eq!(t.fake(CloudProvider::OpenAi).count(), before);
+}

@@ -123,12 +123,21 @@ fn route_auto(candidates: &[ModelRef], inputs: RouteInputs<'_>) -> Result<RouteD
             "{local_note} e nessun provider cloud candidato ha una chiave API"
         )));
     }
-    let price = |m: &ModelRef| -> Option<f64> {
+    let price_of = |m: &ModelRef| {
         let p = m.provider.cloud()?;
         inputs
             .prices
             .iter()
             .find(|x| x.provider == p && x.model == m.model)
+    };
+    // Prices in different currencies are not comparable: only those in the currency of the
+    // first priced candidate (list order) are ranked by price; the others count as unpriced.
+    let currency = available
+        .iter()
+        .find_map(|(_, m)| price_of(m).map(|x| x.currency.clone()));
+    let price = |m: &ModelRef| -> Option<f64> {
+        price_of(m)
+            .filter(|x| Some(&x.currency) == currency.as_ref())
             .map(|x| x.input_per_mtok + x.output_per_mtok)
     };
     let mut ranked: Vec<(usize, &ModelRef, Option<f64>)> =
@@ -334,6 +343,22 @@ mod tests {
             err.to_string().contains("non ci sono modelli cloud"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn prices_in_different_currencies_are_not_compared() {
+        let s = auto(&[(OPENAI, "gpt"), (GEMINI, "flash")]);
+        // gpt is priced in EUR (first priced candidate in list order), flash in USD and
+        // numerically cheaper: the USD price must not win against the EUR one.
+        let mut eur = price(CloudProvider::OpenAi, "gpt", 5.0, 10.0);
+        eur.currency = "EUR".into();
+        let case = Case {
+            local: LocalModels::Unreachable,
+            prices: vec![eur, price(CloudProvider::Gemini, "flash", 0.1, 0.2)],
+            ..Case::new()
+        };
+        let d = case.run(&s).0.unwrap();
+        assert_eq!(d.model.model, "gpt");
     }
 
     #[test]
