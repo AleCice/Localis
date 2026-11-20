@@ -1773,9 +1773,7 @@ fn embed_query<A: StoreAccess>(
     if let Some(provider) = model.provider.cloud() {
         let usage = result.as_ref().map(|(_, u)| *u).unwrap_or_default();
         let _ = db.with_store(|s| {
-            let cost = s
-                .price_of(model)?
-                .and_then(|p| p.cost_of(&usage, false));
+            let cost = s.price_of(model)?.and_then(|p| p.cost_of(&usage, false));
             s.log_cloud_request(&CloudLogEntry {
                 provider,
                 model: Some(model.model.clone()),
@@ -1793,7 +1791,10 @@ fn embed_query<A: StoreAccess>(
 }
 
 fn prompt_chars(prompt: &[PromptMessage]) -> u64 {
-    prompt.iter().map(|m| m.content.chars().count() as u64).sum()
+    prompt
+        .iter()
+        .map(|m| m.content.chars().count() as u64)
+        .sum()
 }
 
 /// Plans a question (retrieval + PRISM routing) without storing it or calling a chat
@@ -1917,6 +1918,8 @@ pub fn send_message<A: StoreAccess>(
     input: SendInput,
     emit: &mut dyn FnMut(ChatEvent),
 ) -> Result<ChatMessage> {
+    // A token is consumed by its first use, whatever happens next.
+    let pending = input.confirm_token.as_deref().map(|t| cloud.take(t));
     let text = validate_question(&input.text)?;
     let guard = runtime.register(&input.conversation_id)?;
     // Nothing is written until begin_turn.
@@ -1926,10 +1929,8 @@ pub fn send_message<A: StoreAccess>(
         return Err(CoreError::consent(message.clone()));
     }
     let mut confirmed = false;
-    let prepared = if let Some(token) = input.confirm_token.as_deref() {
-        let pending = cloud
-            .take(token)
-            .ok_or_else(|| CoreError::consent(TOKEN_INVALID))?;
+    let prepared = if let Some(pending) = pending {
+        let pending = pending.ok_or_else(|| CoreError::consent(TOKEN_INVALID))?;
         if !pending.matches(&input.conversation_id, &text, &input.document_ids) {
             return Err(CoreError::consent(TOKEN_MISMATCH));
         }
@@ -2045,8 +2046,8 @@ fn run_turn<A: StoreAccess>(
             content,
             candidates,
         } => {
-            let message =
-                db.with_store(|s| s.finish_message(id, &Final::reply(kind, &content, &candidates)))?;
+            let message = db
+                .with_store(|s| s.finish_message(id, &Final::reply(kind, &content, &candidates)))?;
             emit(ChatEvent::Done(message.clone()));
             return Ok(message);
         }

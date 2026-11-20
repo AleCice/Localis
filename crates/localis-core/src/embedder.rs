@@ -156,7 +156,11 @@ pub struct CloudEmbeddingEstimate {
     pub est_cost: Option<Money>,
 }
 
-const CURRENT_VERSION_SQL: &str = "v.version_no = (SELECT MAX(m.version_no) FROM document_versions m
+/// Passages to embed: (chunk id, text).
+pub type PendingBatch = Vec<(i64, String)>;
+
+const CURRENT_VERSION_SQL: &str =
+    "v.version_no = (SELECT MAX(m.version_no) FROM document_versions m
                                    WHERE m.document_id = v.document_id)";
 
 impl Store {
@@ -181,7 +185,7 @@ impl Store {
         &self,
         model: &str,
         limit: usize,
-    ) -> Result<Option<(String, Vec<(i64, String)>)>> {
+    ) -> Result<Option<(String, PendingBatch)>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT d.project_id, c.id, c.text FROM chunks c
              JOIN document_versions v ON v.id = c.version_id
@@ -403,8 +407,7 @@ fn step(
         state: EmbeddingState::Running,
         model: Some(key.clone()),
         // Keep the last failure visible while retrying, until a batch succeeds.
-        ..if current.state == EmbeddingState::Unreachable && current.model.as_ref() == Some(&key)
-        {
+        ..if current.state == EmbeddingState::Unreachable && current.model.as_ref() == Some(&key) {
             current
         } else {
             EmbedderSnapshot::default()

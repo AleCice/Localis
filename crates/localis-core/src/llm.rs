@@ -297,6 +297,9 @@ pub(crate) enum Chunk {
     Error(String),
 }
 
+/// Maps a non-200 status and its body to an error.
+pub(crate) type StatusError = Box<dyn Fn(u16, &str) -> CoreError + Send>;
+
 /// A streamed request. Built by each provider; the key (if any) travels in `headers`.
 pub(crate) struct StreamRequest {
     pub agent: ureq::Agent,
@@ -307,7 +310,7 @@ pub(crate) struct StreamRequest {
     /// User-facing message of a failure reported inside the stream.
     pub model_failed: String,
     /// Error for a non-200 status (status, body).
-    pub on_status: Box<dyn Fn(u16, &str) -> CoreError + Send>,
+    pub on_status: StatusError,
     /// Error for a network failure (diagnostics).
     pub unreachable: Box<dyn Fn(String) -> CoreError + Send>,
 }
@@ -676,7 +679,10 @@ mod tests {
             parse_openai_event(r#"{"error":{"message":"boom"}}"#)[..],
             [Chunk::Error(_)]
         ));
-        assert!(matches!(parse_openai_event("not json")[..], [Chunk::Error(_)]));
+        assert!(matches!(
+            parse_openai_event("not json")[..],
+            [Chunk::Error(_)]
+        ));
         assert_eq!(
             parse_openai_event(
                 r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}"#

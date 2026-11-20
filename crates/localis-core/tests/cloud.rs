@@ -18,12 +18,12 @@ use common::fake_lm::{closed_url, FakeLm, CHAT_MODEL};
 use common::keys::{MemoryKeys, UnavailableKeys};
 use common::*;
 use localis_core::{
-    prepare_cloud_send, run_embedder, send_message, ChatEvent, ChatMessage, ChatRuntime,
-    CloudClient, CloudPolicy, CloudPreview, CloudProvider, CloudPurpose, CloudRuntime, CoreError,
-    EmbedderConfig, EmbedderShared, EmbeddingState, Endpoints, ImportFile, ImportOutcome, Keys,
-    LibraryDocument, LlmSettings, MessageKind, MessageStatus, ModelClient, ModelKind, ModelPrice,
-    ModelRef, NewProject, ProviderId, RetrievalMode, Routing, SecretStore, SendInput, Store,
-    MANUAL_REASON, ROUTE_CHANGED, TOKEN_INVALID, TOKEN_MISMATCH,
+    list_provider_models, prepare_cloud_send, run_embedder, send_message, ChatEvent, ChatMessage,
+    ChatRuntime, CloudClient, CloudPolicy, CloudPreview, CloudProvider, CloudPurpose, CloudRuntime,
+    CoreError, EmbedderConfig, EmbedderShared, EmbeddingState, Endpoints, ImportFile,
+    ImportOutcome, Keys, LibraryDocument, LlmSettings, MessageKind, MessageStatus, ModelClient,
+    ModelKind, ModelPrice, ModelRef, NewProject, ProviderId, RetrievalMode, Routing, SecretStore,
+    SendInput, Store, MANUAL_REASON, ROUTE_CHANGED, TOKEN_INVALID, TOKEN_MISMATCH,
 };
 use tempfile::TempDir;
 
@@ -65,7 +65,9 @@ impl T {
     fn build(policy: CloudPolicy, ttl: Option<Duration>, keys: Option<Keys>) -> Self {
         let mut env = Env::new();
         let project = env.project("Studio").id;
-        env.store.set_project_cloud_policy(&project, policy).unwrap();
+        env.store
+            .set_project_cloud_policy(&project, policy)
+            .unwrap();
         let lm = FakeLm::start();
         env.store
             .set_llm_settings(&LlmSettings {
@@ -81,11 +83,8 @@ impl T {
             endpoints = endpoints.with_test_override(p, &fake.url).unwrap();
             fakes.insert(p, fake);
         }
-        let keys: Keys = keys.unwrap_or_else(|| {
-            Arc::new(MemoryKeys::with(
-                &CloudProvider::ALL.map(|p| (p, KEY)),
-            ))
-        });
+        let keys: Keys = keys
+            .unwrap_or_else(|| Arc::new(MemoryKeys::with(&CloudProvider::ALL.map(|p| (p, KEY)))));
         let mut cloud = CloudRuntime::new(keys, endpoints);
         if let Some(ttl) = ttl {
             cloud = cloud.with_ttl(ttl);
@@ -155,11 +154,18 @@ impl T {
 
     fn send_input(&self, input: SendInput) -> (Result<ChatMessage, CoreError>, Vec<ChatEvent>) {
         let mut events = Vec::new();
-        let r = send_message(&self.db, &self.rt, &self.cloud, input, &mut |e| events.push(e));
+        let r = send_message(&self.db, &self.rt, &self.cloud, input, &mut |e| {
+            events.push(e)
+        });
         (r, events)
     }
 
-    fn send(&self, conv: &str, text: &str, token: Option<&str>) -> (Result<ChatMessage, CoreError>, Vec<ChatEvent>) {
+    fn send(
+        &self,
+        conv: &str,
+        text: &str,
+        token: Option<&str>,
+    ) -> (Result<ChatMessage, CoreError>, Vec<ChatEvent>) {
         self.send_input(Self::input(conv, text, &[], token))
     }
 
@@ -244,7 +250,10 @@ fn fast() -> EmbedderConfig {
 fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     let start = Instant::now();
     while !f() {
-        assert!(start.elapsed() < Duration::from_secs(20), "timed out waiting for {what}");
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "timed out waiting for {what}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -260,7 +269,11 @@ fn assert_consent(r: Result<impl std::fmt::Debug, CoreError>, message: Option<&s
 fn chat_requests(fake: &FakeCloud) -> Vec<common::fake_cloud::Recorded> {
     fake.requests()
         .into_iter()
-        .filter(|r| r.path.contains("chat/completions") || r.path.contains("/messages") || r.path.contains("GenerateContent"))
+        .filter(|r| {
+            r.path.contains("chat/completions")
+                || r.path.contains("/messages")
+                || r.path.contains("GenerateContent")
+        })
         .collect()
 }
 
@@ -286,7 +299,10 @@ fn local_only_blocks_every_cloud_path() {
     // Automatic routing never picks a cloud candidate for a local-only project.
     t.settings(|s| {
         s.routing = Routing::Auto;
-        s.auto_models = vec![cloud_model(CloudProvider::OpenAi), cloud_model(CloudProvider::Anthropic)];
+        s.auto_models = vec![
+            cloud_model(CloudProvider::OpenAi),
+            cloud_model(CloudProvider::Anthropic),
+        ];
     });
     assert!(t.prepare(&conv, Q).unwrap().is_none());
     let m = t.send(&conv, Q, None).0.unwrap();
@@ -302,7 +318,10 @@ fn local_only_blocks_every_cloud_path() {
 
     // Cloud embeddings: no consent possible, no indexing, no query embedding.
     t.settings(|s| s.embedding_model = Some(ModelRef::new(OPENAI, EMBED)));
-    let err = t.store().set_cloud_embedding_consent(&t.project, true).unwrap_err();
+    let err = t
+        .store()
+        .set_cloud_embedding_consent(&t.project, true)
+        .unwrap_err();
     assert_eq!(err.code(), "conflict");
     // Vectors computed earlier (e.g. before the project became local-only) are not used
     // for cloud query embeddings.
@@ -310,19 +329,29 @@ fn local_only_blocks_every_cloud_path() {
         let mut store = t.store();
         let key = ModelRef::new(OPENAI, EMBED).embedding_key();
         let pending = store.pending_embeddings(&key, 100).unwrap();
-        let items: Vec<(i64, Vec<f32>)> = pending.iter().map(|(id, _)| (*id, vec![1.0, 0.0])).collect();
+        let items: Vec<(i64, Vec<f32>)> = pending
+            .iter()
+            .map(|(id, _)| (*id, vec![1.0, 0.0]))
+            .collect();
         store.save_embeddings(&key, &items).unwrap();
     }
     let embedder = t.start_embedder(fast());
     std::thread::sleep(Duration::from_millis(300));
     let m = t.send(&conv, Q, None).0.unwrap();
     assert_eq!(m.retrieval.unwrap().mode, RetrievalMode::Lexical);
-    let st = t.store().embedding_status(&t.project, &embedder.shared).unwrap();
+    let st = t
+        .store()
+        .embedding_status(&t.project, &embedder.shared)
+        .unwrap();
     assert_eq!(st.state, EmbeddingState::NeedsConsent);
     assert_eq!(st.provider, Some(OPENAI));
     drop(embedder);
 
-    assert_eq!(t.total_cloud_requests(), 0, "no request ever reached a cloud provider");
+    assert_eq!(
+        t.total_cloud_requests(),
+        0,
+        "no request ever reached a cloud provider"
+    );
     assert_eq!(t.count("SELECT COUNT(*) FROM cloud_requests"), 0);
 }
 
@@ -337,7 +366,10 @@ fn tokens_are_single_use_bound_and_expire() {
     let openai = t.fake(CloudProvider::OpenAi);
 
     let p = t.prepare(&conv, Q).unwrap().unwrap();
-    assert!(chat_requests(openai).is_empty(), "prepare never calls the chat model");
+    assert!(
+        chat_requests(openai).is_empty(),
+        "prepare never calls the chat model"
+    );
     assert_eq!(t.messages(), 0, "prepare stores nothing");
     assert_eq!(p.token.len(), 36);
 
@@ -348,7 +380,11 @@ fn tokens_are_single_use_bound_and_expire() {
     altered.push(if last == 'a' { 'b' } else { 'a' });
     assert_consent(t.send(&conv, Q, Some(&altered)).0, Some(TOKEN_INVALID));
     // Different question: refused, and the token is consumed by that attempt.
-    assert_consent(t.send(&conv, "Che cosa dice il teorema di Rolle?", Some(&p.token)).0, Some(TOKEN_MISMATCH));
+    assert_consent(
+        t.send(&conv, "Che cosa dice il teorema di Rolle?", Some(&p.token))
+            .0,
+        Some(TOKEN_MISMATCH),
+    );
     assert_consent(t.send(&conv, Q, Some(&p.token)).0, Some(TOKEN_INVALID));
     // Different conversation, different selection.
     let p = t.prepare(&conv, Q).unwrap().unwrap();
@@ -367,11 +403,18 @@ fn tokens_are_single_use_bound_and_expire() {
     t.settings(|s| s.chat_model = Some(cloud_model(CloudProvider::OpenAi)));
     // Project made local-only after the preview.
     let p = t.prepare(&conv, Q).unwrap().unwrap();
-    t.store().set_project_cloud_policy(&t.project, CloudPolicy::LocalOnly).unwrap();
+    t.store()
+        .set_project_cloud_policy(&t.project, CloudPolicy::LocalOnly)
+        .unwrap();
     assert_consent(t.send(&conv, Q, Some(&p.token)).0, None);
-    t.store().set_project_cloud_policy(&t.project, CloudPolicy::CloudAllowed).unwrap();
+    t.store()
+        .set_project_cloud_policy(&t.project, CloudPolicy::CloudAllowed)
+        .unwrap();
     assert_eq!(t.messages(), 0, "no failed attempt stored anything");
-    assert!(chat_requests(openai).is_empty(), "no failed attempt reached the provider");
+    assert!(
+        chat_requests(openai).is_empty(),
+        "no failed attempt reached the provider"
+    );
 
     // Valid: sent once; the same token cannot be reused.
     let p = t.prepare(&conv, Q).unwrap().unwrap();
@@ -386,7 +429,11 @@ fn tokens_are_single_use_bound_and_expire() {
     assert_eq!(t.cloud.pending_count(), 0);
 
     // Expiry.
-    let short = T::build(CloudPolicy::CloudAllowed, Some(Duration::from_millis(100)), None);
+    let short = T::build(
+        CloudPolicy::CloudAllowed,
+        Some(Duration::from_millis(100)),
+        None,
+    );
     short.import("analisi.md", ANALISI);
     let conv = short.conversation();
     let p = short.prepare(&conv, Q).unwrap().unwrap();
@@ -409,7 +456,10 @@ fn sent_payload_is_exactly_the_preview() {
     let p = t.prepare(&conv, q2).unwrap().unwrap();
     assert_eq!(p.question, q2);
     assert_eq!(p.history_pairs, 1);
-    assert_eq!(p.history_chars, (Q.chars().count() + CLOUD_ANSWER.chars().count()) as u64);
+    assert_eq!(
+        p.history_chars,
+        (Q.chars().count() + CLOUD_ANSWER.chars().count()) as u64
+    );
     assert_eq!(p.sources[0].title, "analisi.md");
     assert_eq!(p.provider_name, "OpenAI");
     assert_eq!(p.host, "api.openai.com");
@@ -418,21 +468,36 @@ fn sent_payload_is_exactly_the_preview() {
     assert_eq!(p.route.reason, MANUAL_REASON);
     // The library changes after the preview: the confirmed request does not.
     t.store().delete_document(&doc.id).unwrap();
-    t.import("rolle.md", "Il teorema di Rolle è citato anche qui, con altre parole.");
+    t.import(
+        "rolle.md",
+        "Il teorema di Rolle è citato anche qui, con altre parole.",
+    );
     let m = t.send(&conv, q2, Some(&p.token)).0.unwrap();
     assert_eq!(m.status, MessageStatus::Complete);
 
-    let req = chat_requests(t.fake(CloudProvider::OpenAi)).pop().unwrap().json();
+    let req = chat_requests(t.fake(CloudProvider::OpenAi))
+        .pop()
+        .unwrap()
+        .json();
     let messages = req["messages"].as_array().unwrap();
     let total: u64 = messages
         .iter()
         .map(|m| m["content"].as_str().unwrap().chars().count() as u64)
         .sum();
-    assert_eq!(total, p.total_chars, "characters sent == characters previewed");
+    assert_eq!(
+        total, p.total_chars,
+        "characters sent == characters previewed"
+    );
     assert_eq!(messages.len(), 1 + 2 * p.history_pairs as usize + 1);
     let last = messages.last().unwrap()["content"].as_str().unwrap();
-    assert!(last.contains("Il teorema di Rolle afferma"), "passage of the deleted document");
-    assert!(!last.contains("altre parole"), "nothing added after the preview");
+    assert!(
+        last.contains("Il teorema di Rolle afferma"),
+        "passage of the deleted document"
+    );
+    assert!(
+        !last.contains("altre parole"),
+        "nothing added after the preview"
+    );
     assert!(last.ends_with(&format!("Domanda: {q2}")));
     assert_eq!(messages[1]["content"], Q);
     assert_eq!(messages[2]["content"], CLOUD_ANSWER);
@@ -459,10 +524,16 @@ fn turns_without_a_model_need_no_confirmation() {
     let t = T::new(CloudPolicy::CloudAllowed);
     t.import("analisi.md", ANALISI);
     let conv = t.conversation();
-    for q in ["Quali documenti ho caricato?", "Parlami della fotosintesi clorofilliana"] {
+    for q in [
+        "Quali documenti ho caricato?",
+        "Parlami della fotosintesi clorofilliana",
+    ] {
         assert!(t.prepare(&conv, q).unwrap().is_none(), "{q}");
         let m = t.send(&conv, q, None).0.unwrap();
-        assert!(matches!(m.kind, MessageKind::Inventory | MessageKind::NoEvidence), "{q}");
+        assert!(
+            matches!(m.kind, MessageKind::Inventory | MessageKind::NoEvidence),
+            "{q}"
+        );
     }
     assert_eq!(t.total_cloud_requests(), 0);
 }
@@ -477,10 +548,17 @@ fn provider_failures_never_fall_back() {
     // Auto with two keyed cloud candidates (OpenAI cheaper): OpenAI is chosen and fails.
     t.settings(|s| {
         s.routing = Routing::Auto;
-        s.auto_models = vec![cloud_model(CloudProvider::Anthropic), cloud_model(CloudProvider::OpenAi)];
+        s.auto_models = vec![
+            cloud_model(CloudProvider::Anthropic),
+            cloud_model(CloudProvider::OpenAi),
+        ];
     });
     for (model, price) in [("chat-fake", 1.0), ("chat-fake", 5.0)] {
-        let provider = if price == 1.0 { CloudProvider::OpenAi } else { CloudProvider::Anthropic };
+        let provider = if price == 1.0 {
+            CloudProvider::OpenAi
+        } else {
+            CloudProvider::Anthropic
+        };
         t.store()
             .set_price(&ModelPrice {
                 provider,
@@ -494,7 +572,10 @@ fn provider_failures_never_fall_back() {
     let openai = t.fake(CloudProvider::OpenAi);
     for (status, message) in [
         (500, "OpenAI non raggiungibile."),
-        (429, "Limite di richieste raggiunto per OpenAI. Riprova più tardi."),
+        (
+            429,
+            "Limite di richieste raggiunto per OpenAI. Riprova più tardi.",
+        ),
         (401, "Chiave API non valida o senza permessi per OpenAI."),
         (400, "OpenAI ha rifiutato la richiesta."),
     ] {
@@ -514,12 +595,25 @@ fn provider_failures_never_fall_back() {
         s.key = "a-different-key".into();
     });
     let (_, m) = t.ask_cloud(&conv, Q);
-    assert_eq!(m.error.as_ref().unwrap().detail.as_deref(), Some("HTTP 401"));
-    assert_eq!(chat_requests(t.fake(CloudProvider::Anthropic)).len(), 0, "no fallback to Anthropic");
-    assert_eq!(t.lm.requests("/v1/chat/completions").len(), 0, "no fallback to LM Studio");
+    assert_eq!(
+        m.error.as_ref().unwrap().detail.as_deref(),
+        Some("HTTP 401")
+    );
+    assert_eq!(
+        chat_requests(t.fake(CloudProvider::Anthropic)).len(),
+        0,
+        "no fallback to Anthropic"
+    );
+    assert_eq!(
+        t.lm.requests("/v1/chat/completions").len(),
+        0,
+        "no fallback to LM Studio"
+    );
     let log = t.store().list_cloud_requests(100).unwrap();
     assert_eq!(log.len(), 5);
-    assert!(log.iter().all(|e| !e.ok && e.error.is_some() && e.purpose == CloudPurpose::Chat));
+    assert!(log
+        .iter()
+        .all(|e| !e.ok && e.error.is_some() && e.purpose == CloudPurpose::Chat));
 }
 
 #[test]
@@ -531,20 +625,20 @@ fn cancelling_a_cloud_answer_keeps_the_partial_text_and_logs_it() {
     let p = t.prepare(&conv, Q).unwrap().unwrap();
     std::thread::scope(|scope| {
         let handle = scope.spawn(|| t.send(&conv, Q, Some(&p.token)).0.unwrap());
-        wait_until("streaming", || {
-            t.count("SELECT COUNT(*) FROM messages WHERE status = 'streaming' AND content <> ''") > 0
-                || t.rt.is_active(&conv) && {
-                    std::thread::sleep(Duration::from_millis(300));
-                    true
-                }
+        wait_until("stream started", || {
+            !chat_requests(t.fake(CloudProvider::OpenAi)).is_empty()
         });
+        std::thread::sleep(Duration::from_millis(400));
         t.rt.cancel(&conv);
         let m = handle.join().unwrap();
         assert_eq!(m.status, MessageStatus::Cancelled);
         assert!(m.content.starts_with("parola"));
     });
     let log = t.store().list_cloud_requests(1).unwrap();
-    assert_eq!(log[0].error.as_deref(), Some("Risposta interrotta dall'utente."));
+    assert_eq!(
+        log[0].error.as_deref(),
+        Some("Risposta interrotta dall'utente.")
+    );
 }
 
 // ------------------------------------------------------------------ PRISM
@@ -575,7 +669,11 @@ fn automatic_routing_prefers_local_then_cheapest_cloud() {
     t.settings(|s| s.base_url = closed_url());
     let p = t.prepare(&conv, Q).unwrap().unwrap();
     assert_eq!(p.route.model, cloud_model(CloudProvider::OpenAi));
-    assert!(p.route.reason.contains("LM Studio non è raggiungibile"), "{}", p.route.reason);
+    assert!(
+        p.route.reason.contains("LM Studio non è raggiungibile"),
+        "{}",
+        p.route.reason
+    );
     // Prices: DeepSeek is cheaper.
     t.store()
         .set_price(&ModelPrice {
@@ -610,7 +708,10 @@ fn estimates_and_costs_follow_user_prices() {
     assert!(p.est_cost.is_none());
     assert_eq!(p.est_input_tokens, p.total_chars.div_ceil(4));
     let usage = m.usage.unwrap();
-    assert_eq!((usage.input_tokens, usage.output_tokens), (Some(OPENAI_USAGE.0), Some(OPENAI_USAGE.1)));
+    assert_eq!(
+        (usage.input_tokens, usage.output_tokens),
+        (Some(OPENAI_USAGE.0), Some(OPENAI_USAGE.1))
+    );
     assert!(m.cost.is_none());
 
     t.store()
@@ -650,7 +751,11 @@ fn every_provider_streams_with_usage_and_its_own_wire_format() {
     for (p, path, usage) in [
         (CloudProvider::OpenAi, "/v1/chat/completions", OPENAI_USAGE),
         (CloudProvider::DeepSeek, "/chat/completions", OPENAI_USAGE),
-        (CloudProvider::Qwen, "/compatible-mode/v1/chat/completions", OPENAI_USAGE),
+        (
+            CloudProvider::Qwen,
+            "/compatible-mode/v1/chat/completions",
+            OPENAI_USAGE,
+        ),
         (CloudProvider::Anthropic, "/v1/messages", ANTHROPIC_USAGE),
         (
             CloudProvider::Gemini,
@@ -666,7 +771,11 @@ fn every_provider_streams_with_usage_and_its_own_wire_format() {
         assert_eq!(m.content, CLOUD_ANSWER, "{p:?}");
         assert_eq!(m.provider, Some(ProviderId::Cloud(p)));
         let u = m.usage.unwrap();
-        assert_eq!((u.input_tokens, u.output_tokens), (Some(usage.0), Some(usage.1)), "{p:?}");
+        assert_eq!(
+            (u.input_tokens, u.output_tokens),
+            (Some(usage.0), Some(usage.1)),
+            "{p:?}"
+        );
         assert!(m.sources.iter().any(|s| s.cited), "{p:?}: [1] is cited");
         let req = chat_requests(t.fake(p)).pop().unwrap();
         assert_eq!(req.path, path, "{p:?}");
@@ -678,7 +787,10 @@ fn every_provider_streams_with_usage_and_its_own_wire_format() {
                 assert_eq!(body["messages"].as_array().unwrap().len(), 1);
             }
             CloudProvider::Gemini => {
-                assert!(body["systemInstruction"]["parts"][0]["text"].as_str().unwrap().contains("Localis"));
+                assert!(body["systemInstruction"]["parts"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Localis"));
                 assert_eq!(body["contents"][0]["role"], "user");
             }
             _ => {
@@ -686,7 +798,12 @@ fn every_provider_streams_with_usage_and_its_own_wire_format() {
                 assert_eq!(body["messages"][0]["role"], "system");
             }
         }
-        assert_eq!(body["temperature"].as_f64().or(body["generationConfig"]["temperature"].as_f64()), Some(0.2));
+        assert_eq!(
+            body["temperature"]
+                .as_f64()
+                .or(body["generationConfig"]["temperature"].as_f64()),
+            Some(0.2)
+        );
     }
 }
 
@@ -699,11 +816,17 @@ fn model_lists_and_embeddings_per_provider() {
     };
     assert_eq!(
         ids(client(CloudProvider::OpenAi).list_models().unwrap()),
-        [("chat-fake".into(), ModelKind::Unknown), ("text-embedding-fake".into(), ModelKind::Embedding)]
+        [
+            ("chat-fake".into(), ModelKind::Unknown),
+            ("text-embedding-fake".into(), ModelKind::Embedding)
+        ]
     );
     assert_eq!(
         ids(client(CloudProvider::DeepSeek).list_models().unwrap()),
-        [("chat-fake".into(), ModelKind::Llm), ("text-embedding-fake".into(), ModelKind::Llm)]
+        [
+            ("chat-fake".into(), ModelKind::Llm),
+            ("text-embedding-fake".into(), ModelKind::Llm)
+        ]
     );
     assert_eq!(client(CloudProvider::Qwen).list_models().unwrap().len(), 2);
     assert_eq!(
@@ -725,21 +848,38 @@ fn model_lists_and_embeddings_per_provider() {
     );
     let g = t.fake(CloudProvider::Gemini).requests();
     assert_eq!(g.len(), 2);
-    assert_eq!(g[0].headers.get("x-goog-api-key").map(String::as_str), Some(KEY));
+    assert_eq!(
+        g[0].headers.get("x-goog-api-key").map(String::as_str),
+        Some(KEY)
+    );
     assert!(!g[0].path.contains(KEY), "the key never goes in the URL");
 
     // Embeddings.
-    let texts: Vec<String> = ["derivata", "integrale", "Rolle"].map(String::from).to_vec();
+    let texts: Vec<String> = ["derivata", "integrale", "Rolle"]
+        .map(String::from)
+        .to_vec();
     let (v, usage) = client(CloudProvider::Gemini)
         .embed("text-embedding-004", &texts, Duration::from_secs(10))
         .unwrap();
     assert_eq!(v.len(), 3);
     assert!(usage.is_empty());
-    let req = t.fake(CloudProvider::Gemini).matching("batchEmbedContents").pop().unwrap();
-    assert_eq!(req.path, "/v1beta/models/text-embedding-004:batchEmbedContents");
-    assert_eq!(req.json()["requests"][0]["model"], "models/text-embedding-004");
+    let req = t
+        .fake(CloudProvider::Gemini)
+        .matching("batchEmbedContents")
+        .pop()
+        .unwrap();
+    assert_eq!(
+        req.path,
+        "/v1beta/models/text-embedding-004:batchEmbedContents"
+    );
+    assert_eq!(
+        req.json()["requests"][0]["model"],
+        "models/text-embedding-004"
+    );
     let ten: Vec<String> = (0..10).map(|i| format!("testo {i}")).collect();
-    let (v, usage) = client(CloudProvider::Qwen).embed(EMBED, &ten, Duration::from_secs(10)).unwrap();
+    let (v, usage) = client(CloudProvider::Qwen)
+        .embed(EMBED, &ten, Duration::from_secs(10))
+        .unwrap();
     assert_eq!(v.len(), 10);
     assert_eq!(usage.input_tokens, Some(EMBED_USAGE));
     for x in &v {
@@ -747,14 +887,22 @@ fn model_lists_and_embeddings_per_provider() {
         assert!((norm - 1.0).abs() < 1e-4);
     }
     let eleven: Vec<String> = (0..11).map(|i| format!("testo {i}")).collect();
-    assert!(client(CloudProvider::Qwen).embed(EMBED, &eleven, Duration::from_secs(10)).is_err());
-    let err = client(CloudProvider::Anthropic).embed("x", &texts, Duration::from_secs(10)).unwrap_err();
+    assert!(client(CloudProvider::Qwen)
+        .embed(EMBED, &eleven, Duration::from_secs(10))
+        .is_err());
+    let err = client(CloudProvider::Anthropic)
+        .embed("x", &texts, Duration::from_secs(10))
+        .unwrap_err();
     assert_eq!(err.code(), "llm_unavailable");
 
     // 401 on listing: message by provider, no key in detail.
-    t.fake(CloudProvider::DeepSeek).set(|s| s.key = "other".into());
+    t.fake(CloudProvider::DeepSeek)
+        .set(|s| s.key = "other".into());
     let err = client(CloudProvider::DeepSeek).list_models().unwrap_err();
-    assert_eq!(err.to_string(), "Chiave API non valida o senza permessi per DeepSeek.");
+    assert_eq!(
+        err.to_string(),
+        "Chiave API non valida o senza permessi per DeepSeek."
+    );
     assert!(!err.detail().unwrap().contains(KEY));
 }
 
@@ -765,10 +913,15 @@ fn keys_never_reach_the_database_errors_or_events() {
     let t = T::new(CloudPolicy::CloudAllowed);
     t.import("analisi.md", ANALISI);
     t.settings(|s| s.embedding_model = Some(ModelRef::new(OPENAI, EMBED)));
-    t.store().set_cloud_embedding_consent(&t.project, true).unwrap();
+    t.store()
+        .set_cloud_embedding_consent(&t.project, true)
+        .unwrap();
     let embedder = t.start_embedder(fast());
     wait_until("cloud indexing", || {
-        let st = t.store().embedding_status(&t.project, &embedder.shared).unwrap();
+        let st = t
+            .store()
+            .embedding_status(&t.project, &embedder.shared)
+            .unwrap();
         st.embedded == st.total && st.total > 0
     });
     let conv = t.conversation();
@@ -788,12 +941,19 @@ fn keys_never_reach_the_database_errors_or_events() {
     let p = t.prepare(&conv, Q).unwrap().unwrap();
     let (r, events) = t.send(&conv, Q, Some(&p.token));
     seen.push_str(&format!("{r:?}{events:?}"));
-    let err = CloudClient::new(CloudProvider::OpenAi, KEY.into(), t.cloud.endpoints().clone())
-        .list_models()
-        .unwrap_err();
+    let err = CloudClient::new(
+        CloudProvider::OpenAi,
+        KEY.into(),
+        t.cloud.endpoints().clone(),
+    )
+    .list_models()
+    .unwrap_err();
     seen.push_str(&format!("{err:?} {err}"));
     seen.push_str(&format!("{:?}", t.cloud.env));
-    seen.push_str(&format!("{:?}", t.store().list_cloud_requests(1000).unwrap()));
+    seen.push_str(&format!(
+        "{:?}",
+        t.store().list_cloud_requests(1000).unwrap()
+    ));
     seen.push_str(&format!("{:?}", t.store().list_messages(&conv).unwrap()));
     seen.push_str(&format!("{:?}", embedder.shared.snapshot()));
     drop(embedder);
@@ -812,7 +972,11 @@ fn keys_never_reach_the_database_errors_or_events() {
                 "key found in {}",
                 path.display()
             );
-            assert!(!bytes.windows(8).any(|w| w == b"SENTINEL"), "{}", path.display());
+            assert!(
+                !bytes.windows(8).any(|w| w == b"SENTINEL"),
+                "{}",
+                path.display()
+            );
             checked += 1;
         }
     }
@@ -825,14 +989,19 @@ fn keys_never_reach_the_database_errors_or_events() {
 
 #[test]
 fn unavailable_keychain_is_reported_without_fallback() {
-    let t = T::build(CloudPolicy::CloudAllowed, None, Some(Arc::new(UnavailableKeys)));
+    let t = T::build(
+        CloudPolicy::CloudAllowed,
+        None,
+        Some(Arc::new(UnavailableKeys)),
+    );
     t.import("analisi.md", ANALISI);
     let conv = t.conversation();
     let err = t.prepare(&conv, Q).unwrap_err();
     assert_eq!(err.code(), "keyring_unavailable");
     assert!(err.to_string().contains("portachiavi"));
     assert!(!t.cloud.keys().status().available);
-    let err = CloudClient::from_keys(CloudProvider::OpenAi, t.cloud.keys(), t.cloud.endpoints()).unwrap_err();
+    let err = CloudClient::from_keys(CloudProvider::OpenAi, t.cloud.keys(), t.cloud.endpoints())
+        .unwrap_err();
     assert_eq!(err.code(), "keyring_unavailable");
     // Automatic routing treats the providers as keyless.
     t.settings(|s| {
@@ -853,7 +1022,9 @@ fn missing_key_is_reported_before_any_request() {
     let conv = t.conversation();
     let err = t.prepare(&conv, Q).unwrap_err();
     assert_eq!(err.code(), "llm_unavailable");
-    assert!(err.to_string().starts_with("Nessuna chiave API salvata per OpenAI"));
+    assert!(err
+        .to_string()
+        .starts_with("Nessuna chiave API salvata per OpenAI"));
     keys.set(CloudProvider::OpenAi, KEY).unwrap();
     let p = t.prepare(&conv, Q).unwrap().unwrap();
     // The key removed between preview and confirmation: clear error, nothing sent.
@@ -881,7 +1052,13 @@ fn cloud_embedder_indexes_only_consenting_projects_and_stops_on_revoke() {
     let est = t.store().estimate_cloud_embedding(&a).unwrap().unwrap();
     let (total, _) = t.store().embedding_counts(&a, None).unwrap();
     assert_eq!(est.chunks, total);
-    assert_eq!(est.chars, ANALISI.split("\n\n").map(|p| p.chars().count() as u64).sum::<u64>());
+    assert_eq!(
+        est.chars,
+        ANALISI
+            .split("\n\n")
+            .map(|p| p.chars().count() as u64)
+            .sum::<u64>()
+    );
     assert_eq!(est.est_tokens, est.chars.div_ceil(4));
     assert!(est.est_cost.is_none());
     t.store()
@@ -898,7 +1075,11 @@ fn cloud_embedder_indexes_only_consenting_projects_and_stops_on_revoke() {
 
     let embedder = t.start_embedder(fast());
     std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(t.fake(CloudProvider::OpenAi).count(), 0, "nothing without consent");
+    assert_eq!(
+        t.fake(CloudProvider::OpenAi).count(),
+        0,
+        "nothing without consent"
+    );
     t.store().set_cloud_embedding_consent(&a, true).unwrap();
     embedder.wake();
     wait_until("project A indexed", || {
@@ -913,7 +1094,10 @@ fn cloud_embedder_indexes_only_consenting_projects_and_stops_on_revoke() {
         .map(|r| r.body.clone())
         .collect();
     assert!(sent.contains("derivata"));
-    assert!(!sent.contains("Bastiglia") && !sent.contains("periodica"), "only project A");
+    assert!(
+        !sent.contains("Bastiglia") && !sent.contains("periodica"),
+        "only project A"
+    );
     for p in [&b, &c] {
         let st = t.store().embedding_status(p, &embedder.shared).unwrap();
         assert_eq!(st.state, EmbeddingState::NeedsConsent);
@@ -925,7 +1109,14 @@ fn cloud_embedder_indexes_only_consenting_projects_and_stops_on_revoke() {
         && e.project_id.as_deref() == Some(a.as_str())
         && e.ok
         && e.usage.unwrap().input_tokens == Some(EMBED_USAGE)));
-    assert_eq!(t.store().estimate_cloud_embedding(&a).unwrap().unwrap().chunks, 0);
+    assert_eq!(
+        t.store()
+            .estimate_cloud_embedding(&a)
+            .unwrap()
+            .unwrap()
+            .chunks,
+        0
+    );
 
     // The question's embedding goes to the cloud for this project, and the preview says so.
     let conv = t.conversation();
@@ -937,7 +1128,10 @@ fn cloud_embedder_indexes_only_consenting_projects_and_stops_on_revoke() {
     assert_eq!(r.embedding_provider, Some(OPENAI));
     assert_eq!(r.embedding_model.as_deref(), Some(EMBED));
     let log = t.store().list_cloud_requests(100).unwrap();
-    let q = log.iter().find(|e| e.purpose == CloudPurpose::QueryEmbedding).unwrap();
+    let q = log
+        .iter()
+        .find(|e| e.purpose == CloudPurpose::QueryEmbedding)
+        .unwrap();
     assert_eq!(q.chars_sent, Q.chars().count() as u64);
     assert_eq!(q.conversation_id.as_deref(), Some(conv.as_str()));
 
@@ -945,20 +1139,33 @@ fn cloud_embedder_indexes_only_consenting_projects_and_stops_on_revoke() {
     t.store().set_cloud_embedding_consent(&a, false).unwrap();
     embedder.wake();
     let before = t.fake(CloudProvider::OpenAi).matching("/embeddings").len();
-    t.import_into(&a, "rolle.md", "Il teorema di Rolle riguarda le funzioni derivabili.".as_bytes());
+    t.import_into(
+        &a,
+        "rolle.md",
+        "Il teorema di Rolle riguarda le funzioni derivabili.".as_bytes(),
+    );
     embedder.wake();
     std::thread::sleep(Duration::from_millis(400));
-    assert_eq!(t.fake(CloudProvider::OpenAi).matching("/embeddings").len(), before);
+    assert_eq!(
+        t.fake(CloudProvider::OpenAi).matching("/embeddings").len(),
+        before
+    );
     let st = t.store().embedding_status(&a, &embedder.shared).unwrap();
     assert_eq!(st.state, EmbeddingState::NeedsConsent);
     let p = t.prepare(&conv, Q).unwrap().unwrap();
     assert_eq!(p.query_embedded_by, None);
-    assert_eq!(t.fake(CloudProvider::OpenAi).matching("/embeddings").len(), before);
+    assert_eq!(
+        t.fake(CloudProvider::OpenAi).matching("/embeddings").len(),
+        before
+    );
     t.cloud.discard(&p.token);
 
     // Making the project local-only also revokes the consent.
     t.store().set_cloud_embedding_consent(&a, true).unwrap();
-    let project = t.store().set_project_cloud_policy(&a, CloudPolicy::LocalOnly).unwrap();
+    let project = t
+        .store()
+        .set_project_cloud_policy(&a, CloudPolicy::LocalOnly)
+        .unwrap();
     assert!(!project.cloud_embedding_consent);
     drop(embedder);
 
@@ -971,15 +1178,28 @@ fn cloud_embedder_indexes_only_consenting_projects_and_stops_on_revoke() {
 fn cloud_embedder_backs_off_on_rate_limit() {
     let t = T::new(CloudPolicy::CloudAllowed);
     t.import("analisi.md", ANALISI);
-    t.settings(|s| s.embedding_model = Some(ModelRef::new(ProviderId::Cloud(CloudProvider::Gemini), "text-embedding-004")));
-    t.store().set_cloud_embedding_consent(&t.project, true).unwrap();
+    t.settings(|s| {
+        s.embedding_model = Some(ModelRef::new(
+            ProviderId::Cloud(CloudProvider::Gemini),
+            "text-embedding-004",
+        ))
+    });
+    t.store()
+        .set_cloud_embedding_consent(&t.project, true)
+        .unwrap();
     let gemini = t.fake(CloudProvider::Gemini);
     gemini.set(|s| s.embed_mode = Mode::Status(429));
     let embedder = t.start_embedder(fast());
     wait_until("rate limit reported", || {
-        let st = t.store().embedding_status(&t.project, &embedder.shared).unwrap();
+        let st = t
+            .store()
+            .embedding_status(&t.project, &embedder.shared)
+            .unwrap();
         st.state == EmbeddingState::Unreachable
-            && st.message.as_deref().is_some_and(|m| m.contains("Limite di richieste"))
+            && st
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("Limite di richieste"))
     });
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(gemini.count(), 1, "backs off instead of retrying at once");
@@ -993,7 +1213,10 @@ fn cloud_embedder_backs_off_on_rate_limit() {
     gemini.set(|s| s.embed_mode = Mode::Normal);
     embedder.wake();
     wait_until("indexed after recovery", || {
-        let st = t.store().embedding_status(&t.project, &embedder.shared).unwrap();
+        let st = t
+            .store()
+            .embedding_status(&t.project, &embedder.shared)
+            .unwrap();
         st.embedded == st.total
     });
 }
@@ -1008,7 +1231,10 @@ fn migration_3_to_4_keeps_settings_embeddings_and_messages() {
     env.run_jobs();
     let conv = env.store.create_conversation(&p).unwrap().id;
     let chunks: i64 = env.count("SELECT COUNT(*) FROM chunks");
-    drop(std::mem::replace(&mut env.store, Store::open_in_memory().unwrap()));
+    drop(std::mem::replace(
+        &mut env.store,
+        Store::open_in_memory().unwrap(),
+    ));
     // Shape the database as v0.3 left it: plain-string model settings, embeddings keyed by
     // model id, messages without the v0.4 columns, no v0.4 tables.
     {
@@ -1042,13 +1268,21 @@ fn migration_3_to_4_keeps_settings_embeddings_and_messages() {
     let store = env.reopen();
     assert_eq!(store.schema_version().unwrap(), 4);
     let s = store.llm_settings().unwrap();
-    assert_eq!(s.chat_model, Some(ModelRef::lmstudio("qwen2.5-7b-instruct")));
-    assert_eq!(s.embedding_model, Some(ModelRef::lmstudio("nomic-embed-text")));
+    assert_eq!(
+        s.chat_model,
+        Some(ModelRef::lmstudio("qwen2.5-7b-instruct"))
+    );
+    assert_eq!(
+        s.embedding_model,
+        Some(ModelRef::lmstudio("nomic-embed-text"))
+    );
     assert_eq!(s.routing, Routing::Manual);
     assert!(s.auto_models.is_empty());
     assert_eq!(s.base_url, "http://127.0.0.1:1234");
     assert_eq!(
-        env.count("SELECT COUNT(*) FROM chunk_embeddings WHERE model = 'lmstudio:nomic-embed-text'"),
+        env.count(
+            "SELECT COUNT(*) FROM chunk_embeddings WHERE model = 'lmstudio:nomic-embed-text'"
+        ),
         chunks
     );
     let shared = EmbedderShared::new();
@@ -1063,7 +1297,10 @@ fn migration_3_to_4_keeps_settings_embeddings_and_messages() {
     assert_eq!(msgs[1].content, "Risposta [1].");
     assert_eq!(msgs[1].provider, Some(ProviderId::LmStudio));
     assert_eq!(msgs[1].model.as_deref(), Some("qwen2.5-7b-instruct"));
-    assert_eq!(msgs[1].retrieval.as_ref().unwrap().embedding_provider, Some(ProviderId::LmStudio));
+    assert_eq!(
+        msgs[1].retrieval.as_ref().unwrap().embedding_provider,
+        Some(ProviderId::LmStudio)
+    );
     assert_eq!(msgs[0].provider, None);
     assert!(msgs[1].usage.is_none() && msgs[1].cost.is_none() && msgs[1].route_reason.is_none());
     assert!(store.list_prices().unwrap().is_empty());
@@ -1091,4 +1328,41 @@ fn deleting_a_project_keeps_the_log_without_references() {
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].project_id, None);
     assert_eq!(log[0].conversation_id, None);
+}
+
+#[test]
+fn listing_models_sends_only_the_key_on_request_and_is_logged() {
+    let keys = Arc::new(MemoryKeys::with(&[(CloudProvider::Gemini, KEY)]));
+    let t = T::build(CloudPolicy::LocalOnly, None, Some(keys));
+    // No key: nothing sent, nothing logged.
+    let m = list_provider_models(&t.db, &t.cloud, CloudProvider::OpenAi).unwrap();
+    assert!(!m.reachable);
+    assert!(m
+        .message
+        .unwrap()
+        .starts_with("Nessuna chiave API salvata per OpenAI"));
+    assert_eq!(t.total_cloud_requests(), 0);
+    assert!(t.store().list_cloud_requests(10).unwrap().is_empty());
+    let m = list_provider_models(&t.db, &t.cloud, CloudProvider::Gemini).unwrap();
+    assert!(m.reachable);
+    assert_eq!(m.models.len(), 3);
+    for r in t.fake(CloudProvider::Gemini).requests() {
+        assert_eq!(r.method, "GET");
+        assert!(r.body.is_empty(), "only the key (in a header) is sent");
+    }
+    t.fake(CloudProvider::Gemini)
+        .set(|s| s.mode = Mode::Status(503));
+    let m = list_provider_models(&t.db, &t.cloud, CloudProvider::Gemini).unwrap();
+    assert!(!m.reachable);
+    assert_eq!(
+        m.message.as_deref(),
+        Some("Google Gemini non raggiungibile.")
+    );
+    assert!(!m.detail.unwrap().contains(KEY));
+    let log = t.store().list_cloud_requests(10).unwrap();
+    assert_eq!(log.len(), 2);
+    assert!(log.iter().all(|e| e.purpose == CloudPurpose::ListModels
+        && e.chars_sent == 0
+        && e.project_id.is_none()));
+    assert!(!log[0].ok && log[1].ok);
 }

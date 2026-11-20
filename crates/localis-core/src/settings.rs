@@ -149,7 +149,9 @@ pub fn validate_base_url(raw: &str) -> Result<String> {
 /// Validates a model id (trimmed, not empty, no control characters).
 pub(crate) fn validate_model_id(raw: &str, field: &'static str) -> Result<String> {
     let model = raw.trim();
-    if model.is_empty() || model.chars().count() > MODEL_ID_MAX || model.chars().any(char::is_control)
+    if model.is_empty()
+        || model.chars().count() > MODEL_ID_MAX
+        || model.chars().any(char::is_control)
     {
         return Err(CoreError::validation(field, MODEL_INVALID));
     }
@@ -282,7 +284,10 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (key, value) in [
             (KEY_BASE_URL, Some(settings.base_url.clone())),
-            (KEY_CHAT_MODEL, settings.chat_model.as_ref().map(ref_to_json)),
+            (
+                KEY_CHAT_MODEL,
+                settings.chat_model.as_ref().map(ref_to_json),
+            ),
             (
                 KEY_EMBEDDING_MODEL,
                 settings.embedding_model.as_ref().map(ref_to_json),

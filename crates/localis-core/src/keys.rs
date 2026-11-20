@@ -15,8 +15,7 @@ pub const KEYRING_SERVICE: &str = "app.localis.desktop";
 /// Longest accepted API key.
 pub const API_KEY_MAX: usize = 1024;
 
-const KEY_INVALID: &str =
-    "La chiave API non è valida: incollala senza spazi o caratteri speciali.";
+const KEY_INVALID: &str = "La chiave API non è valida: incollala senza spazi o caratteri speciali.";
 const KEY_EMPTY: &str = "Inserisci la chiave API.";
 const KEYRING_MESSAGE: &str = "Il portachiavi di sistema non è disponibile: Localis salva le chiavi API solo lì, quindi i provider cloud non si possono usare finché non è accessibile.";
 

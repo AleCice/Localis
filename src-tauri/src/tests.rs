@@ -718,9 +718,8 @@ mod chat {
         no_reason.retrieval.as_mut().unwrap().scope_reason = None;
         no_reason.retrieval.as_mut().unwrap().embedding_model = None;
         no_reason.retrieval.as_mut().unwrap().embedding_provider = None;
-        assert!(to_json(no_reason).contains(
-            r#""scopeReason":null,"embeddingModel":null,"embeddingProvider":null"#
-        ));
+        assert!(to_json(no_reason)
+            .contains(r#""scopeReason":null,"embeddingModel":null,"embeddingProvider":null"#));
         let cloud = ChatMessageDto {
             model: Some("gpt-x".into()),
             provider: Some("openai"),
@@ -1018,7 +1017,13 @@ mod chat {
                 EmbeddingState::NeedsConsent
             ]
             .map(EmbeddingState::as_str),
-            ["disabled", "idle", "running", "unreachable", "needs_consent"]
+            [
+                "disabled",
+                "idle",
+                "running",
+                "unreachable",
+                "needs_consent"
+            ]
         );
     }
 
@@ -1113,5 +1118,295 @@ mod chat {
             .with_store(|s| Ok(s.list_messages(&conversation)?))
             .unwrap();
         assert_eq!(listed.len(), 2);
+    }
+}
+
+mod cloud {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use localis_core::{
+        CloudPolicy, CloudPreview, CloudProvider, CloudPurpose, CloudRequest, CloudRuntime,
+        CoreError, Endpoints, KeyringStatus, ModelPrice, ModelRef, Money, NewProject,
+        PreviewSource, ProviderId, RouteDecision, SecretStore, Store, UnitKind, Usage, Via,
+    };
+
+    use super::to_json;
+    use crate::commands::{
+        AppState, CloudEmbeddingEstimateDto, CloudPreviewDto, CloudRequestDto, KeyringStatusDto,
+        ModelPriceDto, ProjectDto, ProviderInfoDto, ProviderModelsDto,
+    };
+    use crate::error::{AppError, ErrorCode};
+
+    #[derive(Default)]
+    struct MemoryKeys(Mutex<HashMap<CloudProvider, String>>);
+
+    impl SecretStore for MemoryKeys {
+        fn status(&self) -> KeyringStatus {
+            KeyringStatus {
+                available: true,
+                message: None,
+                detail: None,
+            }
+        }
+        fn get(&self, p: CloudProvider) -> localis_core::Result<Option<String>> {
+            Ok(self.0.lock().unwrap().get(&p).cloned())
+        }
+        fn set(&self, p: CloudProvider, key: &str) -> localis_core::Result<()> {
+            self.0.lock().unwrap().insert(p, key.to_owned());
+            Ok(())
+        }
+        fn delete(&self, p: CloudProvider) -> localis_core::Result<()> {
+            self.0.lock().unwrap().remove(&p);
+            Ok(())
+        }
+    }
+
+    const OPENAI: ProviderId = ProviderId::Cloud(CloudProvider::OpenAi);
+
+    #[test]
+    fn new_error_codes_json() {
+        let consent: AppError = CoreError::ConsentRequired {
+            message: "Serve la tua conferma.".into(),
+        }
+        .into();
+        assert_eq!(
+            to_json(consent),
+            r#"{"code":"consent_required","message":"Serve la tua conferma."}"#
+        );
+        let keyring: AppError = localis_core::keyring_unavailable("no secret service").into();
+        assert_eq!(keyring.code, ErrorCode::KeyringUnavailable);
+        assert!(to_json(keyring).starts_with(r#"{"code":"keyring_unavailable","message":"Il portachiavi di sistema non è disponibile"#));
+        // A validation error on the key never echoes it.
+        let err: AppError = localis_core::validate_api_key("sk secret with spaces")
+            .unwrap_err()
+            .into();
+        assert_eq!(err.field.as_deref(), Some("key"));
+        assert!(!to_json(err).contains("secret"));
+    }
+
+    #[test]
+    fn provider_keyring_and_models_json() {
+        assert_eq!(
+            to_json(ProviderInfoDto::new(CloudProvider::Qwen, true)),
+            r#"{"id":"qwen","name":"Qwen (Alibaba Cloud)","host":"dashscope-intl.aliyuncs.com","hasKey":true,"supportsChat":true,"supportsEmbeddings":true}"#
+        );
+        assert_eq!(
+            to_json(ProviderInfoDto::new(CloudProvider::Anthropic, false)),
+            r#"{"id":"anthropic","name":"Anthropic","host":"api.anthropic.com","hasKey":false,"supportsChat":true,"supportsEmbeddings":false}"#
+        );
+        let names: Vec<&str> = CloudProvider::ALL.iter().map(|p| p.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "OpenAI",
+                "Anthropic",
+                "Google Gemini",
+                "DeepSeek",
+                "Qwen (Alibaba Cloud)"
+            ]
+        );
+        assert_eq!(
+            to_json(KeyringStatusDto {
+                available: false,
+                message: Some("m".into()),
+                detail: None
+            }),
+            r#"{"available":false,"message":"m","detail":null}"#
+        );
+        assert_eq!(
+            to_json(ProviderModelsDto {
+                provider: "gemini",
+                reachable: true,
+                message: None,
+                detail: None,
+                models: vec![crate::commands::ModelInfoDto {
+                    id: "gemini-x".into(),
+                    kind: "llm",
+                    state: None
+                }],
+            }),
+            r#"{"provider":"gemini","reachable":true,"message":null,"detail":null,"models":[{"id":"gemini-x","kind":"llm","state":null}]}"#
+        );
+    }
+
+    #[test]
+    fn price_json_round_trip_and_validation() {
+        let json = r#"{"provider":"openai","model":"gpt-x","inputPerMTok":2.5,"outputPerMTok":10.0,"currency":"USD"}"#;
+        let dto: ModelPriceDto = serde_json::from_str(json).unwrap();
+        let price = ModelPrice::try_from(dto.clone()).unwrap();
+        assert_eq!(price.input_per_mtok, 2.5);
+        assert_eq!(
+            to_json(ModelPriceDto::from(price)),
+            r#"{"provider":"openai","model":"gpt-x","inputPerMTok":2.5,"outputPerMTok":10.0,"currency":"USD"}"#
+        );
+        let lm: ModelPriceDto = serde_json::from_str(
+            r#"{"provider":"lmstudio","model":"x","inputPerMTok":1,"outputPerMTok":1,"currency":"USD"}"#,
+        )
+        .unwrap();
+        let err = ModelPrice::try_from(lm).unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("provider"));
+    }
+
+    #[test]
+    fn preview_estimate_and_log_json() {
+        let preview = CloudPreview {
+            token: "t".into(),
+            route: RouteDecision {
+                model: ModelRef::new(OPENAI, "gpt-x"),
+                cloud: true,
+                reason: "Scelto manualmente nelle impostazioni.".into(),
+            },
+            provider_name: "OpenAI".into(),
+            host: "api.openai.com".into(),
+            question: "Domanda?".into(),
+            sources: vec![PreviewSource {
+                n: 1,
+                title: "a.pdf".into(),
+                unit: 3,
+                unit_kind: UnitKind::Page,
+                chars: 120,
+                via: Via::Both,
+            }],
+            history_pairs: 1,
+            history_chars: 40,
+            total_chars: 2000,
+            est_input_tokens: 500,
+            max_output_tokens: 2048,
+            est_cost: Some((
+                Money {
+                    amount: 0.001,
+                    currency: "USD".into(),
+                },
+                Money {
+                    amount: 0.021,
+                    currency: "USD".into(),
+                },
+            )),
+            query_embedded_by: Some(ModelRef::new(OPENAI, "emb")),
+            expires_at: "2026-01-01T00:10:00.000Z".into(),
+        };
+        assert_eq!(
+            to_json(CloudPreviewDto::from(preview.clone())),
+            concat!(
+                r#"{"token":"t","route":{"model":{"provider":"openai","model":"gpt-x"},"cloud":true,"#,
+                r#""reason":"Scelto manualmente nelle impostazioni."},"providerName":"OpenAI","#,
+                r#""host":"api.openai.com","question":"Domanda?","sources":[{"n":1,"title":"a.pdf","#,
+                r#""unit":3,"unitKind":"page","chars":120,"via":"both"}],"historyPairs":1,"#,
+                r#""historyChars":40,"totalChars":2000,"estInputTokens":500,"maxOutputTokens":2048,"#,
+                r#""estCost":{"min":{"amount":0.001,"currency":"USD"},"max":{"amount":0.021,"currency":"USD"}},"#,
+                r#""queryEmbeddedBy":{"provider":"openai","model":"emb"},"expiresAt":"2026-01-01T00:10:00.000Z"}"#
+            )
+        );
+        let no_cost = CloudPreview {
+            est_cost: None,
+            query_embedded_by: None,
+            ..preview
+        };
+        assert!(to_json(CloudPreviewDto::from(no_cost))
+            .contains(r#""estCost":null,"queryEmbeddedBy":null"#));
+        assert_eq!(
+            to_json(CloudEmbeddingEstimateDto {
+                provider: "gemini",
+                model: "text-embedding-004".into(),
+                chunks: 3,
+                chars: 900,
+                est_tokens: 225,
+                est_cost: None,
+            }),
+            r#"{"provider":"gemini","model":"text-embedding-004","chunks":3,"chars":900,"estTokens":225,"estCost":null}"#
+        );
+        let log = CloudRequest {
+            id: 7,
+            created_at: "c".into(),
+            provider: CloudProvider::DeepSeek,
+            model: Some("chat".into()),
+            purpose: CloudPurpose::Chat,
+            project_id: Some("p".into()),
+            conversation_id: None,
+            chars_sent: 1234,
+            usage: Some(Usage {
+                input_tokens: Some(300),
+                output_tokens: Some(50),
+            }),
+            cost: None,
+            ok: false,
+            error: Some("DeepSeek non raggiungibile.".into()),
+        };
+        assert_eq!(
+            to_json(CloudRequestDto::from(log)),
+            r#"{"id":7,"createdAt":"c","provider":"deepseek","model":"chat","purpose":"chat","projectId":"p","conversationId":null,"charsSent":1234,"usage":{"inputTokens":300,"outputTokens":50},"cost":null,"ok":false,"error":"DeepSeek non raggiungibile."}"#
+        );
+        assert_eq!(
+            [
+                CloudPurpose::Chat,
+                CloudPurpose::QueryEmbedding,
+                CloudPurpose::IndexEmbedding,
+                CloudPurpose::ListModels
+            ]
+            .map(CloudPurpose::as_str),
+            ["chat", "query_embedding", "index_embedding", "list_models"]
+        );
+    }
+
+    /// Project DTOs carry the policy; a cloud send through AppState without a token is
+    /// refused with `consent_required` and nothing is stored.
+    #[test]
+    fn project_policy_and_consent_through_app_state() {
+        let keys = Arc::new(MemoryKeys::default());
+        keys.set(CloudProvider::OpenAi, "sk-test").unwrap();
+        let state = AppState::new(|| Ok(Store::open_in_memory().unwrap()))
+            .with_cloud(CloudRuntime::new(keys, Endpoints::default()));
+        let (project, conversation) = state
+            .with_store(|s| {
+                let p = s.create_project(NewProject {
+                    name: "P".into(),
+                    description: None,
+                })?;
+                let mut settings = s.llm_settings()?;
+                settings.chat_model = Some(ModelRef::new(OPENAI, "gpt-x"));
+                s.set_llm_settings(&settings)?;
+                Ok((p.id.clone(), s.create_conversation(&p.id)?.id))
+            })
+            .unwrap();
+        let dto: ProjectDto = state
+            .with_store(|s| Ok(s.set_project_cloud_policy(&project, CloudPolicy::CloudAllowed)?))
+            .unwrap()
+            .into();
+        assert_eq!(dto.cloud_policy, "cloud_allowed");
+        assert!(to_json(dto)
+            .ends_with(r#""cloudPolicy":"cloud_allowed","cloudEmbeddingConsent":false}"#));
+        let input = localis_core::SendInput {
+            conversation_id: conversation.clone(),
+            text: "Domanda qualsiasi sul testo".into(),
+            document_ids: vec![],
+            confirm_token: Some("forged".into()),
+        };
+        let err: AppError =
+            localis_core::send_message(&state, &state.chat, &state.cloud, input, &mut |_| {})
+                .unwrap_err()
+                .into();
+        assert_eq!(err.code, ErrorCode::ConsentRequired);
+        let stored = state
+            .with_store(|s| Ok(s.list_messages(&conversation)?))
+            .unwrap();
+        assert!(stored.is_empty());
+        // Local-only project: even preparing is refused.
+        state
+            .with_store(|s| Ok(s.set_project_cloud_policy(&project, CloudPolicy::LocalOnly)?))
+            .unwrap();
+        let err: AppError = localis_core::prepare_cloud_send(
+            &state,
+            &state.cloud,
+            &localis_core::SendInput {
+                conversation_id: conversation,
+                text: "Domanda".into(),
+                document_ids: vec![],
+                confirm_token: None,
+            },
+        )
+        .unwrap_err()
+        .into();
+        assert_eq!(err.code, ErrorCode::ConsentRequired);
     }
 }

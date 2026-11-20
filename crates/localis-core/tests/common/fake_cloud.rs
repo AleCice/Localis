@@ -130,7 +130,11 @@ fn authorized(provider: CloudProvider, headers: &HashMap<String, String>, key: &
     }
 }
 
-fn handle(provider: CloudProvider, stream: TcpStream, state: &Mutex<CloudState>) -> std::io::Result<()> {
+fn handle(
+    provider: CloudProvider,
+    stream: TcpStream,
+    state: &Mutex<CloudState>,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
@@ -179,7 +183,11 @@ fn handle(provider: CloudProvider, stream: TcpStream, state: &Mutex<CloudState>)
             .or(headers.get("x-goog-api-key"))
             .cloned()
             .unwrap_or_default();
-        return respond(&mut out, 401, &json!({ "error": format!("Incorrect API key provided: {sent}") }));
+        return respond(
+            &mut out,
+            401,
+            &json!({ "error": format!("Incorrect API key provided: {sent}") }),
+        );
     }
     if let Mode::Status(status) = mode {
         return respond(
@@ -235,7 +243,9 @@ fn handle(provider: CloudProvider, stream: TcpStream, state: &Mutex<CloudState>)
                 .unwrap_or_default()
                 .iter()
                 .map(|r| {
-                    let text = r["content"]["parts"][0]["text"].as_str().unwrap_or_default();
+                    let text = r["content"]["parts"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default();
                     json!({ "values": token_vector(text) })
                 })
                 .collect();
@@ -307,7 +317,13 @@ fn stream_openai(out: &mut TcpStream, slow: bool) -> std::io::Result<()> {
     start_stream(out)?;
     let (parts, delay) = pieces(slow);
     for p in parts {
-        chunk(out, &format!("data: {}\n\n", json!({ "choices": [{ "index": 0, "delta": { "content": p } }] })))?;
+        chunk(
+            out,
+            &format!(
+                "data: {}\n\n",
+                json!({ "choices": [{ "index": 0, "delta": { "content": p } }] })
+            ),
+        )?;
         std::thread::sleep(delay);
     }
     chunk(
@@ -355,7 +371,8 @@ fn stream_gemini(out: &mut TcpStream, slow: bool) -> std::io::Result<()> {
     let (parts, delay) = pieces(slow);
     let n = parts.len();
     for (i, p) in parts.into_iter().enumerate() {
-        let mut ev = json!({ "candidates": [{ "content": { "role": "model", "parts": [{ "text": p }] } }] });
+        let mut ev =
+            json!({ "candidates": [{ "content": { "role": "model", "parts": [{ "text": p }] } }] });
         if i + 1 == n {
             ev["usageMetadata"] = json!({ "promptTokenCount": GEMINI_USAGE.0, "candidatesTokenCount": GEMINI_USAGE.1 });
         }

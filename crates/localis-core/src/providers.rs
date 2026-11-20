@@ -426,10 +426,10 @@ mod tests {
         }
     }
 
+    // The override exists only in builds with debug assertions (compiled out otherwise).
+    #[cfg(debug_assertions)]
     #[test]
     fn test_override_is_loopback_http_only() {
-        // Tests run with debug assertions: the override exists here, and only here.
-        assert!(cfg!(debug_assertions));
         for bad in [
             "https://127.0.0.1:4010",
             "http://example.com:4010",

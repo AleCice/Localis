@@ -33,12 +33,13 @@ pub use chat::{
     HISTORY_PAIRS, INTERRUPTED_MESSAGE, NO_EVIDENCE_MESSAGE, NO_TEXT_NOTE, QUESTION_MAX_CHARS,
     SYSTEM_PROMPT, WHICH_DOCUMENT,
 };
+pub use chunks::{chunk_text, ChunkSpan, CHUNK_MAX_CHARS};
 pub use cloud_log::{CloudLogEntry, CloudPurpose, CloudRequest, CLOUD_LOG_MAX};
 pub use cloud_send::{
-    CloudEnv, CloudPreview, CloudRuntime, PreviewSource, CLOUD_TOKEN_TTL, CONFIRMATION_REQUIRED,
-    PROJECT_LOCAL_ONLY, ROUTE_CHANGED, TOKEN_INVALID, TOKEN_MISMATCH,
+    list_provider_models, CloudEnv, CloudPreview, CloudRuntime, PreviewSource, ProviderModels,
+    CLOUD_TOKEN_TTL, CONFIRMATION_REQUIRED, PROJECT_LOCAL_ONLY, ROUTE_CHANGED, TOKEN_INVALID,
+    TOKEN_MISMATCH,
 };
-pub use chunks::{chunk_text, ChunkSpan, CHUNK_MAX_CHARS};
 pub use embedder::{
     next_backoff, run_embedder, CloudEmbeddingEstimate, EmbedderConfig, EmbedderShared,
     EmbedderSnapshot, EmbeddingState, EmbeddingStatus,
@@ -48,13 +49,13 @@ pub use formats::{detect_format, DetectedFormat, DocumentKind};
 pub use jobs::{
     run_worker, ClaimedJob, Job, JobState, WorkerConfig, JOBS_LIST_MAX, JOB_KIND_EXTRACT_TEXT,
 };
-pub use library::{
-    check_size, DocumentVersion, Folder, ImportFile, ImportOutcome, LibraryDocument, NewFolder,
-    TextStatus, TextUnit, FILE_NAME_MAX, IMPORT_MAX_BYTES,
-};
 pub use keys::{
     keyring_unavailable, validate_api_key, KeyringStatus, Keys, SecretStore, SystemKeyring,
     API_KEY_MAX, KEYRING_SERVICE,
+};
+pub use library::{
+    check_size, DocumentVersion, Folder, ImportFile, ImportOutcome, LibraryDocument, NewFolder,
+    TextStatus, TextUnit, FILE_NAME_MAX, IMPORT_MAX_BYTES,
 };
 pub use llm::{
     LlmClient, LlmStatus, ModelInfo, ModelKind, PromptMessage, SseParser, StreamEnd,

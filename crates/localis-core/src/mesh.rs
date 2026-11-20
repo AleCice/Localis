@@ -43,8 +43,12 @@ pub trait ModelClient: Send + Sync {
         on_delta: &mut dyn FnMut(&str),
     ) -> (StreamEnd, Usage);
     /// Embeds at most [`ModelClient::embed_batch_max`] texts; vectors are L2-normalized.
-    fn embed(&self, model: &str, texts: &[String], total: Duration)
-        -> Result<(Vec<Vec<f32>>, Usage)>;
+    fn embed(
+        &self,
+        model: &str,
+        texts: &[String],
+        total: Duration,
+    ) -> Result<(Vec<Vec<f32>>, Usage)>;
     fn embed_batch_max(&self) -> usize;
 }
 
@@ -73,7 +77,10 @@ impl ModelClient for LlmClient {
         texts: &[String],
         total: Duration,
     ) -> Result<(Vec<Vec<f32>>, Usage)> {
-        Ok((LlmClient::embed(self, model, texts, total)?, Usage::default()))
+        Ok((
+            LlmClient::embed(self, model, texts, total)?,
+            Usage::default(),
+        ))
     }
 
     fn embed_batch_max(&self) -> usize {
@@ -131,11 +138,7 @@ impl CloudClient {
     }
 
     fn agent(&self, total: Option<Duration>, per_read: Option<Duration>) -> ureq::Agent {
-        cloud_agent(
-            self.endpoints.is_overridden(self.provider),
-            total,
-            per_read,
-        )
+        cloud_agent(self.endpoints.is_overridden(self.provider), total, per_read)
     }
 
     fn auth_headers(&self) -> Vec<(&'static str, String)> {
@@ -166,7 +169,13 @@ impl CloudClient {
         )
     }
 
-    fn send(&self, method: &str, path: &str, body: Option<&Value>, total: Duration) -> Result<String> {
+    fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        total: Duration,
+    ) -> Result<String> {
         let url = self.endpoints.url(self.provider, path)?;
         let agent = self.agent(Some(total), None);
         let headers = self.auth_headers();
@@ -438,7 +447,12 @@ pub(crate) fn unreachable_error(provider: CloudProvider, detail: String) -> Core
 
 /// `llm_unavailable` for an HTTP error status. With 401/403 the body is not kept at all
 /// (some providers echo part of the key); otherwise it is kept with the key removed.
-pub(crate) fn status_error(provider: CloudProvider, status: u16, body: &str, key: &str) -> CoreError {
+pub(crate) fn status_error(
+    provider: CloudProvider,
+    status: u16,
+    body: &str,
+    key: &str,
+) -> CoreError {
     let name = provider.name();
     match status {
         401 | 403 => CoreError::llm(
@@ -569,7 +583,8 @@ impl ModelClient for CloudClient {
                     Some(&json!({ "requests": requests })),
                     total,
                 )?;
-                let vectors = parse_gemini_embeddings(&body, texts.len()).ok_or_else(|| failed(&body))?;
+                let vectors =
+                    parse_gemini_embeddings(&body, texts.len()).ok_or_else(|| failed(&body))?;
                 Ok((vectors, Usage::default()))
             }
             _ => {
@@ -740,15 +755,21 @@ mod tests {
 
     #[test]
     fn wire_formats_per_provider() {
-        let (path, b) = client(CloudProvider::OpenAi).chat_body("gpt", &prompt()).unwrap();
+        let (path, b) = client(CloudProvider::OpenAi)
+            .chat_body("gpt", &prompt())
+            .unwrap();
         assert_eq!(path, "/chat/completions");
         assert_eq!(b["messages"].as_array().unwrap().len(), 4);
         assert_eq!(b["stream_options"]["include_usage"], true);
         assert_eq!(b["max_completion_tokens"], 2048);
         assert_eq!(b["temperature"], 0.2);
-        let (_, b) = client(CloudProvider::DeepSeek).chat_body("ds", &prompt()).unwrap();
+        let (_, b) = client(CloudProvider::DeepSeek)
+            .chat_body("ds", &prompt())
+            .unwrap();
         assert_eq!(b["max_tokens"], 2048);
-        let (path, b) = client(CloudProvider::Anthropic).chat_body("c", &prompt()).unwrap();
+        let (path, b) = client(CloudProvider::Anthropic)
+            .chat_body("c", &prompt())
+            .unwrap();
         assert_eq!(path, "/messages");
         assert_eq!(b["system"], "S");
         assert_eq!(b["max_tokens"], 2048);
@@ -810,13 +831,18 @@ mod tests {
             [Chunk::Text("Ciao".into())]
         );
         assert_eq!(
-            parse_anthropic_event(r#"{"type":"message_delta","delta":{},"usage":{"output_tokens":15}}"#),
+            parse_anthropic_event(
+                r#"{"type":"message_delta","delta":{},"usage":{"output_tokens":15}}"#
+            ),
             [Chunk::Usage(Usage {
                 input_tokens: None,
                 output_tokens: Some(15)
             })]
         );
-        assert_eq!(parse_anthropic_event(r#"{"type":"message_stop"}"#), [Chunk::Done]);
+        assert_eq!(
+            parse_anthropic_event(r#"{"type":"message_stop"}"#),
+            [Chunk::Done]
+        );
         assert!(parse_anthropic_event(r#"{"type":"ping"}"#).is_empty());
         assert!(matches!(
             parse_anthropic_event(r#"{"type":"error","error":{"type":"overloaded_error"}}"#)[..],
@@ -868,7 +894,17 @@ mod tests {
             assert!(!detail.contains(key), "{status}: {detail}");
             assert!(!err.to_string().contains(key));
         }
-        assert!(is_rate_limited(&status_error(CloudProvider::Qwen, 429, "", key)));
-        assert!(!is_rate_limited(&status_error(CloudProvider::Qwen, 500, "", key)));
+        assert!(is_rate_limited(&status_error(
+            CloudProvider::Qwen,
+            429,
+            "",
+            key
+        )));
+        assert!(!is_rate_limited(&status_error(
+            CloudProvider::Qwen,
+            500,
+            "",
+            key
+        )));
     }
 }

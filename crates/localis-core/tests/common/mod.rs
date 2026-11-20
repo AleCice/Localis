@@ -8,6 +8,7 @@ use std::time::Duration;
 use localis_core::{ImportFile, ImportOutcome, LibraryDocument, NewProject, Project, Store};
 use tempfile::TempDir;
 
+pub mod fake_cloud;
 pub mod fake_lm;
 pub mod keys;
 

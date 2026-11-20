@@ -122,36 +122,28 @@ impl Store {
                 input_tokens: input.map(|t| t.max(0) as u64),
                 output_tokens: output.map(|t| t.max(0) as u64),
             };
-            Ok(CloudProvider::parse(&provider)
-                .zip(CloudPurpose::parse(&purpose))
-                .map(|(provider, purpose)| CloudRequest {
-                    id: 0,
-                    created_at: String::new(),
-                    provider,
-                    model: None,
-                    purpose,
-                    project_id: None,
-                    conversation_id: None,
-                    chars_sent: 0,
-                    usage: (!usage.is_empty()).then_some(usage),
-                    cost: amount.zip(currency).map(|(amount, currency)| Money { amount, currency }),
-                    ok: false,
-                    error: None,
-                })
-                .map(|base| -> rusqlite::Result<CloudRequest> {
-                    Ok(CloudRequest {
-                        id: r.get(0)?,
-                        created_at: r.get(1)?,
-                        model: r.get(3)?,
-                        project_id: r.get(5)?,
-                        conversation_id: r.get(6)?,
-                        chars_sent: r.get::<_, i64>(7)?.max(0) as u64,
-                        ok: r.get(12)?,
-                        error: r.get(13)?,
-                        ..base
-                    })
-                })
-                .transpose()?)
+            let (Some(provider), Some(purpose)) = (
+                CloudProvider::parse(&provider),
+                CloudPurpose::parse(&purpose),
+            ) else {
+                return Ok(None);
+            };
+            Ok(Some(CloudRequest {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                provider,
+                model: r.get(3)?,
+                purpose,
+                project_id: r.get(5)?,
+                conversation_id: r.get(6)?,
+                chars_sent: r.get::<_, i64>(7)?.max(0) as u64,
+                usage: (!usage.is_empty()).then_some(usage),
+                cost: amount
+                    .zip(currency)
+                    .map(|(amount, currency)| Money { amount, currency }),
+                ok: r.get(12)?,
+                error: r.get(13)?,
+            }))
         })?;
         Ok(rows
             .collect::<rusqlite::Result<Vec<_>>>()?

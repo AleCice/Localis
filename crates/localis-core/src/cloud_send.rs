@@ -21,11 +21,16 @@ pub const CLOUD_TOKEN_TTL: Duration = Duration::from_secs(600);
 /// Max prepared requests kept at once (the oldest are dropped).
 const PENDING_MAX: usize = 64;
 
-pub const TOKEN_INVALID: &str = "Conferma non valida o scaduta: rivedi l'anteprima e conferma di nuovo l'invio al cloud.";
-pub const TOKEN_MISMATCH: &str = "La conferma non corrisponde a questa domanda: rivedi l'anteprima e conferma di nuovo.";
-pub const ROUTE_CHANGED: &str = "La scelta del modello è cambiata dopo l'anteprima: rivedi l'anteprima e conferma di nuovo.";
-pub const CONFIRMATION_REQUIRED: &str = "Questa domanda va a un modello cloud: serve la tua conferma prima dell'invio.";
-pub const PROJECT_LOCAL_ONLY: &str = "Questo progetto è «Solo locale»: nessun dato può essere inviato a un provider cloud.";
+pub const TOKEN_INVALID: &str =
+    "Conferma non valida o scaduta: rivedi l'anteprima e conferma di nuovo l'invio al cloud.";
+pub const TOKEN_MISMATCH: &str =
+    "La conferma non corrisponde a questa domanda: rivedi l'anteprima e conferma di nuovo.";
+pub const ROUTE_CHANGED: &str =
+    "La scelta del modello è cambiata dopo l'anteprima: rivedi l'anteprima e conferma di nuovo.";
+pub const CONFIRMATION_REQUIRED: &str =
+    "Questa domanda va a un modello cloud: serve la tua conferma prima dell'invio.";
+pub const PROJECT_LOCAL_ONLY: &str =
+    "Questo progetto è «Solo locale»: nessun dato può essere inviato a un provider cloud.";
 
 /// Keys and endpoints, shared by the commands and the embedder.
 #[derive(Clone)]
@@ -70,7 +75,12 @@ impl PendingSend {
         }
     }
 
-    pub(crate) fn matches(&self, conversation_id: &str, text: &str, document_ids: &[String]) -> bool {
+    pub(crate) fn matches(
+        &self,
+        conversation_id: &str,
+        text: &str,
+        document_ids: &[String],
+    ) -> bool {
         self.conversation_id == conversation_id
             && self.text == text
             && self.document_ids == normalize_ids(document_ids)
@@ -189,4 +199,67 @@ pub struct CloudPreview {
     pub est_cost: Option<(Money, Money)>,
     pub query_embedded_by: Option<ModelRef>,
     pub expires_at: String,
+}
+
+/// Result of [`list_provider_models`] (`ProviderModels` in `src/api/types.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderModels {
+    pub provider: crate::providers::CloudProvider,
+    pub reachable: bool,
+    pub message: Option<String>,
+    pub detail: Option<String>,
+    pub models: Vec<crate::llm::ModelInfo>,
+}
+
+/// Lists a provider's models on explicit request of the user: only the key is sent, and
+/// the request is logged (`list_models`). Without a key nothing is sent. Fails only when
+/// the keychain cannot be read.
+pub fn list_provider_models<A: crate::chat::StoreAccess>(
+    db: &A,
+    cloud: &CloudRuntime,
+    provider: crate::providers::CloudProvider,
+) -> crate::error::Result<ProviderModels> {
+    use crate::mesh::ModelClient;
+    let Some(key) = cloud.keys().get(provider)? else {
+        return Ok(ProviderModels {
+            provider,
+            reachable: false,
+            message: Some(crate::mesh::missing_key_message(provider)),
+            detail: None,
+            models: Vec::new(),
+        });
+    };
+    let client = crate::mesh::CloudClient::new(provider, key, cloud.endpoints().clone());
+    let result = client.list_models();
+    drop(client);
+    // Best effort: a log failure does not hide the answer.
+    let _ = db.with_store(|s| {
+        s.log_cloud_request(&crate::cloud_log::CloudLogEntry {
+            provider,
+            model: None,
+            purpose: crate::cloud_log::CloudPurpose::ListModels,
+            project_id: None,
+            conversation_id: None,
+            chars_sent: 0,
+            usage: crate::prices::Usage::default(),
+            cost: None,
+            error: result.as_ref().err().map(|e| e.to_string()),
+        })
+    });
+    Ok(match result {
+        Ok(models) => ProviderModels {
+            provider,
+            reachable: true,
+            message: None,
+            detail: None,
+            models,
+        },
+        Err(err) => ProviderModels {
+            provider,
+            reachable: false,
+            message: Some(err.to_string()),
+            detail: err.detail().map(str::to_owned),
+            models: Vec::new(),
+        },
+    })
 }

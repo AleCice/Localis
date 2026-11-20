@@ -101,9 +101,7 @@ fn route_auto(candidates: &[ModelRef], inputs: RouteInputs<'_>) -> Result<RouteD
         }
     };
     if local_only {
-        return Err(none(&format!(
-            "il progetto è «Solo locale» e {local_note}"
-        )));
+        return Err(none(&format!("il progetto è «Solo locale» e {local_note}")));
     }
     let clouds: Vec<(usize, &ModelRef, CloudProvider)> = candidates
         .iter()
@@ -111,7 +109,9 @@ fn route_auto(candidates: &[ModelRef], inputs: RouteInputs<'_>) -> Result<RouteD
         .filter_map(|(i, m)| m.provider.cloud().map(|p| (i, m, p)))
         .collect();
     if clouds.is_empty() {
-        return Err(none(&format!("{local_note} e non ci sono modelli cloud tra i candidati")));
+        return Err(none(&format!(
+            "{local_note} e non ci sono modelli cloud tra i candidati"
+        )));
     }
     let available: Vec<(usize, &ModelRef)> = clouds
         .iter()
@@ -253,7 +253,11 @@ mod tests {
 
     #[test]
     fn local_preference_wins_when_available() {
-        let s = auto(&[(OPENAI, "gpt"), (ProviderId::LmStudio, "absent"), (ProviderId::LmStudio, "qwen")]);
+        let s = auto(&[
+            (OPENAI, "gpt"),
+            (ProviderId::LmStudio, "absent"),
+            (ProviderId::LmStudio, "qwen"),
+        ]);
         let (r, calls) = Case::new().run(&s);
         let d = r.unwrap();
         assert_eq!(d.model, ModelRef::lmstudio("qwen"));
@@ -265,7 +269,10 @@ mod tests {
     #[test]
     fn no_local_candidates_skip_lm_studio() {
         let (r, calls) = Case::new().run(&auto(&[(OPENAI, "gpt")]));
-        assert!(r.unwrap().reason.contains("nessun modello locale tra i candidati"));
+        assert!(r
+            .unwrap()
+            .reason
+            .contains("nessun modello locale tra i candidati"));
         assert_eq!(calls, 0);
     }
 
@@ -291,14 +298,22 @@ mod tests {
 
     #[test]
     fn availability_requires_keys_and_listed_local_models() {
-        let s = auto(&[(ProviderId::LmStudio, "missing"), (OPENAI, "gpt"), (GEMINI, "g")]);
+        let s = auto(&[
+            (ProviderId::LmStudio, "missing"),
+            (OPENAI, "gpt"),
+            (GEMINI, "g"),
+        ]);
         let case = Case {
             keys: vec![CloudProvider::Gemini],
             ..Case::new()
         };
         let d = case.run(&s).0.unwrap();
         assert_eq!(d.model, ModelRef::new(GEMINI, "g"));
-        assert!(d.reason.contains("non sono disponibili in LM Studio"), "{}", d.reason);
+        assert!(
+            d.reason.contains("non sono disponibili in LM Studio"),
+            "{}",
+            d.reason
+        );
         assert!(d.reason.contains("nessun prezzo"), "{}", d.reason);
         let case = Case {
             keys: vec![],
@@ -306,12 +321,19 @@ mod tests {
             ..Case::new()
         };
         let err = case.run(&s).0.unwrap_err();
-        assert!(err.to_string().contains("nessun provider cloud candidato ha una chiave API"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("nessun provider cloud candidato ha una chiave API"),
+            "{err}"
+        );
         let err = Case::new()
             .run(&auto(&[(ProviderId::LmStudio, "missing")]))
             .0
             .unwrap_err();
-        assert!(err.to_string().contains("non ci sono modelli cloud"), "{err}");
+        assert!(
+            err.to_string().contains("non ci sono modelli cloud"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -326,7 +348,11 @@ mod tests {
             ..Case::new()
         };
         let d = case.run(&s).0.unwrap();
-        assert_eq!(d.model, ModelRef::new(DEEPSEEK, "c"), "cheapest; tie broken by list order");
+        assert_eq!(
+            d.model,
+            ModelRef::new(DEEPSEEK, "c"),
+            "cheapest; tie broken by list order"
+        );
         assert!(d.reason.contains("più economico"));
         // Same inputs, same answer.
         for _ in 0..5 {

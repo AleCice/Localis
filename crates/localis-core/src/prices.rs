@@ -227,9 +227,15 @@ mod tests {
                 "{err:?}"
             );
         }
-        let gpt = ModelRef::new(crate::providers::ProviderId::Cloud(CloudProvider::OpenAi), "gpt-x");
+        let gpt = ModelRef::new(
+            crate::providers::ProviderId::Cloud(CloudProvider::OpenAi),
+            "gpt-x",
+        );
         assert!(store.price_of(&gpt).unwrap().is_some());
-        assert!(store.price_of(&ModelRef::lmstudio("gpt-x")).unwrap().is_none());
+        assert!(store
+            .price_of(&ModelRef::lmstudio("gpt-x"))
+            .unwrap()
+            .is_none());
         assert!(store
             .delete_price(CloudProvider::OpenAi, "gpt-x")
             .unwrap()

@@ -2,13 +2,13 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use localis_core::{
-    Candidate, ChatEvent, ChatMessage, ChatRuntime, CloudClient, CloudEmbeddingEstimate,
-    CloudLogEntry, CloudPolicy, CloudPreview, CloudProvider, CloudPurpose, CloudRequest,
-    CloudRuntime, Conversation, CoreError, DocumentVersion, EmbedderShared, EmbeddingStatus,
-    Endpoints, Folder, ImportFile, ImportOutcome, Job, KeyringStatus, LibraryDocument, LlmClient,
-    LlmSettings, LlmStatus, ModelClient, ModelInfo, ModelPrice, ModelRef, Money, NewFolder,
-    NewProject, PreviewSource, Project, ProviderId, RetrievalInfo, RouteDecision, Routing,
-    SearchHit, SendInput, Source, Store, StoreAccess, SystemKeyring, TextUnit, Usage,
+    Candidate, ChatEvent, ChatMessage, ChatRuntime, CloudEmbeddingEstimate, CloudPolicy,
+    CloudPreview, CloudProvider, CloudRequest, CloudRuntime, Conversation, CoreError,
+    DocumentVersion, EmbedderShared, EmbeddingStatus, Endpoints, Folder, ImportFile, ImportOutcome,
+    Job, KeyringStatus, LibraryDocument, LlmClient, LlmSettings, LlmStatus, ModelInfo, ModelPrice,
+    ModelRef, Money, NewFolder, NewProject, PreviewSource, Project, ProviderId, RetrievalInfo,
+    RouteDecision, Routing, SearchHit, SendInput, Source, Store, StoreAccess, SystemKeyring,
+    TextUnit, Usage,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, Request, Response};
@@ -1017,16 +1017,11 @@ pub async fn send_message(
     blocking(move || {
         let state = app.state::<AppState>();
         let state: &AppState = &state;
-        let message = localis_core::send_message(
-            state,
-            &state.chat,
-            &state.cloud,
-            input.into(),
-            &mut |e| {
+        let message =
+            localis_core::send_message(state, &state.chat, &state.cloud, input.into(), &mut |e| {
                 // A closed webview just stops receiving events; the answer is still stored.
                 let _ = on_event.send(ChatEventDto::from(e));
-            },
-        )?;
+            })?;
         Ok(message.into())
     })
     .await
@@ -1404,46 +1399,14 @@ pub async fn list_provider_models(
     let provider = parse_cloud_provider(&provider)?;
     blocking(move || {
         let state = app.state::<AppState>();
-        let Some(key) = state.cloud.keys().get(provider)? else {
-            return Ok(ProviderModelsDto {
-                provider: provider.as_str(),
-                reachable: false,
-                message: Some(localis_core::missing_key_message(provider)),
-                detail: None,
-                models: Vec::new(),
-            });
-        };
-        let client = CloudClient::new(provider, key, state.cloud.endpoints().clone());
-        let result = client.list_models();
-        drop(client);
-        let _ = state.with_store(|s| {
-            Ok(s.log_cloud_request(&CloudLogEntry {
-                provider,
-                model: None,
-                purpose: CloudPurpose::ListModels,
-                project_id: None,
-                conversation_id: None,
-                chars_sent: 0,
-                usage: Usage::default(),
-                cost: None,
-                error: result.as_ref().err().map(|e| e.to_string()),
-            })?)
-        });
-        Ok(match result {
-            Ok(models) => ProviderModelsDto {
-                provider: provider.as_str(),
-                reachable: true,
-                message: None,
-                detail: None,
-                models: map_all(models),
-            },
-            Err(err) => ProviderModelsDto {
-                provider: provider.as_str(),
-                reachable: false,
-                message: Some(err.to_string()),
-                detail: err.detail().map(str::to_owned),
-                models: Vec::new(),
-            },
+        let state: &AppState = &state;
+        let m = localis_core::list_provider_models(state, &state.cloud, provider)?;
+        Ok(ProviderModelsDto {
+            provider: m.provider.as_str(),
+            reachable: m.reachable,
+            message: m.message,
+            detail: m.detail,
+            models: map_all(m.models),
         })
     })
     .await
