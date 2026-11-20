@@ -1,4 +1,4 @@
-// Browser UI/accessibility checks of the v0.3 chat on the in-memory mock backend
+// Browser UI/accessibility checks of the v0.3 chat (picker updated for the v0.4 grouped models) on the in-memory mock backend
 // (`npm run dev:mock` with VITE_MOCK_LLM=1: a canned fake model that labels its answers as such).
 // Covers layout (no horizontal page overflow at several widths and at 200% zoom with a long
 // formula, table and code block; composer always visible; closed inspector takes no space),
@@ -134,8 +134,11 @@ async function main() {
   // Model picker (mock: reachable when VITE_MOCK_LLM=1).
   const picker = page.locator(".chat-header .model-picker select");
   await picker.waitFor({ timeout: 10000 });
-  const opts = await picker.locator("option").allTextContents();
-  await picker.selectOption({ index: opts.length - 1 });
+  // v0.4: options are grouped «Locale (LM Studio)» / «Cloud» with "provider:model" values; pick the
+  // mock's enabled local model (the last option is now a disabled cloud placeholder).
+  const localValue = await picker.evaluate((sel) => [...sel.options].find((o) => o.value.startsWith("lmstudio:") && !o.disabled)?.value ?? null);
+  check("model picker offers an enabled local (LM Studio) model in the mock", !!localValue, localValue);
+  await picker.selectOption(localValue);
   await sleep(300);
 
   // A long answer (formula, table, code) from the mock's /demo.
@@ -252,7 +255,7 @@ async function main() {
   await page.locator("#llm-settings-title").waitFor();
   await page.locator(".llm-settings .url-field input").waitFor();
   const settingsFocusables = await page.evaluate(() =>
-    [...document.querySelectorAll(".llm-settings input, .llm-settings select, .llm-settings button")].map((e) => ({ tag: e.tagName, dis: e.disabled, tab: e.tabIndex })),
+    [...document.querySelectorAll(".settings input, .settings select, .settings button")] /* v0.4: whole settings view (LM Studio, providers, prices, models, activity) */.map((e) => ({ tag: e.tagName, dis: e.disabled, tab: e.tabIndex })),
   );
   check("settings controls are native focusable inputs/selects/buttons", settingsFocusables.length >= 4 && settingsFocusables.every((x) => x.tab >= 0), JSON.stringify(settingsFocusables));
   check("no external network requests from the page", external.length === 0, external.join(" "));
