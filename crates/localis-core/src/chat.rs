@@ -1,5 +1,7 @@
 //! Conversations and messages (persistence), citations, prompt building and the
-//! `send_message` pipeline: question → retrieval → generation with LM Studio → answer.
+//! `send_message` pipeline: question → retrieval → routing (PRISM) → generation with the
+//! chosen provider (Model Mesh) → answer. A cloud route needs the user's confirmation
+//! token from [`prepare_cloud_send`].
 //!
 //! The pipeline takes the store through [`StoreAccess`] in short sections and never holds
 //! it while waiting on the network.
@@ -11,9 +13,18 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 
+use crate::cloud_log::{CloudLogEntry, CloudPurpose};
+use crate::cloud_send::{
+    CloudPreview, CloudRuntime, PendingSend, PreviewSource, CONFIRMATION_REQUIRED,
+    PROJECT_LOCAL_ONLY, ROUTE_CHANGED, TOKEN_INVALID, TOKEN_MISMATCH,
+};
 use crate::error::{CoreError, Result};
 use crate::library::TextStatus;
 use crate::llm::{LlmClient, PromptMessage, StreamEnd, SHORT_TIMEOUT};
+use crate::mesh::{client_for, missing_key_message, CLOUD_MAX_OUTPUT_TOKENS};
+use crate::prices::{estimate_tokens, Money, Usage};
+use crate::prism::{route, LocalModels, RouteDecision, RouteInputs};
+use crate::providers::{CloudPolicy, ModelRef, ProviderId};
 use crate::retrieval::{
     fuse, has_deictic_reference, is_inventory_question, lexical_query, match_titles,
     select_evidence, DocRef, Ranked, TitleMatch, Via,
@@ -41,8 +52,6 @@ pub const NO_EVIDENCE_MESSAGE: &str =
 pub const NO_TEXT_NOTE: &str = "Alcuni documenti non hanno testo ricercabile.";
 pub const WHICH_DOCUMENT: &str = "A quale documento ti riferisci?";
 pub const AMBIGUOUS_TITLE: &str = "Più documenti corrispondono al titolo indicato. Quale intendi?";
-pub const NO_CHAT_MODEL: &str =
-    "Nessun modello di chat selezionato. Scegline uno in Impostazioni o nell'intestazione della chat.";
 pub const CANCELLED_MESSAGE: &str = "Risposta interrotta dall'utente.";
 pub const INTERRUPTED_MESSAGE: &str = "Risposta interrotta.";
 
@@ -206,6 +215,7 @@ pub struct RetrievalInfo {
     pub document_ids: Vec<String>,
     pub scope_reason: Option<ScopeReason>,
     pub embedding_model: Option<String>,
+    pub embedding_provider: Option<ProviderId>,
     /// Lexical FTS5 query actually used (empty when the question had no significant words).
     pub query: String,
 }
@@ -233,7 +243,7 @@ pub struct Candidate {
     pub title: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatMessage {
     pub id: String,
     pub conversation_id: String,
@@ -244,6 +254,14 @@ pub struct ChatMessage {
     pub status: MessageStatus,
     pub error: Option<ErrorInfo>,
     pub model: Option<String>,
+    /// Provider of `model`.
+    pub provider: Option<ProviderId>,
+    /// Why the model was chosen (PRISM).
+    pub route_reason: Option<String>,
+    /// Token usage as reported by the provider.
+    pub usage: Option<Usage>,
+    /// Cost from `usage` and the user's prices.
+    pub cost: Option<Money>,
     pub created_at: String,
     pub retrieval: Option<RetrievalInfo>,
     pub sources: Vec<Source>,
@@ -266,6 +284,8 @@ pub struct SendInput {
     pub text: String,
     /// Explicit selection (empty = automatic scope).
     pub document_ids: Vec<String>,
+    /// Token from [`prepare_cloud_send`], required when the route is a cloud model.
+    pub confirm_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,7 +306,7 @@ impl ChatPhase {
 /// Events streamed during [`send_message`] (`ChatEvent` in `src/api/types.ts`), always in
 /// this order: `Accepted`, `Phase(Retrieving)`, [`Phase(Generating)`, `Delta`…], then
 /// exactly one of `Done` / `Error`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChatEvent {
     Accepted {
         user_message: ChatMessage,
@@ -658,7 +678,8 @@ pub fn build_prompt(
 const MESSAGE_COLUMNS: &str = "m.id, m.conversation_id, m.role, m.kind, m.content, m.status,
     m.error_code, m.error_message, m.error_detail, m.model, m.created_at, m.retrieval_mode,
     m.retrieval_scope, m.scope_reason, m.scope_document_ids, m.embedding_model,
-    m.retrieval_query";
+    m.retrieval_query, m.provider, m.route_reason, m.input_tokens, m.output_tokens,
+    m.cost_amount, m.cost_currency, m.embedding_provider";
 
 fn bad(idx: usize, what: &str) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
@@ -696,6 +717,10 @@ fn row_to_message(r: &Row<'_>) -> rusqlite::Result<ChatMessage> {
                     .unwrap_or_default(),
                 scope_reason: reason.as_deref().and_then(ScopeReason::parse),
                 embedding_model: r.get(15)?,
+                embedding_provider: r
+                    .get::<_, Option<String>>(23)?
+                    .as_deref()
+                    .and_then(ProviderId::parse),
                 query: r.get::<_, Option<String>>(16)?.unwrap_or_default(),
             })
         }
@@ -720,6 +745,27 @@ fn row_to_message(r: &Row<'_>) -> rusqlite::Result<ChatMessage> {
             None => None,
         },
         model: r.get(9)?,
+        provider: r
+            .get::<_, Option<String>>(17)?
+            .as_deref()
+            .and_then(ProviderId::parse),
+        route_reason: r.get(18)?,
+        usage: {
+            let input: Option<i64> = r.get(19)?;
+            let output: Option<i64> = r.get(20)?;
+            let usage = Usage {
+                input_tokens: input.map(|t| t.max(0) as u64),
+                output_tokens: output.map(|t| t.max(0) as u64),
+            };
+            (!usage.is_empty()).then_some(usage)
+        },
+        cost: {
+            let amount: Option<f64> = r.get(21)?;
+            let currency: Option<String> = r.get(22)?;
+            amount
+                .zip(currency)
+                .map(|(amount, currency)| Money { amount, currency })
+        },
         created_at: r.get(10)?,
         retrieval,
         sources: Vec::new(),
@@ -751,7 +797,6 @@ fn conversation_title(question: &str) -> String {
 struct Turn {
     user_message: ChatMessage,
     assistant_id: String,
-    project_id: String,
 }
 
 /// Final state written to an assistant message.
@@ -760,10 +805,32 @@ struct Final<'a> {
     content: &'a str,
     status: MessageStatus,
     error: Option<&'a ErrorInfo>,
-    model: Option<&'a str>,
+    /// The model that produced (or failed to produce) the answer.
+    route: Option<&'a RouteDecision>,
+    usage: Usage,
+    cost: Option<&'a Money>,
     cited: &'a BTreeSet<u32>,
     candidates: &'a [Candidate],
 }
+
+impl<'a> Final<'a> {
+    /// A complete answer built without a model.
+    fn reply(kind: MessageKind, content: &'a str, candidates: &'a [Candidate]) -> Self {
+        Final {
+            kind,
+            content,
+            status: MessageStatus::Complete,
+            error: None,
+            route: None,
+            usage: Usage::default(),
+            cost: None,
+            cited: &NO_CITATIONS,
+            candidates,
+        }
+    }
+}
+
+static NO_CITATIONS: BTreeSet<u32> = BTreeSet::new();
 
 impl Store {
     pub fn list_conversations(&self, project_id: &str) -> Result<Vec<Conversation>> {
@@ -967,7 +1034,6 @@ impl Store {
         Ok(Turn {
             user_message: self.get_message(&user_id)?,
             assistant_id,
-            project_id,
         })
     }
 
@@ -985,7 +1051,8 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "UPDATE messages SET retrieval_mode = ?2, retrieval_scope = ?3, scope_reason = ?4,
-                 scope_document_ids = ?5, embedding_model = ?6, retrieval_query = ?7
+                 scope_document_ids = ?5, embedding_model = ?6, retrieval_query = ?7,
+                 embedding_provider = ?8
              WHERE id = ?1",
             params![
                 message_id,
@@ -994,7 +1061,8 @@ impl Store {
                 info.scope_reason.map(ScopeReason::as_str),
                 serde_json::Value::from(info.document_ids.clone()).to_string(),
                 info.embedding_model,
-                info.query
+                info.query,
+                info.embedding_provider.map(ProviderId::as_str)
             ],
         )?;
         tx.execute(
@@ -1044,7 +1112,9 @@ impl Store {
         let now = now(&tx)?;
         let changed = tx.execute(
             "UPDATE messages SET kind = ?2, content = ?3, status = ?4, error_code = ?5,
-                 error_message = ?6, error_detail = ?7, model = ?8, updated_at = ?9
+                 error_message = ?6, error_detail = ?7, model = ?8, updated_at = ?9,
+                 provider = ?10, route_reason = ?11, input_tokens = ?12, output_tokens = ?13,
+                 cost_amount = ?14, cost_currency = ?15
              WHERE id = ?1 AND status = 'streaming'",
             params![
                 message_id,
@@ -1054,8 +1124,14 @@ impl Store {
                 f.error.map(|e| e.code.as_str()),
                 f.error.map(|e| e.message.as_str()),
                 f.error.and_then(|e| e.detail.as_deref()),
-                f.model,
-                now
+                f.route.map(|r| r.model.model.as_str()),
+                now,
+                f.route.map(|r| r.model.provider.as_str()),
+                f.route.map(|r| r.reason.as_str()),
+                f.usage.input_tokens.map(|t| t as i64),
+                f.usage.output_tokens.map(|t| t as i64),
+                f.cost.map(|c| c.amount),
+                f.cost.map(|c| c.currency.as_str())
             ],
         )?;
         if changed == 0 {
@@ -1083,27 +1159,22 @@ impl Store {
         self.get_message(message_id)
     }
 
-    /// Question/answer pairs before `before_seq_of` (the current question), oldest first,
-    /// at most [`HISTORY_PAIRS`]; only answers with text.
-    fn history_pairs(
-        &self,
-        conversation_id: &str,
-        current_user_id: &str,
-    ) -> Result<Vec<(String, String)>> {
+    /// The last question/answer pairs of the conversation, oldest first, at most
+    /// [`HISTORY_PAIRS`]; only finished answers with text (so a turn in progress, whose
+    /// answer is still empty and streaming, is never included).
+    fn history_pairs(&self, conversation_id: &str) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT q.content, a.content FROM messages q
              JOIN messages a ON a.conversation_id = q.conversation_id AND a.seq = q.seq + 1
              WHERE q.conversation_id = ?1 AND q.role = 'user' AND a.role = 'assistant'
                AND a.kind = 'answer'
                AND a.status IN ('complete', 'cancelled') AND a.content <> ''
-               AND q.seq < (SELECT seq FROM messages WHERE id = ?2)
-             ORDER BY q.seq DESC LIMIT ?3",
+             ORDER BY q.seq DESC LIMIT ?2",
         )?;
         let mut pairs: Vec<(String, String)> = stmt
-            .query_map(
-                params![conversation_id, current_user_id, HISTORY_PAIRS as i64],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?
+            .query_map(params![conversation_id, HISTORY_PAIRS as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
             .collect::<rusqlite::Result<_>>()?;
         pairs.reverse();
         for (_, a) in &mut pairs {
@@ -1142,9 +1213,9 @@ struct SearchPlan {
     document_ids: Vec<String>,
     reason: Option<ScopeReason>,
     fts: Option<String>,
-    /// Embedding model to use, when configured and at least one passage in scope has it.
-    embedding_model: Option<String>,
-    chat_model: Option<String>,
+    /// Embedding model to use, when configured, allowed for the project (a cloud model
+    /// needs `cloud_allowed` + consent) and at least one passage in scope has it.
+    embedding_model: Option<ModelRef>,
     base_url: String,
     /// Some document in scope has no searchable text (scan or image).
     has_textless: bool,
@@ -1304,6 +1375,7 @@ impl Store {
     ) -> Result<Plan> {
         let docs = self.doc_infos(project_id)?;
         let settings = self.llm_settings()?;
+        let project = self.get_project(project_id)?;
         let mut scope = RetrievalScope::Project;
         let mut document_ids: Vec<String> = Vec::new();
         let mut reason = None;
@@ -1398,11 +1470,19 @@ impl Store {
                 TextStatus::NoText | TextStatus::NotApplicable
             )
         });
-        let embedding_model = match &settings.embedding_model {
+        let embedding_model = match allowed_embedding(
+            settings.embedding_model,
+            project.cloud_policy,
+            project.cloud_embedding_consent,
+        ) {
             Some(model)
-                if self.embedded_passages_in_scope(project_id, &document_ids, model)? > 0 =>
+                if self.embedded_passages_in_scope(
+                    project_id,
+                    &document_ids,
+                    &model.embedding_key(),
+                )? > 0 =>
             {
-                Some(model.clone())
+                Some(model)
             }
             _ => None,
         };
@@ -1412,7 +1492,6 @@ impl Store {
             reason,
             fts: lexical_query(text),
             embedding_model,
-            chat_model: settings.chat_model,
             base_url: settings.base_url,
             has_textless,
         }))
@@ -1420,6 +1499,20 @@ impl Store {
 }
 
 // ---------------------------------------------------------------- pipeline
+
+/// The embedding model a project may use: LM Studio always; a cloud model only for
+/// `cloud_allowed` projects with consent.
+pub(crate) fn allowed_embedding(
+    model: Option<ModelRef>,
+    policy: CloudPolicy,
+    consent: bool,
+) -> Option<ModelRef> {
+    match model {
+        Some(m) if !m.is_cloud() => Some(m),
+        Some(m) if policy == CloudPolicy::CloudAllowed && consent => Some(m),
+        _ => None,
+    }
+}
 
 fn validate_question(text: &str) -> Result<String> {
     let trimmed = text.trim();
@@ -1432,121 +1525,163 @@ fn validate_question(text: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
-/// Sends a question and produces the answer, streaming [`ChatEvent`]s through `emit`.
-///
-/// Returns the final assistant message (also for inventory, clarification, no_evidence,
-/// cancelled and `llm_unavailable` answers). Fails only when the question could not be
-/// stored (validation, unknown conversation, a generation already running → `conflict`,
-/// storage) or, afterwards, if the answer can no longer be written (e.g. the conversation
-/// was deleted meanwhile).
-pub fn send_message<A: StoreAccess>(
-    db: &A,
-    runtime: &ChatRuntime,
-    input: SendInput,
-    emit: &mut dyn FnMut(ChatEvent),
-) -> Result<ChatMessage> {
-    let text = validate_question(&input.text)?;
-    let guard = runtime.register(&input.conversation_id)?;
-    let turn = db.with_store(|s| s.begin_turn(&input, &text))?;
-    let assistant_id = turn.assistant_id.clone();
-    emit(ChatEvent::Accepted {
-        user_message: turn.user_message.clone(),
-        assistant_message_id: assistant_id.clone(),
-    });
-    let result = run_turn(db, &guard.cancel, &input, &text, &turn, emit);
-    match result {
-        Ok(message) => Ok(message),
-        Err(err) => {
-            // Best effort: record the failure on the answer so it does not stay streaming.
-            let info = ErrorInfo::from(&err);
-            let stored = db.with_store(|s| {
-                s.finish_message(
-                    &assistant_id,
-                    &Final {
-                        kind: MessageKind::Answer,
-                        content: "",
-                        status: MessageStatus::Error,
-                        error: Some(&info),
-                        model: None,
-                        cited: &BTreeSet::new(),
-                        candidates: &[],
-                    },
-                )
-            });
-            emit(ChatEvent::Error {
-                error: info,
-                message: stored.as_ref().ok().cloned(),
-            });
-            stored.map_err(|_| err)
+/// What a turn needs to know before anything is stored.
+struct TurnContext {
+    project_id: String,
+    policy: CloudPolicy,
+    settings: crate::settings::LlmSettings,
+}
+
+impl Store {
+    /// Checks the conversation and the selection, without writing anything.
+    fn turn_context(&self, conversation_id: &str, selection: &[String]) -> Result<TurnContext> {
+        let conversation = self.get_conversation(conversation_id)?;
+        for doc in selection {
+            let ok: bool = self.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM documents WHERE id = ?1 AND project_id = ?2)",
+                params![doc, conversation.project_id],
+                |r| r.get(0),
+            )?;
+            if !ok {
+                return Err(CoreError::validation("documentIds", SELECTION_INVALID));
+            }
         }
+        let project = self.get_project(&conversation.project_id)?;
+        Ok(TurnContext {
+            project_id: project.id,
+            policy: project.cloud_policy,
+            settings: self.llm_settings()?,
+        })
+    }
+
+    /// ISO 8601 UTC time `after` from now.
+    fn time_after(&self, after: Duration) -> Result<String> {
+        Ok(self.conn.query_row(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
+            params![format!("+{:.3} seconds", after.as_secs_f64())],
+            |r| r.get(0),
+        )?)
     }
 }
 
-fn run_turn<A: StoreAccess>(
+/// PRISM for this turn: may contact LM Studio (automatic routing with local candidates)
+/// and reads which providers have a key. Writes nothing.
+fn resolve_route<A: StoreAccess>(
     db: &A,
-    cancel: &AtomicBool,
-    input: &SendInput,
+    cloud: &CloudRuntime,
+    ctx: &TurnContext,
+) -> Result<RouteDecision> {
+    let prices = db.with_store(|s| s.list_prices())?;
+    let base_url = ctx.settings.base_url.clone();
+    let mut local = || match LlmClient::new(&base_url).and_then(|c| c.list_models()) {
+        Ok(models) => LocalModels::Reachable(models.into_iter().map(|m| m.id).collect()),
+        Err(_) => LocalModels::Unreachable,
+    };
+    // A keychain that cannot be read counts as "no key".
+    let has_key = |p| matches!(cloud.keys().get(p), Ok(Some(_)));
+    route(
+        &ctx.settings,
+        RouteInputs {
+            policy: ctx.policy,
+            local: &mut local,
+            has_key: &has_key,
+            prices: &prices,
+        },
+    )
+}
+
+/// A turn planned and searched, ready to be stored (and, for an answer, generated).
+pub(crate) enum Prepared {
+    /// Answer built by Localis (inventory or clarification).
+    Reply {
+        kind: MessageKind,
+        content: String,
+        candidates: Vec<Candidate>,
+    },
+    Search(Box<Searched>),
+}
+
+impl Prepared {
+    /// Whether the turn needs the chat model.
+    fn needs_model(&self) -> bool {
+        matches!(self, Prepared::Search(s) if !s.ranked.is_empty())
+    }
+}
+
+pub(crate) struct Searched {
+    info: RetrievalInfo,
+    ranked: Vec<Ranked>,
+    evidence_idx: Vec<usize>,
+    has_textless: bool,
+    evidence: Vec<Evidence>,
+    history: Vec<(String, String)>,
+    /// The exact messages for the chat model (empty when nothing was found).
+    prompt: Vec<PromptMessage>,
+    /// Cloud model the question was sent to for its embedding, if any.
+    query_embedded_by: Option<ModelRef>,
+}
+
+/// Plans and searches a turn, without writing anything except the cloud log of a query
+/// embedding (which happens only for projects that consented to cloud embeddings).
+fn prepare<A: StoreAccess>(
+    db: &A,
+    cloud: &CloudRuntime,
+    ctx: &TurnContext,
+    conversation_id: &str,
     text: &str,
-    turn: &Turn,
-    emit: &mut dyn FnMut(ChatEvent),
-) -> Result<ChatMessage> {
-    let id = turn.assistant_id.as_str();
-    emit(ChatEvent::Phase(ChatPhase::Retrieving));
-    let plan = db.with_store(|s| {
-        s.plan_turn(
-            &turn.project_id,
-            &input.conversation_id,
-            text,
-            &input.document_ids,
-        )
-    })?;
+    selection: &[String],
+) -> Result<Prepared> {
+    let plan = db.with_store(|s| s.plan_turn(&ctx.project_id, conversation_id, text, selection))?;
     let plan = match plan {
         Plan::Reply {
             kind,
             content,
             candidates,
         } => {
-            let message = db.with_store(|s| {
-                s.finish_message(
-                    id,
-                    &Final {
-                        kind,
-                        content: &content,
-                        status: MessageStatus::Complete,
-                        error: None,
-                        model: None,
-                        cited: &BTreeSet::new(),
-                        candidates: &candidates,
-                    },
-                )
-            })?;
-            emit(ChatEvent::Done(message.clone()));
-            return Ok(message);
+            return Ok(Prepared::Reply {
+                kind,
+                content,
+                candidates,
+            })
         }
         Plan::Search(plan) => plan,
     };
 
     // Query embedding (network, no store access). Hybrid only if it succeeds.
+    let mut query_embedded_by = None;
     let query_vector = match (&plan.embedding_model, &plan.fts) {
-        (Some(model), Some(_)) => LlmClient::new(&plan.base_url)
-            .and_then(|c| c.embed(model, &[text.to_owned()], SHORT_TIMEOUT))
-            .ok()
-            .and_then(|mut v| v.pop()),
+        (Some(model), Some(_)) => {
+            if model.is_cloud() && ctx.policy != CloudPolicy::CloudAllowed {
+                None // defense in depth: plan_turn already excludes this
+            } else {
+                let (vector, sent) =
+                    embed_query(db, cloud, ctx, conversation_id, model, &plan.base_url, text);
+                if sent && model.is_cloud() {
+                    query_embedded_by = Some(model.clone());
+                }
+                vector
+            }
+        }
         _ => None,
     };
     let (ranked, mode) = db.with_store(|s| {
         let lexical = match &plan.fts {
-            Some(q) => s.search_passages_lexical(&turn.project_id, &plan.document_ids, q)?,
+            Some(q) => s.search_passages_lexical(&ctx.project_id, &plan.document_ids, q)?,
             None => Vec::new(),
         };
         // Without searchable terms there is no meaningful query: semantic similarity alone
         // would always return "something" (vague matches), so it is not used.
         let (semantic, mode) = match (&plan.embedding_model, &query_vector, &plan.fts) {
             (Some(model), Some(v), Some(_)) => (
-                s.search_passages_semantic(&turn.project_id, &plan.document_ids, model, v)?
-                    .into_iter()
-                    .map(|(p, _)| p)
-                    .collect(),
+                s.search_passages_semantic(
+                    &ctx.project_id,
+                    &plan.document_ids,
+                    &model.embedding_key(),
+                    v,
+                )?
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect(),
                 RetrievalMode::Hybrid,
             ),
             _ => (Vec::new(), RetrievalMode::Lexical),
@@ -1556,7 +1691,7 @@ fn run_turn<A: StoreAccess>(
         // documento»): pass the opening passages, declared as such (via "position").
         if ranked.is_empty() && plan.fts.is_none() && plan.scope == RetrievalScope::Documents {
             ranked = s
-                .leading_passages(&turn.project_id, &plan.document_ids)?
+                .leading_passages(&ctx.project_id, &plan.document_ids)?
                 .into_iter()
                 .map(|passage| Ranked {
                     passage,
@@ -1567,98 +1702,25 @@ fn run_turn<A: StoreAccess>(
         }
         Ok((ranked, mode))
     })?;
+    let hybrid = mode == RetrievalMode::Hybrid;
     let info = RetrievalInfo {
         mode,
         scope: plan.scope,
         document_ids: plan.document_ids.clone(),
         scope_reason: plan.reason,
-        embedding_model: if mode == RetrievalMode::Hybrid {
-            plan.embedding_model.clone()
-        } else {
-            None
-        },
+        embedding_model: plan
+            .embedding_model
+            .as_ref()
+            .filter(|_| hybrid)
+            .map(|m| m.model.clone()),
+        embedding_provider: plan
+            .embedding_model
+            .as_ref()
+            .filter(|_| hybrid)
+            .map(|m| m.provider),
         query: plan.fts.clone().unwrap_or_default(),
     };
     let evidence_idx = select_evidence(&ranked);
-    db.with_store(|s| s.record_retrieval(id, &info, &ranked, &evidence_idx))?;
-
-    if ranked.is_empty() {
-        let mut content = NO_EVIDENCE_MESSAGE.to_owned();
-        if plan.has_textless {
-            content.push(' ');
-            content.push_str(NO_TEXT_NOTE);
-        }
-        let message = db.with_store(|s| {
-            s.finish_message(
-                id,
-                &Final {
-                    kind: MessageKind::NoEvidence,
-                    content: &content,
-                    status: MessageStatus::Complete,
-                    error: None,
-                    model: None,
-                    cited: &BTreeSet::new(),
-                    candidates: &[],
-                },
-            )
-        })?;
-        emit(ChatEvent::Done(message.clone()));
-        return Ok(message);
-    }
-
-    let fail = |db: &A,
-                err: CoreError,
-                content: &str,
-                model: Option<&str>,
-                cited: &BTreeSet<u32>,
-                emit: &mut dyn FnMut(ChatEvent)| {
-        let info = ErrorInfo::from(&err);
-        let status = if err.code() == "cancelled" {
-            MessageStatus::Cancelled
-        } else {
-            MessageStatus::Error
-        };
-        let message = db.with_store(|s| {
-            s.finish_message(
-                id,
-                &Final {
-                    kind: MessageKind::Answer,
-                    content,
-                    status,
-                    error: Some(&info),
-                    model,
-                    cited,
-                    candidates: &[],
-                },
-            )
-        })?;
-        emit(ChatEvent::Error {
-            error: info,
-            message: Some(message.clone()),
-        });
-        Ok(message)
-    };
-
-    let Some(chat_model) = plan.chat_model.clone() else {
-        return fail(
-            db,
-            CoreError::llm(NO_CHAT_MODEL, "no chat model configured"),
-            "",
-            None,
-            &BTreeSet::new(),
-            emit,
-        );
-    };
-    if cancel.load(Ordering::SeqCst) {
-        let err = CoreError::Cancelled {
-            message: CANCELLED_MESSAGE.to_owned(),
-        };
-        return fail(db, err, "", Some(&chat_model), &BTreeSet::new(), emit);
-    }
-    let client = match LlmClient::new(&plan.base_url) {
-        Ok(c) => c,
-        Err(err) => return fail(db, err, "", Some(&chat_model), &BTreeSet::new(), emit),
-    };
     let evidence: Vec<Evidence> = evidence_idx
         .iter()
         .enumerate()
@@ -1674,25 +1736,451 @@ fn run_turn<A: StoreAccess>(
             }
         })
         .collect();
-    let history =
-        db.with_store(|s| s.history_pairs(&input.conversation_id, &turn.user_message.id))?;
-    let prompt = build_prompt(text, &evidence, &history);
+    let (history, prompt) = if ranked.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let history = db.with_store(|s| s.history_pairs(conversation_id))?;
+        let prompt = build_prompt(text, &evidence, &history);
+        (history, prompt)
+    };
+    Ok(Prepared::Search(Box::new(Searched {
+        info,
+        ranked,
+        evidence_idx,
+        has_textless: plan.has_textless,
+        evidence,
+        history,
+        prompt,
+        query_embedded_by,
+    })))
+}
+
+/// Embeds the question; returns the vector (if it worked) and whether a request was sent
+/// to the provider. Cloud requests are logged.
+fn embed_query<A: StoreAccess>(
+    db: &A,
+    cloud: &CloudRuntime,
+    ctx: &TurnContext,
+    conversation_id: &str,
+    model: &ModelRef,
+    base_url: &str,
+    text: &str,
+) -> (Option<Vec<f32>>, bool) {
+    let Ok(client) = client_for(model, base_url, cloud.keys(), cloud.endpoints()) else {
+        return (None, false); // no key / invalid URL: lexical only
+    };
+    let result = client.embed(&model.model, &[text.to_owned()], SHORT_TIMEOUT);
+    if let Some(provider) = model.provider.cloud() {
+        let usage = result.as_ref().map(|(_, u)| *u).unwrap_or_default();
+        let _ = db.with_store(|s| {
+            let cost = s
+                .price_of(model)?
+                .and_then(|p| p.cost_of(&usage, false));
+            s.log_cloud_request(&CloudLogEntry {
+                provider,
+                model: Some(model.model.clone()),
+                purpose: CloudPurpose::QueryEmbedding,
+                project_id: Some(ctx.project_id.clone()),
+                conversation_id: Some(conversation_id.to_owned()),
+                chars_sent: text.chars().count() as u64,
+                usage,
+                cost,
+                error: result.as_ref().err().map(|e| e.to_string()),
+            })
+        });
+    }
+    (result.ok().and_then(|(mut v, _)| v.pop()), true)
+}
+
+fn prompt_chars(prompt: &[PromptMessage]) -> u64 {
+    prompt.iter().map(|m| m.content.chars().count() as u64).sum()
+}
+
+/// Plans a question (retrieval + PRISM routing) without storing it or calling a chat
+/// model. Returns `None` when no cloud send is needed: local route, routing error (the
+/// answer will carry it), inventory, clarification, no evidence. Otherwise keeps the exact
+/// request under a single-use token and returns the preview to confirm.
+///
+/// Fails with `consent_required` when the configured chat model is a cloud model and the
+/// project is local-only, `llm_unavailable` when the provider has no key, and
+/// `keyring_unavailable` when the keychain cannot be read.
+pub fn prepare_cloud_send<A: StoreAccess>(
+    db: &A,
+    cloud: &CloudRuntime,
+    input: &SendInput,
+) -> Result<Option<CloudPreview>> {
+    let text = validate_question(&input.text)?;
+    let ctx = db.with_store(|s| s.turn_context(&input.conversation_id, &input.document_ids))?;
+    let decision = match resolve_route(db, cloud, &ctx) {
+        Ok(d) if d.cloud => d,
+        Ok(_) => return Ok(None),
+        Err(err @ CoreError::ConsentRequired { .. }) => return Err(err),
+        Err(_) => return Ok(None),
+    };
+    let Some(provider) = decision.model.provider.cloud() else {
+        return Ok(None);
+    };
+    if ctx.policy != CloudPolicy::CloudAllowed {
+        return Err(CoreError::consent(PROJECT_LOCAL_ONLY));
+    }
+    if cloud.keys().get(provider)?.is_none() {
+        return Err(CoreError::llm(
+            missing_key_message(provider),
+            "no API key in the keychain",
+        ));
+    }
+    let prepared = prepare(
+        db,
+        cloud,
+        &ctx,
+        &input.conversation_id,
+        &text,
+        &input.document_ids,
+    )?;
+    if !prepared.needs_model() {
+        return Ok(None);
+    }
+    let Prepared::Search(searched) = &prepared else {
+        return Ok(None);
+    };
+    let total_chars = prompt_chars(&searched.prompt);
+    let est_input_tokens = estimate_tokens(total_chars);
+    let price = db.with_store(|s| s.price_of(&decision.model))?;
+    let est_cost = price.map(|p| {
+        (
+            p.cost(est_input_tokens, 0),
+            p.cost(est_input_tokens, CLOUD_MAX_OUTPUT_TOKENS),
+        )
+    });
+    let sources = searched
+        .evidence
+        .iter()
+        .zip(&searched.evidence_idx)
+        .map(|(e, &i)| PreviewSource {
+            n: e.n,
+            title: e.title.clone(),
+            unit: e.unit,
+            unit_kind: e.unit_kind,
+            chars: e.text.chars().count() as u64,
+            via: searched.ranked[i].via,
+        })
+        .collect();
+    let history_chars = searched
+        .history
+        .iter()
+        .map(|(q, a)| (q.chars().count() + a.chars().count()) as u64)
+        .sum();
+    let history_pairs = searched.history.len() as u32;
+    let query_embedded_by = searched.query_embedded_by.clone();
+    let expires_at = db.with_store(|s| s.time_after(cloud.ttl()))?;
+    let token = cloud.put(PendingSend::new(
+        &input.conversation_id,
+        &text,
+        &input.document_ids,
+        decision.clone(),
+        prepared,
+    ));
+    Ok(Some(CloudPreview {
+        token,
+        provider_name: provider.name().to_owned(),
+        host: provider.host().to_owned(),
+        route: decision,
+        question: text,
+        sources,
+        history_pairs,
+        history_chars,
+        total_chars,
+        est_input_tokens,
+        max_output_tokens: CLOUD_MAX_OUTPUT_TOKENS,
+        est_cost,
+        query_embedded_by,
+        expires_at,
+    }))
+}
+
+/// Sends a question and produces the answer, streaming [`ChatEvent`]s through `emit`.
+///
+/// Returns the final assistant message (also for inventory, clarification, no_evidence,
+/// cancelled and `llm_unavailable` answers). Fails without storing anything when the
+/// question is invalid, the conversation unknown, a generation already running
+/// (`conflict`) or the route is a cloud model without a valid confirmation
+/// (`consent_required`: missing, expired, reused or altered token, a different question
+/// or selection, a changed model choice, a local-only project). Afterwards it fails only
+/// if the answer can no longer be written (e.g. the conversation was deleted meanwhile).
+///
+/// With a valid token the request stored by [`prepare_cloud_send`] is sent as is (same
+/// sources, history and prompt). There is never a fallback to another provider.
+pub fn send_message<A: StoreAccess>(
+    db: &A,
+    runtime: &ChatRuntime,
+    cloud: &CloudRuntime,
+    input: SendInput,
+    emit: &mut dyn FnMut(ChatEvent),
+) -> Result<ChatMessage> {
+    let text = validate_question(&input.text)?;
+    let guard = runtime.register(&input.conversation_id)?;
+    // Nothing is written until begin_turn.
+    let ctx = db.with_store(|s| s.turn_context(&input.conversation_id, &input.document_ids))?;
+    let decision = resolve_route(db, cloud, &ctx);
+    if let Err(CoreError::ConsentRequired { message }) = &decision {
+        return Err(CoreError::consent(message.clone()));
+    }
+    let mut confirmed = false;
+    let prepared = if let Some(token) = input.confirm_token.as_deref() {
+        let pending = cloud
+            .take(token)
+            .ok_or_else(|| CoreError::consent(TOKEN_INVALID))?;
+        if !pending.matches(&input.conversation_id, &text, &input.document_ids) {
+            return Err(CoreError::consent(TOKEN_MISMATCH));
+        }
+        if ctx.policy != CloudPolicy::CloudAllowed {
+            return Err(CoreError::consent(PROJECT_LOCAL_ONLY));
+        }
+        match &decision {
+            Ok(d) if d.model == pending.route.model => {}
+            _ => return Err(CoreError::consent(ROUTE_CHANGED)),
+        }
+        confirmed = true;
+        Some(pending.prepared)
+    } else if matches!(&decision, Ok(d) if d.cloud) {
+        // A cloud route without confirmation: allowed only when no model is needed.
+        let prepared = prepare(
+            db,
+            cloud,
+            &ctx,
+            &input.conversation_id,
+            &text,
+            &input.document_ids,
+        )?;
+        if prepared.needs_model() {
+            return Err(CoreError::consent(CONFIRMATION_REQUIRED));
+        }
+        Some(prepared)
+    } else {
+        None
+    };
+    let turn = db.with_store(|s| s.begin_turn(&input, &text))?;
+    let assistant_id = turn.assistant_id.clone();
+    emit(ChatEvent::Accepted {
+        user_message: turn.user_message.clone(),
+        assistant_message_id: assistant_id.clone(),
+    });
+    let result = run_turn(
+        db,
+        cloud,
+        &guard.cancel,
+        &ctx,
+        &input,
+        &text,
+        &turn,
+        Step {
+            prepared,
+            decision,
+            confirmed,
+        },
+        emit,
+    );
+    match result {
+        Ok(message) => Ok(message),
+        Err(err) => {
+            // Best effort: record the failure on the answer so it does not stay streaming.
+            let info = ErrorInfo::from(&err);
+            let stored = db.with_store(|s| {
+                s.finish_message(
+                    &assistant_id,
+                    &Final {
+                        status: MessageStatus::Error,
+                        error: Some(&info),
+                        ..Final::reply(MessageKind::Answer, "", &[])
+                    },
+                )
+            });
+            emit(ChatEvent::Error {
+                error: info,
+                message: stored.as_ref().ok().cloned(),
+            });
+            stored.map_err(|_| err)
+        }
+    }
+}
+
+/// What `send_message` decided before storing the turn.
+struct Step {
+    /// Already planned and searched (confirmed cloud request, or a cloud route that needs
+    /// no model); `None` = plan and search now.
+    prepared: Option<Prepared>,
+    decision: Result<RouteDecision>,
+    /// The request was confirmed with a valid token.
+    confirmed: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_turn<A: StoreAccess>(
+    db: &A,
+    cloud: &CloudRuntime,
+    cancel: &AtomicBool,
+    ctx: &TurnContext,
+    input: &SendInput,
+    text: &str,
+    turn: &Turn,
+    step: Step,
+    emit: &mut dyn FnMut(ChatEvent),
+) -> Result<ChatMessage> {
+    let id = turn.assistant_id.as_str();
+    emit(ChatEvent::Phase(ChatPhase::Retrieving));
+    let prepared = match step.prepared {
+        Some(p) => p,
+        None => prepare(
+            db,
+            cloud,
+            ctx,
+            &input.conversation_id,
+            text,
+            &input.document_ids,
+        )?,
+    };
+    let searched = match prepared {
+        Prepared::Reply {
+            kind,
+            content,
+            candidates,
+        } => {
+            let message =
+                db.with_store(|s| s.finish_message(id, &Final::reply(kind, &content, &candidates)))?;
+            emit(ChatEvent::Done(message.clone()));
+            return Ok(message);
+        }
+        Prepared::Search(s) => s,
+    };
+    db.with_store(|s| {
+        s.record_retrieval(id, &searched.info, &searched.ranked, &searched.evidence_idx)
+    })?;
+
+    if searched.ranked.is_empty() {
+        let mut content = NO_EVIDENCE_MESSAGE.to_owned();
+        if searched.has_textless {
+            content.push(' ');
+            content.push_str(NO_TEXT_NOTE);
+        }
+        let message = db.with_store(|s| {
+            s.finish_message(id, &Final::reply(MessageKind::NoEvidence, &content, &[]))
+        })?;
+        emit(ChatEvent::Done(message.clone()));
+        return Ok(message);
+    }
+
+    let evidence_count = searched.evidence.len();
+    let fail = |db: &A,
+                err: CoreError,
+                content: &str,
+                route: Option<&RouteDecision>,
+                usage: Usage,
+                emit: &mut dyn FnMut(ChatEvent)| {
+        let info = ErrorInfo::from(&err);
+        let status = if err.code() == "cancelled" {
+            MessageStatus::Cancelled
+        } else {
+            MessageStatus::Error
+        };
+        // Partial answers keep their valid citations clickable too.
+        let cited = valid_citations(content, evidence_count);
+        let message = db.with_store(|s| {
+            s.finish_message(
+                id,
+                &Final {
+                    kind: MessageKind::Answer,
+                    content,
+                    status,
+                    error: Some(&info),
+                    route,
+                    usage,
+                    cost: None,
+                    cited: &cited,
+                    candidates: &[],
+                },
+            )
+        })?;
+        emit(ChatEvent::Error {
+            error: info,
+            message: Some(message.clone()),
+        });
+        Ok(message)
+    };
+
+    let decision = match step.decision {
+        Ok(d) => d,
+        Err(err) => return fail(db, err, "", None, Usage::default(), emit),
+    };
+    // Defense in depth: a cloud model is reached only with a confirmed request of a
+    // project that allows the cloud.
+    if decision.cloud && (!step.confirmed || ctx.policy != CloudPolicy::CloudAllowed) {
+        let err = CoreError::consent(CONFIRMATION_REQUIRED);
+        return fail(db, err, "", Some(&decision), Usage::default(), emit);
+    }
+    if cancel.load(Ordering::SeqCst) {
+        let err = CoreError::Cancelled {
+            message: CANCELLED_MESSAGE.to_owned(),
+        };
+        return fail(db, err, "", Some(&decision), Usage::default(), emit);
+    }
+    let client = match client_for(
+        &decision.model,
+        &ctx.settings.base_url,
+        cloud.keys(),
+        cloud.endpoints(),
+    ) {
+        Ok(c) => c,
+        Err(err) => return fail(db, err, "", Some(&decision), Usage::default(), emit),
+    };
 
     emit(ChatEvent::Phase(ChatPhase::Generating));
     let mut content = String::new();
     let mut last_save = Instant::now();
-    let end = client.chat_stream(&chat_model, &prompt, cancel, &mut |delta| {
-        content.push_str(delta);
-        emit(ChatEvent::Delta(delta.to_owned()));
-        if last_save.elapsed() >= PARTIAL_SAVE_EVERY {
-            // Best effort, so a crash keeps what was generated so far.
-            let _ = db.with_store(|s| s.save_partial(id, &content));
-            last_save = Instant::now();
-        }
-    });
+    let (end, usage) = client.chat(
+        &decision.model.model,
+        &searched.prompt,
+        cancel,
+        &mut |delta| {
+            content.push_str(delta);
+            emit(ChatEvent::Delta(delta.to_owned()));
+            if last_save.elapsed() >= PARTIAL_SAVE_EVERY {
+                // Best effort, so a crash keeps what was generated so far.
+                let _ = db.with_store(|s| s.save_partial(id, &content));
+                last_save = Instant::now();
+            }
+        },
+    );
+    let cost = match decision.model.provider {
+        ProviderId::Cloud(_) => db
+            .with_store(|s| s.price_of(&decision.model))
+            .ok()
+            .flatten()
+            .and_then(|p| p.cost_of(&usage, true)),
+        ProviderId::LmStudio => None,
+    };
+    if let Some(provider) = decision.model.provider.cloud() {
+        let error = match &end {
+            StreamEnd::Finished => None,
+            StreamEnd::Cancelled => Some(CANCELLED_MESSAGE.to_owned()),
+            StreamEnd::Failed(err) => Some(err.to_string()),
+        };
+        let _ = db.with_store(|s| {
+            s.log_cloud_request(&CloudLogEntry {
+                provider,
+                model: Some(decision.model.model.clone()),
+                purpose: CloudPurpose::Chat,
+                project_id: Some(ctx.project_id.clone()),
+                conversation_id: Some(input.conversation_id.clone()),
+                chars_sent: prompt_chars(&searched.prompt),
+                usage,
+                cost: cost.clone(),
+                error,
+            })
+        });
+    }
     match end {
         StreamEnd::Finished => {
-            let cited = valid_citations(&content, evidence.len());
+            let cited = valid_citations(&content, evidence_count);
             let message = db.with_store(|s| {
                 s.finish_message(
                     id,
@@ -1701,7 +2189,9 @@ fn run_turn<A: StoreAccess>(
                         content: &content,
                         status: MessageStatus::Complete,
                         error: None,
-                        model: Some(&chat_model),
+                        route: Some(&decision),
+                        usage,
+                        cost: cost.as_ref(),
                         cited: &cited,
                         candidates: &[],
                     },
@@ -1710,18 +2200,13 @@ fn run_turn<A: StoreAccess>(
             emit(ChatEvent::Done(message.clone()));
             Ok(message)
         }
-        // Partial answers keep their valid citations clickable too.
         StreamEnd::Cancelled => {
             let err = CoreError::Cancelled {
                 message: CANCELLED_MESSAGE.to_owned(),
             };
-            let cited = valid_citations(&content, evidence.len());
-            fail(db, err, &content, Some(&chat_model), &cited, emit)
+            fail(db, err, &content, Some(&decision), usage, emit)
         }
-        StreamEnd::Failed(err) => {
-            let cited = valid_citations(&content, evidence.len());
-            fail(db, err, &content, Some(&chat_model), &cited, emit)
-        }
+        StreamEnd::Failed(err) => fail(db, err, &content, Some(&decision), usage, emit),
     }
 }
 

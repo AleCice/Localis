@@ -1,8 +1,11 @@
-//! LM Studio connection settings, stored in the `settings` table.
+//! Model settings (LM Studio connection, chat and embedding models, PRISM routing),
+//! stored in the `settings` table. Models are stored as JSON `{"provider", "model"}`.
 
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use serde_json::{json, Value};
 
 use crate::error::{CoreError, Result};
+use crate::providers::{ModelRef, ProviderId};
 use crate::store::Store;
 
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:1234";
@@ -12,19 +15,58 @@ const URL_MAX: usize = 200;
 const KEY_BASE_URL: &str = "llm.base_url";
 const KEY_CHAT_MODEL: &str = "llm.chat_model";
 const KEY_EMBEDDING_MODEL: &str = "llm.embedding_model";
+const KEY_ROUTING: &str = "llm.routing";
+const KEY_AUTO_MODELS: &str = "llm.auto_models";
+/// Max candidates for automatic routing.
+pub const AUTO_MODELS_MAX: usize = 20;
 
 const URL_INVALID: &str =
     "Indirizzo non valido: usa http://127.0.0.1, http://localhost o http://[::1] con una porta (es. http://127.0.0.1:1234).";
 const MODEL_INVALID: &str = "Il nome del modello non è valido.";
+const EMBEDDING_PROVIDER_INVALID: &str =
+    "Questo provider non offre modelli di embedding: scegli LM Studio, OpenAI, Google Gemini o Qwen.";
+const AUTO_MODELS_TOO_MANY: &str = "Troppi modelli candidati (massimo 20).";
+const AUTO_MODELS_EMPTY: &str =
+    "Per l'instradamento automatico aggiungi almeno un modello candidato.";
 
-/// Connection to LM Studio (`LlmSettings` in `src/api/types.ts`).
+/// PRISM routing mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Routing {
+    /// Always `chat_model`.
+    #[default]
+    Manual,
+    /// Picked per question from `auto_models` (see `prism`).
+    Auto,
+}
+
+impl Routing {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Routing::Manual => "manual",
+            Routing::Auto => "auto",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "manual" => Some(Routing::Manual),
+            "auto" => Some(Routing::Auto),
+            _ => None,
+        }
+    }
+}
+
+/// Model settings (`LlmSettings` in `src/api/types.ts`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmSettings {
-    /// Normalized loopback URL without trailing `/`.
+    /// LM Studio: normalized loopback URL without trailing `/`.
     pub base_url: String,
-    pub chat_model: Option<String>,
+    pub chat_model: Option<ModelRef>,
     /// `None` = lexical retrieval only.
-    pub embedding_model: Option<String>,
+    pub embedding_model: Option<ModelRef>,
+    pub routing: Routing,
+    /// Ordered candidates for automatic routing.
+    pub auto_models: Vec<ModelRef>,
 }
 
 impl Default for LlmSettings {
@@ -33,6 +75,8 @@ impl Default for LlmSettings {
             base_url: DEFAULT_BASE_URL.to_owned(),
             chat_model: None,
             embedding_model: None,
+            routing: Routing::Manual,
+            auto_models: Vec::new(),
         }
     }
 }
@@ -102,18 +146,84 @@ pub fn validate_base_url(raw: &str) -> Result<String> {
     })
 }
 
-fn validate_model(raw: Option<&str>) -> Result<Option<String>> {
-    let Some(model) = raw.map(str::trim).filter(|m| !m.is_empty()) else {
-        return Ok(None);
-    };
-    if model.chars().count() > MODEL_ID_MAX || model.chars().any(char::is_control) {
-        return Err(CoreError::validation("model", MODEL_INVALID));
+/// Validates a model id (trimmed, not empty, no control characters).
+pub(crate) fn validate_model_id(raw: &str, field: &'static str) -> Result<String> {
+    let model = raw.trim();
+    if model.is_empty() || model.chars().count() > MODEL_ID_MAX || model.chars().any(char::is_control)
+    {
+        return Err(CoreError::validation(field, MODEL_INVALID));
     }
-    Ok(Some(model.to_owned()))
+    Ok(model.to_owned())
+}
+
+fn validate_ref(model: &Option<ModelRef>, field: &'static str) -> Result<Option<ModelRef>> {
+    match model {
+        None => Ok(None),
+        // An empty id means "none chosen".
+        Some(m) if m.model.trim().is_empty() => Ok(None),
+        Some(m) => Ok(Some(ModelRef {
+            provider: m.provider,
+            model: validate_model_id(&m.model, field)?,
+        })),
+    }
+}
+
+fn ref_to_json(m: &ModelRef) -> String {
+    json!({ "provider": m.provider.as_str(), "model": m.model }).to_string()
+}
+
+fn ref_from_value(v: &Value) -> Option<ModelRef> {
+    let provider = ProviderId::parse(v.get("provider")?.as_str()?)?;
+    let model = v.get("model")?.as_str()?.trim();
+    (!model.is_empty()).then(|| ModelRef::new(provider, model))
+}
+
+/// A stored model: JSON `{provider, model}`; anything else is ignored (treated as none).
+fn ref_from_stored(raw: &str) -> Option<ModelRef> {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .as_ref()
+        .and_then(ref_from_value)
+}
+
+/// Validates settings as saved by [`Store::set_llm_settings`].
+pub fn validate_llm_settings(input: &LlmSettings) -> Result<LlmSettings> {
+    let chat_model = validate_ref(&input.chat_model, "chatModel")?;
+    let embedding_model = validate_ref(&input.embedding_model, "embeddingModel")?;
+    if let Some(m) = &embedding_model {
+        if !m.provider.supports_embeddings() {
+            return Err(CoreError::validation(
+                "embeddingModel",
+                EMBEDDING_PROVIDER_INVALID,
+            ));
+        }
+    }
+    let mut auto_models: Vec<ModelRef> = Vec::new();
+    for m in &input.auto_models {
+        let Some(m) = validate_ref(&Some(m.clone()), "autoModels")? else {
+            continue;
+        };
+        if !auto_models.contains(&m) {
+            auto_models.push(m);
+        }
+    }
+    if auto_models.len() > AUTO_MODELS_MAX {
+        return Err(CoreError::validation("autoModels", AUTO_MODELS_TOO_MANY));
+    }
+    if input.routing == Routing::Auto && auto_models.is_empty() {
+        return Err(CoreError::validation("autoModels", AUTO_MODELS_EMPTY));
+    }
+    Ok(LlmSettings {
+        base_url: validate_base_url(&input.base_url)?,
+        chat_model,
+        embedding_model,
+        routing: input.routing,
+        auto_models,
+    })
 }
 
 impl Store {
-    fn setting(&self, key: &str) -> Result<Option<String>> {
+    pub(crate) fn setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn
             .query_row(
@@ -124,35 +234,61 @@ impl Store {
             .optional()?)
     }
 
-    /// Current LM Studio settings (defaults when never saved).
+    /// Current model settings (defaults when never saved).
     pub fn llm_settings(&self) -> Result<LlmSettings> {
         let base_url = self
             .setting(KEY_BASE_URL)?
             .and_then(|u| validate_base_url(&u).ok())
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+        let auto_models = self
+            .setting(KEY_AUTO_MODELS)?
+            .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+            .map(|items| items.iter().filter_map(ref_from_value).collect())
+            .unwrap_or_default();
         Ok(LlmSettings {
             base_url,
-            chat_model: self.setting(KEY_CHAT_MODEL)?.filter(|m| !m.is_empty()),
-            embedding_model: self.setting(KEY_EMBEDDING_MODEL)?.filter(|m| !m.is_empty()),
+            chat_model: self
+                .setting(KEY_CHAT_MODEL)?
+                .as_deref()
+                .and_then(ref_from_stored),
+            embedding_model: self
+                .setting(KEY_EMBEDDING_MODEL)?
+                .as_deref()
+                .and_then(ref_from_stored)
+                .filter(|m| m.provider.supports_embeddings()),
+            routing: self
+                .setting(KEY_ROUTING)?
+                .as_deref()
+                .and_then(Routing::parse)
+                .unwrap_or_default(),
+            auto_models,
         })
     }
 
-    /// Validates (loopback http only) and saves the settings; returns them normalized.
+    /// Validates (loopback http only for LM Studio) and saves the settings; returns them
+    /// normalized.
     pub fn set_llm_settings(&mut self, input: &LlmSettings) -> Result<LlmSettings> {
-        let settings = LlmSettings {
-            base_url: validate_base_url(&input.base_url)?,
-            chat_model: validate_model(input.chat_model.as_deref())
-                .map_err(|_| CoreError::validation("chatModel", MODEL_INVALID))?,
-            embedding_model: validate_model(input.embedding_model.as_deref())
-                .map_err(|_| CoreError::validation("embeddingModel", MODEL_INVALID))?,
-        };
+        let settings = validate_llm_settings(input)?;
+        let auto = Value::from(
+            settings
+                .auto_models
+                .iter()
+                .map(|m| json!({ "provider": m.provider.as_str(), "model": m.model }))
+                .collect::<Vec<_>>(),
+        )
+        .to_string();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (key, value) in [
-            (KEY_BASE_URL, Some(settings.base_url.as_str())),
-            (KEY_CHAT_MODEL, settings.chat_model.as_deref()),
-            (KEY_EMBEDDING_MODEL, settings.embedding_model.as_deref()),
+            (KEY_BASE_URL, Some(settings.base_url.clone())),
+            (KEY_CHAT_MODEL, settings.chat_model.as_ref().map(ref_to_json)),
+            (
+                KEY_EMBEDDING_MODEL,
+                settings.embedding_model.as_ref().map(ref_to_json),
+            ),
+            (KEY_ROUTING, Some(settings.routing.as_str().to_owned())),
+            (KEY_AUTO_MODELS, Some(auto)),
         ] {
             match value {
                 Some(v) => tx.execute(
@@ -171,6 +307,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::CloudProvider;
 
     #[test]
     fn accepted_urls_are_normalized() {
@@ -244,16 +381,27 @@ mod tests {
         let saved = store
             .set_llm_settings(&LlmSettings {
                 base_url: "http://localhost:4321/".into(),
-                chat_model: Some("  qwen  ".into()),
-                embedding_model: Some("".into()),
+                chat_model: Some(ModelRef::lmstudio("  qwen  ")),
+                embedding_model: Some(ModelRef::lmstudio("")),
+                routing: Routing::Auto,
+                auto_models: vec![
+                    ModelRef::lmstudio("qwen"),
+                    ModelRef::new(ProviderId::Cloud(CloudProvider::OpenAi), "gpt-x"),
+                    ModelRef::lmstudio(" qwen "),
+                ],
             })
             .unwrap();
         assert_eq!(
             saved,
             LlmSettings {
                 base_url: "http://localhost:4321".into(),
-                chat_model: Some("qwen".into()),
+                chat_model: Some(ModelRef::lmstudio("qwen")),
                 embedding_model: None,
+                routing: Routing::Auto,
+                auto_models: vec![
+                    ModelRef::lmstudio("qwen"),
+                    ModelRef::new(ProviderId::Cloud(CloudProvider::OpenAi), "gpt-x"),
+                ],
             }
         );
         assert_eq!(store.llm_settings().unwrap(), saved);
@@ -277,7 +425,7 @@ mod tests {
         );
         let err = store
             .set_llm_settings(&LlmSettings {
-                chat_model: Some("a\u{0}b".into()),
+                chat_model: Some(ModelRef::lmstudio("a\u{0}b")),
                 ..LlmSettings::default()
             })
             .unwrap_err();
@@ -288,5 +436,64 @@ mod tests {
                 ..
             }
         ));
+        for (input, field) in [
+            (
+                LlmSettings {
+                    embedding_model: Some(ModelRef::new(
+                        ProviderId::Cloud(CloudProvider::Anthropic),
+                        "claude",
+                    )),
+                    ..LlmSettings::default()
+                },
+                "embeddingModel",
+            ),
+            (
+                LlmSettings {
+                    routing: Routing::Auto,
+                    ..LlmSettings::default()
+                },
+                "autoModels",
+            ),
+            (
+                LlmSettings {
+                    auto_models: (0..=AUTO_MODELS_MAX)
+                        .map(|i| ModelRef::lmstudio(&format!("m{i}")))
+                        .collect(),
+                    ..LlmSettings::default()
+                },
+                "autoModels",
+            ),
+        ] {
+            let err = store.set_llm_settings(&input).unwrap_err();
+            assert!(
+                matches!(err, CoreError::Validation { field: f, .. } if f == field),
+                "{err:?}"
+            );
+        }
+        assert_eq!(store.llm_settings().unwrap(), saved);
+    }
+
+    #[test]
+    fn unreadable_stored_models_are_ignored() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO settings VALUES ('llm.chat_model', 'not json');
+                 INSERT INTO settings VALUES ('llm.embedding_model',
+                     '{\"provider\":\"deepseek\",\"model\":\"x\"}');
+                 INSERT INTO settings VALUES ('llm.routing', 'weird');
+                 INSERT INTO settings VALUES ('llm.auto_models',
+                     '[{\"provider\":\"nope\",\"model\":\"a\"},{\"provider\":\"gemini\",\"model\":\"g\"}]');",
+            )
+            .unwrap();
+        let s = store.llm_settings().unwrap();
+        assert_eq!(s.chat_model, None);
+        assert_eq!(s.embedding_model, None, "DeepSeek has no embeddings");
+        assert_eq!(s.routing, Routing::Manual);
+        assert_eq!(
+            s.auto_models,
+            [ModelRef::new(ProviderId::Cloud(CloudProvider::Gemini), "g")]
+        );
     }
 }

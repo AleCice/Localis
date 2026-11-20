@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-discard-cloud-send"
+description = "Enables the discard_cloud_send command without any pre-configured scope."
+commands.allow = ["discard_cloud_send"]
+
+[[permission]]
+identifier = "deny-discard-cloud-send"
+description = "Denies the discard_cloud_send command without any pre-configured scope."
+commands.deny = ["discard_cloud_send"]

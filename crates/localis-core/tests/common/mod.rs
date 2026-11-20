@@ -9,6 +9,7 @@ use localis_core::{ImportFile, ImportOutcome, LibraryDocument, NewProject, Proje
 use tempfile::TempDir;
 
 pub mod fake_lm;
+pub mod keys;
 
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 

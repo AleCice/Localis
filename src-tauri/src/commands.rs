@@ -2,10 +2,13 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use localis_core::{
-    Candidate, ChatEvent, ChatMessage, ChatRuntime, Conversation, CoreError, DocumentVersion,
-    EmbedderShared, EmbeddingStatus, Folder, ImportFile, ImportOutcome, Job, LibraryDocument,
-    LlmClient, LlmSettings, LlmStatus, ModelInfo, NewFolder, NewProject, Project, RetrievalInfo,
-    SearchHit, SendInput, Source, Store, StoreAccess, TextUnit,
+    Candidate, ChatEvent, ChatMessage, ChatRuntime, CloudClient, CloudEmbeddingEstimate,
+    CloudLogEntry, CloudPolicy, CloudPreview, CloudProvider, CloudPurpose, CloudRequest,
+    CloudRuntime, Conversation, CoreError, DocumentVersion, EmbedderShared, EmbeddingStatus,
+    Endpoints, Folder, ImportFile, ImportOutcome, Job, KeyringStatus, LibraryDocument, LlmClient,
+    LlmSettings, LlmStatus, ModelClient, ModelInfo, ModelPrice, ModelRef, Money, NewFolder,
+    NewProject, PreviewSource, Project, ProviderId, RetrievalInfo, RouteDecision, Routing,
+    SearchHit, SendInput, Source, Store, StoreAccess, SystemKeyring, TextUnit, Usage,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, Request, Response};
@@ -30,6 +33,8 @@ pub struct AppState {
     embedder: Option<SyncSender<()>>,
     /// What the embedder last reported (default: not running).
     pub(crate) embedder_status: Arc<EmbedderShared>,
+    /// Keychain, cloud endpoints and prepared cloud requests awaiting confirmation.
+    pub(crate) cloud: CloudRuntime,
 }
 
 impl AppState {
@@ -42,7 +47,14 @@ impl AppState {
             chat: ChatRuntime::new(),
             embedder: None,
             embedder_status: EmbedderShared::new(),
+            cloud: CloudRuntime::new(Arc::new(SystemKeyring::new()), Endpoints::from_env()),
         }
+    }
+
+    /// Uses `cloud` (keychain and endpoints shared with the embedder).
+    pub fn with_cloud(mut self, cloud: CloudRuntime) -> Self {
+        self.cloud = cloud;
+        self
     }
 
     pub fn with_embedder(mut self, wake: SyncSender<()>, status: Arc<EmbedderShared>) -> Self {
@@ -118,6 +130,8 @@ pub struct ProjectDto {
     pub description: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub cloud_policy: &'static str,
+    pub cloud_embedding_consent: bool,
 }
 
 impl From<Project> for ProjectDto {
@@ -128,6 +142,8 @@ impl From<Project> for ProjectDto {
             description: p.description,
             created_at: p.created_at,
             updated_at: p.updated_at,
+            cloud_policy: p.cloud_policy.as_str(),
+            cloud_embedding_consent: p.cloud_embedding_consent,
         }
     }
 }
@@ -538,34 +554,93 @@ pub async fn retry_job(state: State<'_, AppState>, id: i64) -> Result<JobDto, Ap
 
 // ---------------------------------------------------------------- v0.3 Local chat
 
+/// `ModelRef` in `src/api/types.ts` (input and output).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRefDto {
+    pub provider: String,
+    pub model: String,
+}
+
+impl From<ModelRef> for ModelRefDto {
+    fn from(m: ModelRef) -> Self {
+        ModelRefDto {
+            provider: m.provider.as_str().to_owned(),
+            model: m.model,
+        }
+    }
+}
+
+impl ModelRefDto {
+    fn parse(self, field: &'static str) -> Result<ModelRef, AppError> {
+        let provider = ProviderId::parse(&self.provider).ok_or_else(|| {
+            AppError::from(CoreError::Validation {
+                field,
+                message: "Provider non valido.".to_owned(),
+            })
+        })?;
+        Ok(ModelRef {
+            provider,
+            model: self.model,
+        })
+    }
+}
+
+fn default_routing() -> String {
+    "manual".to_owned()
+}
+
 /// `LlmSettings` in `src/api/types.ts` (input and output).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmSettingsDto {
     pub base_url: String,
     #[serde(default)]
-    pub chat_model: Option<String>,
+    pub chat_model: Option<ModelRefDto>,
     #[serde(default)]
-    pub embedding_model: Option<String>,
+    pub embedding_model: Option<ModelRefDto>,
+    #[serde(default = "default_routing")]
+    pub routing: String,
+    #[serde(default)]
+    pub auto_models: Vec<ModelRefDto>,
 }
 
 impl From<LlmSettings> for LlmSettingsDto {
     fn from(s: LlmSettings) -> Self {
         LlmSettingsDto {
             base_url: s.base_url,
-            chat_model: s.chat_model,
-            embedding_model: s.embedding_model,
+            chat_model: s.chat_model.map(ModelRefDto::from),
+            embedding_model: s.embedding_model.map(ModelRefDto::from),
+            routing: s.routing.as_str().to_owned(),
+            auto_models: map_all(s.auto_models),
         }
     }
 }
 
-impl From<LlmSettingsDto> for LlmSettings {
-    fn from(s: LlmSettingsDto) -> Self {
-        LlmSettings {
+impl TryFrom<LlmSettingsDto> for LlmSettings {
+    type Error = AppError;
+
+    fn try_from(s: LlmSettingsDto) -> Result<Self, AppError> {
+        let routing = Routing::parse(&s.routing).ok_or_else(|| {
+            AppError::from(CoreError::Validation {
+                field: "routing",
+                message: "Modalità di instradamento non valida.".to_owned(),
+            })
+        })?;
+        Ok(LlmSettings {
             base_url: s.base_url,
-            chat_model: s.chat_model,
-            embedding_model: s.embedding_model,
-        }
+            chat_model: s.chat_model.map(|m| m.parse("chatModel")).transpose()?,
+            embedding_model: s
+                .embedding_model
+                .map(|m| m.parse("embeddingModel"))
+                .transpose()?,
+            routing,
+            auto_models: s
+                .auto_models
+                .into_iter()
+                .map(|m| m.parse("autoModels"))
+                .collect::<Result<_, _>>()?,
+        })
     }
 }
 
@@ -614,6 +689,7 @@ impl From<LlmStatus> for LlmStatusDto {
 #[serde(rename_all = "camelCase")]
 pub struct EmbeddingStatusDto {
     pub state: &'static str,
+    pub provider: Option<&'static str>,
     pub model: Option<String>,
     pub total: u64,
     pub embedded: u64,
@@ -624,6 +700,7 @@ impl From<EmbeddingStatus> for EmbeddingStatusDto {
     fn from(s: EmbeddingStatus) -> Self {
         EmbeddingStatusDto {
             state: s.state.as_str(),
+            provider: s.provider.map(ProviderId::as_str),
             model: s.model,
             total: s.total,
             embedded: s.embedded,
@@ -664,6 +741,7 @@ pub struct RetrievalInfoDto {
     pub document_ids: Vec<String>,
     pub scope_reason: Option<&'static str>,
     pub embedding_model: Option<String>,
+    pub embedding_provider: Option<&'static str>,
     pub query: String,
 }
 
@@ -675,6 +753,7 @@ impl From<RetrievalInfo> for RetrievalInfoDto {
             document_ids: r.document_ids,
             scope_reason: r.scope_reason.map(|s| s.as_str()),
             embedding_model: r.embedding_model,
+            embedding_provider: r.embedding_provider.map(ProviderId::as_str),
             query: r.query,
         }
     }
@@ -733,7 +812,7 @@ impl From<Candidate> for CandidateDto {
 }
 
 /// `ChatMessage` in `src/api/types.ts`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessageDto {
     pub id: String,
@@ -744,6 +823,10 @@ pub struct ChatMessageDto {
     pub status: &'static str,
     pub error: Option<AppError>,
     pub model: Option<String>,
+    pub provider: Option<&'static str>,
+    pub route_reason: Option<String>,
+    pub usage: Option<TokenUsageDto>,
+    pub cost: Option<MoneyDto>,
     pub created_at: String,
     pub retrieval: Option<RetrievalInfoDto>,
     pub sources: Vec<SourceDto>,
@@ -761,6 +844,10 @@ impl From<ChatMessage> for ChatMessageDto {
             status: m.status.as_str(),
             error: m.error.as_ref().map(AppError::from),
             model: m.model,
+            provider: m.provider.map(ProviderId::as_str),
+            route_reason: m.route_reason,
+            usage: m.usage.map(TokenUsageDto::from),
+            cost: m.cost.map(MoneyDto::from),
             created_at: m.created_at,
             retrieval: m.retrieval.map(RetrievalInfoDto::from),
             sources: map_all(m.sources),
@@ -777,6 +864,8 @@ pub struct SendMessageInput {
     pub text: String,
     #[serde(default)]
     pub document_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub confirm_token: Option<String>,
 }
 
 impl From<SendMessageInput> for SendInput {
@@ -785,12 +874,13 @@ impl From<SendMessageInput> for SendInput {
             conversation_id: i.conversation_id,
             text: i.text,
             document_ids: i.document_ids.unwrap_or_default(),
+            confirm_token: i.confirm_token.filter(|t| !t.is_empty()),
         }
     }
 }
 
 /// `ChatEvent` in `src/api/types.ts`: tagged by `type`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -861,7 +951,8 @@ pub async fn set_llm_settings(
     state: State<'_, AppState>,
     settings: LlmSettingsDto,
 ) -> Result<LlmSettingsDto, AppError> {
-    let saved = state.with_store(|store| Ok(store.set_llm_settings(&settings.into())?))?;
+    let settings = LlmSettings::try_from(settings)?;
+    let saved = state.with_store(|store| Ok(store.set_llm_settings(&settings)?))?;
     state.wake_embedder();
     Ok(saved.into())
 }
@@ -926,10 +1017,16 @@ pub async fn send_message(
     blocking(move || {
         let state = app.state::<AppState>();
         let state: &AppState = &state;
-        let message = localis_core::send_message(state, &state.chat, input.into(), &mut |e| {
-            // A closed webview just stops receiving events; the answer is still stored.
-            let _ = on_event.send(ChatEventDto::from(e));
-        })?;
+        let message = localis_core::send_message(
+            state,
+            &state.chat,
+            &state.cloud,
+            input.into(),
+            &mut |e| {
+                // A closed webview just stops receiving events; the answer is still stored.
+                let _ = on_event.send(ChatEventDto::from(e));
+            },
+        )?;
         Ok(message.into())
     })
     .await
@@ -943,4 +1040,513 @@ pub async fn cancel_generation(
 ) -> Result<(), AppError> {
     state.chat.cancel(&conversation_id);
     Ok(())
+}
+
+// ---------------------------------------------------------------- v0.4 Cloud
+
+/// `TokenUsage` in `src/api/types.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageDto {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+impl From<Usage> for TokenUsageDto {
+    fn from(u: Usage) -> Self {
+        TokenUsageDto {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        }
+    }
+}
+
+/// `Money` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoneyDto {
+    pub amount: f64,
+    pub currency: String,
+}
+
+impl From<Money> for MoneyDto {
+    fn from(m: Money) -> Self {
+        MoneyDto {
+            amount: m.amount,
+            currency: m.currency,
+        }
+    }
+}
+
+/// `KeyringStatus` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyringStatusDto {
+    pub available: bool,
+    pub message: Option<String>,
+    pub detail: Option<String>,
+}
+
+impl From<KeyringStatus> for KeyringStatusDto {
+    fn from(s: KeyringStatus) -> Self {
+        KeyringStatusDto {
+            available: s.available,
+            message: s.message,
+            detail: s.detail,
+        }
+    }
+}
+
+/// `ProviderInfo` in `src/api/types.ts`. Says whether a key exists, never the key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderInfoDto {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub host: &'static str,
+    pub has_key: bool,
+    pub supports_chat: bool,
+    pub supports_embeddings: bool,
+}
+
+impl ProviderInfoDto {
+    pub fn new(p: CloudProvider, has_key: bool) -> Self {
+        ProviderInfoDto {
+            id: p.as_str(),
+            name: p.name(),
+            host: p.host(),
+            has_key,
+            supports_chat: p.supports_chat(),
+            supports_embeddings: p.supports_embeddings(),
+        }
+    }
+}
+
+/// `ProviderModels` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelsDto {
+    pub provider: &'static str,
+    pub reachable: bool,
+    pub message: Option<String>,
+    pub detail: Option<String>,
+    pub models: Vec<ModelInfoDto>,
+}
+
+/// `ModelPrice` in `src/api/types.ts` (input and output).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPriceDto {
+    pub provider: String,
+    pub model: String,
+    pub input_per_m_tok: f64,
+    pub output_per_m_tok: f64,
+    pub currency: String,
+}
+
+impl From<ModelPrice> for ModelPriceDto {
+    fn from(p: ModelPrice) -> Self {
+        ModelPriceDto {
+            provider: p.provider.as_str().to_owned(),
+            model: p.model,
+            input_per_m_tok: p.input_per_mtok,
+            output_per_m_tok: p.output_per_mtok,
+            currency: p.currency,
+        }
+    }
+}
+
+impl TryFrom<ModelPriceDto> for ModelPrice {
+    type Error = AppError;
+
+    fn try_from(p: ModelPriceDto) -> Result<Self, AppError> {
+        Ok(ModelPrice {
+            provider: parse_cloud_provider(&p.provider)?,
+            model: p.model,
+            input_per_mtok: p.input_per_m_tok,
+            output_per_mtok: p.output_per_m_tok,
+            currency: p.currency,
+        })
+    }
+}
+
+/// `RouteDecision` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteDecisionDto {
+    pub model: ModelRefDto,
+    pub cloud: bool,
+    pub reason: String,
+}
+
+impl From<RouteDecision> for RouteDecisionDto {
+    fn from(r: RouteDecision) -> Self {
+        RouteDecisionDto {
+            model: r.model.into(),
+            cloud: r.cloud,
+            reason: r.reason,
+        }
+    }
+}
+
+/// Element of `CloudPreview.sources`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewSourceDto {
+    pub n: u32,
+    pub title: String,
+    pub unit: u32,
+    pub unit_kind: &'static str,
+    pub chars: u64,
+    pub via: &'static str,
+}
+
+impl From<PreviewSource> for PreviewSourceDto {
+    fn from(s: PreviewSource) -> Self {
+        PreviewSourceDto {
+            n: s.n,
+            title: s.title,
+            unit: s.unit,
+            unit_kind: s.unit_kind.as_str(),
+            chars: s.chars,
+            via: s.via.as_str(),
+        }
+    }
+}
+
+/// `CloudPreview.estCost`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EstCostDto {
+    pub min: MoneyDto,
+    pub max: MoneyDto,
+}
+
+/// `CloudPreview` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudPreviewDto {
+    pub token: String,
+    pub route: RouteDecisionDto,
+    pub provider_name: String,
+    pub host: String,
+    pub question: String,
+    pub sources: Vec<PreviewSourceDto>,
+    pub history_pairs: u32,
+    pub history_chars: u64,
+    pub total_chars: u64,
+    pub est_input_tokens: u64,
+    pub max_output_tokens: u64,
+    pub est_cost: Option<EstCostDto>,
+    pub query_embedded_by: Option<ModelRefDto>,
+    pub expires_at: String,
+}
+
+impl From<CloudPreview> for CloudPreviewDto {
+    fn from(p: CloudPreview) -> Self {
+        CloudPreviewDto {
+            token: p.token,
+            route: p.route.into(),
+            provider_name: p.provider_name,
+            host: p.host,
+            question: p.question,
+            sources: map_all(p.sources),
+            history_pairs: p.history_pairs,
+            history_chars: p.history_chars,
+            total_chars: p.total_chars,
+            est_input_tokens: p.est_input_tokens,
+            max_output_tokens: p.max_output_tokens,
+            est_cost: p.est_cost.map(|(min, max)| EstCostDto {
+                min: min.into(),
+                max: max.into(),
+            }),
+            query_embedded_by: p.query_embedded_by.map(ModelRefDto::from),
+            expires_at: p.expires_at,
+        }
+    }
+}
+
+/// `CloudEmbeddingEstimate` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudEmbeddingEstimateDto {
+    pub provider: &'static str,
+    pub model: String,
+    pub chunks: u64,
+    pub chars: u64,
+    pub est_tokens: u64,
+    pub est_cost: Option<MoneyDto>,
+}
+
+impl From<CloudEmbeddingEstimate> for CloudEmbeddingEstimateDto {
+    fn from(e: CloudEmbeddingEstimate) -> Self {
+        CloudEmbeddingEstimateDto {
+            provider: e.provider.as_str(),
+            model: e.model,
+            chunks: e.chunks,
+            chars: e.chars,
+            est_tokens: e.est_tokens,
+            est_cost: e.est_cost.map(MoneyDto::from),
+        }
+    }
+}
+
+/// `CloudRequest` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudRequestDto {
+    pub id: i64,
+    pub created_at: String,
+    pub provider: &'static str,
+    pub model: Option<String>,
+    pub purpose: &'static str,
+    pub project_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub chars_sent: u64,
+    pub usage: Option<TokenUsageDto>,
+    pub cost: Option<MoneyDto>,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+impl From<CloudRequest> for CloudRequestDto {
+    fn from(r: CloudRequest) -> Self {
+        CloudRequestDto {
+            id: r.id,
+            created_at: r.created_at,
+            provider: r.provider.as_str(),
+            model: r.model,
+            purpose: r.purpose.as_str(),
+            project_id: r.project_id,
+            conversation_id: r.conversation_id,
+            chars_sent: r.chars_sent,
+            usage: r.usage.map(TokenUsageDto::from),
+            cost: r.cost.map(MoneyDto::from),
+            ok: r.ok,
+            error: r.error,
+        }
+    }
+}
+
+fn parse_cloud_provider(raw: &str) -> Result<CloudProvider, AppError> {
+    Ok(CloudProvider::parse_field(raw, "provider")?)
+}
+
+/// Default number of log entries returned.
+const CLOUD_LOG_DEFAULT: usize = 100;
+
+fn provider_info(state: &AppState, provider: CloudProvider) -> ProviderInfoDto {
+    // An unreadable keychain counts as "no key" here; get_keyring_status explains why.
+    let has_key = matches!(state.cloud.keys().get(provider), Ok(Some(_)));
+    ProviderInfoDto::new(provider, has_key)
+}
+
+/// Probes the system keychain (may talk to the OS keychain service).
+#[tauri::command]
+pub async fn get_keyring_status(app: AppHandle) -> Result<KeyringStatusDto, AppError> {
+    blocking(move || {
+        let state = app.state::<AppState>();
+        Ok(state.cloud.keys().status().into())
+    })
+    .await
+}
+
+/// The five cloud providers, with whether a key is stored (never the key itself).
+#[tauri::command]
+pub async fn list_providers(app: AppHandle) -> Result<Vec<ProviderInfoDto>, AppError> {
+    blocking(move || {
+        let state = app.state::<AppState>();
+        Ok(CloudProvider::ALL
+            .into_iter()
+            .map(|p| provider_info(&state, p))
+            .collect())
+    })
+    .await
+}
+
+/// Stores the key in the system keychain only; `keyring_unavailable` when it cannot be
+/// used (no plaintext fallback). The key is never returned, logged or stored elsewhere.
+#[tauri::command]
+pub async fn set_api_key(
+    app: AppHandle,
+    provider: String,
+    key: String,
+) -> Result<ProviderInfoDto, AppError> {
+    let provider = parse_cloud_provider(&provider)?;
+    blocking(move || {
+        let state = app.state::<AppState>();
+        let key = localis_core::validate_api_key(&key)?;
+        state.cloud.keys().set(provider, &key)?;
+        drop(key);
+        state.wake_embedder();
+        Ok(provider_info(&state, provider))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_api_key(app: AppHandle, provider: String) -> Result<ProviderInfoDto, AppError> {
+    let provider = parse_cloud_provider(&provider)?;
+    blocking(move || {
+        let state = app.state::<AppState>();
+        state.cloud.keys().delete(provider)?;
+        Ok(provider_info(&state, provider))
+    })
+    .await
+}
+
+/// Contacts the provider with its key only (logged as `list_models`). Without a key no
+/// request is made.
+#[tauri::command]
+pub async fn list_provider_models(
+    app: AppHandle,
+    provider: String,
+) -> Result<ProviderModelsDto, AppError> {
+    let provider = parse_cloud_provider(&provider)?;
+    blocking(move || {
+        let state = app.state::<AppState>();
+        let Some(key) = state.cloud.keys().get(provider)? else {
+            return Ok(ProviderModelsDto {
+                provider: provider.as_str(),
+                reachable: false,
+                message: Some(localis_core::missing_key_message(provider)),
+                detail: None,
+                models: Vec::new(),
+            });
+        };
+        let client = CloudClient::new(provider, key, state.cloud.endpoints().clone());
+        let result = client.list_models();
+        drop(client);
+        let _ = state.with_store(|s| {
+            Ok(s.log_cloud_request(&CloudLogEntry {
+                provider,
+                model: None,
+                purpose: CloudPurpose::ListModels,
+                project_id: None,
+                conversation_id: None,
+                chars_sent: 0,
+                usage: Usage::default(),
+                cost: None,
+                error: result.as_ref().err().map(|e| e.to_string()),
+            })?)
+        });
+        Ok(match result {
+            Ok(models) => ProviderModelsDto {
+                provider: provider.as_str(),
+                reachable: true,
+                message: None,
+                detail: None,
+                models: map_all(models),
+            },
+            Err(err) => ProviderModelsDto {
+                provider: provider.as_str(),
+                reachable: false,
+                message: Some(err.to_string()),
+                detail: err.detail().map(str::to_owned),
+                models: Vec::new(),
+            },
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_prices(state: State<'_, AppState>) -> Result<Vec<ModelPriceDto>, AppError> {
+    state.with_store(|store| Ok(map_all(store.list_prices()?)))
+}
+
+#[tauri::command]
+pub async fn set_price(
+    state: State<'_, AppState>,
+    price: ModelPriceDto,
+) -> Result<Vec<ModelPriceDto>, AppError> {
+    let price = ModelPrice::try_from(price)?;
+    state.with_store(|store| Ok(map_all(store.set_price(&price)?)))
+}
+
+#[tauri::command]
+pub async fn delete_price(
+    state: State<'_, AppState>,
+    provider: String,
+    model: String,
+) -> Result<Vec<ModelPriceDto>, AppError> {
+    let provider = parse_cloud_provider(&provider)?;
+    state.with_store(|store| Ok(map_all(store.delete_price(provider, &model)?)))
+}
+
+/// `local_only` also revokes the cloud indexing consent; wakes the embedder.
+#[tauri::command]
+pub async fn set_project_cloud_policy(
+    state: State<'_, AppState>,
+    project_id: String,
+    policy: String,
+) -> Result<ProjectDto, AppError> {
+    let policy = CloudPolicy::parse(&policy).ok_or_else(|| {
+        AppError::from(CoreError::Validation {
+            field: "policy",
+            message: "Scelta non valida per l'uso del cloud.".to_owned(),
+        })
+    })?;
+    let project =
+        state.with_store(|store| Ok(store.set_project_cloud_policy(&project_id, policy)?))?;
+    state.wake_embedder();
+    Ok(project.into())
+}
+
+/// `null` when the configured embedding model is not a cloud model.
+#[tauri::command]
+pub async fn estimate_cloud_embedding(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Option<CloudEmbeddingEstimateDto>, AppError> {
+    state.with_store(|store| {
+        Ok(store
+            .estimate_cloud_embedding(&project_id)?
+            .map(CloudEmbeddingEstimateDto::from))
+    })
+}
+
+#[tauri::command]
+pub async fn set_cloud_embedding_consent(
+    state: State<'_, AppState>,
+    project_id: String,
+    consent: bool,
+) -> Result<ProjectDto, AppError> {
+    let project =
+        state.with_store(|store| Ok(store.set_cloud_embedding_consent(&project_id, consent)?))?;
+    state.wake_embedder();
+    Ok(project.into())
+}
+
+/// Retrieval + routing without storing anything or calling a chat model; `null` when no
+/// cloud send is needed. Runs on a blocking thread (may contact LM Studio, and the cloud
+/// embedding provider for projects that consented).
+#[tauri::command]
+pub async fn prepare_cloud_send(
+    app: AppHandle,
+    input: SendMessageInput,
+) -> Result<Option<CloudPreviewDto>, AppError> {
+    blocking(move || {
+        let state = app.state::<AppState>();
+        let state: &AppState = &state;
+        let preview = localis_core::prepare_cloud_send(state, &state.cloud, &input.into())?;
+        Ok(preview.map(CloudPreviewDto::from))
+    })
+    .await
+}
+
+/// Drops a prepared request the user did not confirm (no-op when unknown).
+#[tauri::command]
+pub async fn discard_cloud_send(state: State<'_, AppState>, token: String) -> Result<(), AppError> {
+    state.cloud.discard(&token);
+    Ok(())
+}
+
+/// Most recent first.
+#[tauri::command]
+pub async fn list_cloud_requests(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<CloudRequestDto>, AppError> {
+    let limit = limit.unwrap_or(CLOUD_LOG_DEFAULT);
+    state.with_store(|store| Ok(map_all(store.list_cloud_requests(limit)?)))
 }

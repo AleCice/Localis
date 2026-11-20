@@ -1,10 +1,11 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{params, Connection, ErrorCode, TransactionBehavior};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBehavior};
 
 use crate::blobs::BlobStore;
 use crate::error::{CoreError, Result};
+use crate::providers::CloudPolicy;
 use crate::validation::{name_key, validate_description, validate_name};
 
 /// Ordered schema migrations. Migration `i` (0-based) brings `user_version` to `i + 1`.
@@ -204,6 +205,58 @@ const MIGRATIONS: &[&str] = &[
         title        TEXT NOT NULL,
         PRIMARY KEY (message_id, position)
     );",
+    // 4: optional cloud (Model Mesh + PRISM): project policy and consent, models stored as
+    // {provider, model}, embeddings keyed by provider:model, prices, cloud request log.
+    // No column ever holds an API key (they live in the system keychain).
+    "ALTER TABLE projects ADD COLUMN cloud_policy TEXT NOT NULL DEFAULT 'local_only'
+        CHECK (cloud_policy IN ('local_only', 'cloud_allowed'));
+    ALTER TABLE projects ADD COLUMN cloud_embedding_consent INTEGER NOT NULL DEFAULT 0
+        CHECK (cloud_embedding_consent IN (0, 1));
+
+    UPDATE settings SET value = json_object('provider', 'lmstudio', 'model', value)
+    WHERE key IN ('llm.chat_model', 'llm.embedding_model');
+
+    UPDATE chunk_embeddings SET model = 'lmstudio:' || model;
+
+    ALTER TABLE messages ADD COLUMN provider TEXT;
+    ALTER TABLE messages ADD COLUMN route_reason TEXT;
+    ALTER TABLE messages ADD COLUMN input_tokens INTEGER;
+    ALTER TABLE messages ADD COLUMN output_tokens INTEGER;
+    ALTER TABLE messages ADD COLUMN cost_amount REAL;
+    ALTER TABLE messages ADD COLUMN cost_currency TEXT;
+    ALTER TABLE messages ADD COLUMN embedding_provider TEXT;
+    UPDATE messages SET provider = 'lmstudio' WHERE model IS NOT NULL;
+    UPDATE messages SET embedding_provider = 'lmstudio' WHERE embedding_model IS NOT NULL;
+
+    CREATE TABLE model_prices (
+        provider         TEXT NOT NULL,
+        model            TEXT NOT NULL,
+        input_per_mtok   REAL NOT NULL CHECK (input_per_mtok >= 0),
+        output_per_mtok  REAL NOT NULL CHECK (output_per_mtok >= 0),
+        currency         TEXT NOT NULL,
+        updated_at       TEXT NOT NULL,
+        PRIMARY KEY (provider, model)
+    );
+
+    CREATE TABLE cloud_requests (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at       TEXT NOT NULL,
+        provider         TEXT NOT NULL,
+        model            TEXT,
+        purpose          TEXT NOT NULL CHECK (purpose IN
+                             ('chat', 'query_embedding', 'index_embedding', 'list_models')),
+        project_id       TEXT REFERENCES projects (id) ON DELETE SET NULL,
+        conversation_id  TEXT REFERENCES conversations (id) ON DELETE SET NULL,
+        chars_sent       INTEGER NOT NULL CHECK (chars_sent >= 0),
+        input_tokens     INTEGER,
+        output_tokens    INTEGER,
+        cost_amount      REAL,
+        cost_currency    TEXT,
+        ok               INTEGER NOT NULL CHECK (ok IN (0, 1)),
+        error            TEXT
+    );
+    CREATE INDEX cloud_requests_project ON cloud_requests (project_id);
+    CREATE INDEX cloud_requests_conversation ON cloud_requests (conversation_id);",
 ];
 
 /// Schema version this build of the app knows about.
@@ -215,6 +268,10 @@ const NEWER_SCHEMA_MESSAGE: &str =
     "Il database è stato creato da una versione più recente di Localis.";
 const DUPLICATE_MESSAGE: &str = "Esiste già un progetto con questo nome.";
 const NOT_FOUND_MESSAGE: &str = "Il progetto non esiste più.";
+const CONSENT_NEEDS_CLOUD: &str =
+    "Per dare il consenso all'indicizzazione cloud consenti prima l'uso del cloud nel progetto.";
+const PROJECT_COLUMNS: &str =
+    "id, name, description, created_at, updated_at, cloud_policy, cloud_embedding_consent";
 
 /// A project as stored in the database.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +284,10 @@ pub struct Project {
     pub created_at: String,
     /// ISO 8601 UTC with milliseconds.
     pub updated_at: String,
+    /// `LocalOnly` (default): nothing of the project is ever sent to a cloud provider.
+    pub cloud_policy: CloudPolicy,
+    /// Consent to index the project's passages with the configured cloud embedding model.
+    pub cloud_embedding_consent: bool,
 }
 
 /// Unvalidated input for [`Store::create_project`].
@@ -385,11 +446,10 @@ impl Store {
 
     /// All projects, most recently updated first (then most recently created, then id).
     pub fn list_projects(&self) -> Result<Vec<Project>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, description, created_at, updated_at
-             FROM projects
-             ORDER BY updated_at DESC, created_at DESC, id ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM projects
+             ORDER BY updated_at DESC, created_at DESC, id ASC"
+        ))?;
         let rows = stmt.query_map([], row_to_project)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -428,6 +488,8 @@ impl Store {
             description,
             created_at: now.clone(),
             updated_at: now,
+            cloud_policy: CloudPolicy::LocalOnly,
+            cloud_embedding_consent: false,
         };
         tx.execute(
             "INSERT INTO projects (id, name, description, created_at, updated_at)
@@ -472,6 +534,50 @@ impl Store {
         Ok(())
     }
 
+    pub fn get_project(&self, id: &str) -> Result<Project> {
+        self.conn
+            .query_row(
+                &format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1"),
+                params![id],
+                row_to_project,
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::not_found(NOT_FOUND_MESSAGE))
+    }
+
+    /// Sets whether the project may use cloud providers. `LocalOnly` also revokes the
+    /// consent to cloud indexing.
+    pub fn set_project_cloud_policy(&mut self, id: &str, policy: CloudPolicy) -> Result<Project> {
+        let now = now(&self.conn)?;
+        let changed = self.conn.execute(
+            "UPDATE projects SET cloud_policy = ?2,
+                 cloud_embedding_consent = CASE WHEN ?2 = 'local_only' THEN 0
+                                                ELSE cloud_embedding_consent END,
+                 updated_at = ?3
+             WHERE id = ?1",
+            params![id, policy.as_str(), now],
+        )?;
+        if changed == 0 {
+            return Err(CoreError::not_found(NOT_FOUND_MESSAGE));
+        }
+        self.get_project(id)
+    }
+
+    /// Gives or revokes the consent to index the project with the cloud embedding model.
+    /// Giving it requires `CloudAllowed` (`conflict` otherwise).
+    pub fn set_cloud_embedding_consent(&mut self, id: &str, consent: bool) -> Result<Project> {
+        let project = self.get_project(id)?;
+        if consent && project.cloud_policy != CloudPolicy::CloudAllowed {
+            return Err(CoreError::conflict(CONSENT_NEEDS_CLOUD));
+        }
+        let now = now(&self.conn)?;
+        self.conn.execute(
+            "UPDATE projects SET cloud_embedding_consent = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, consent, now],
+        )?;
+        self.get_project(id)
+    }
+
     /// Checks that the project exists.
     pub(crate) fn ensure_project(&self, id: &str) -> Result<()> {
         let exists: bool = self.conn.query_row(
@@ -509,12 +615,16 @@ fn check_not_newer(version: u32) -> Result<()> {
 }
 
 fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
+    let policy: String = row.get(5)?;
     Ok(Project {
         id: row.get(0)?,
         name: row.get(1)?,
         description: row.get(2)?,
         created_at: row.get(3)?,
         updated_at: row.get(4)?,
+        // Anything unexpected is treated as the safe default.
+        cloud_policy: CloudPolicy::parse(&policy).unwrap_or_default(),
+        cloud_embedding_consent: row.get(6)?,
     })
 }
 

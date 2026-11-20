@@ -70,14 +70,14 @@ fn migrates_from_scratch() {
     let store = Store::open(&nested).unwrap();
     assert!(nested.exists(), "parent directories are created");
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 3);
+    assert_eq!(SCHEMA_VERSION, 4);
     drop(store);
 
     let conn = raw(&nested);
     let version: u32 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let tables: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
         .unwrap()
@@ -95,6 +95,7 @@ fn migrates_from_scratch() {
             "chunks_fts_data",
             "chunks_fts_docsize",
             "chunks_fts_idx",
+            "cloud_requests",
             "conversations",
             "document_text",
             "document_text_fts",
@@ -109,6 +110,7 @@ fn migrates_from_scratch() {
             "message_candidates",
             "message_sources",
             "messages",
+            "model_prices",
             "projects",
             "settings",
             "sqlite_sequence",
@@ -123,7 +125,15 @@ fn migrates_from_scratch() {
         .unwrap();
     assert_eq!(
         columns,
-        ["id", "name", "description", "created_at", "updated_at"]
+        [
+            "id",
+            "name",
+            "description",
+            "created_at",
+            "updated_at",
+            "cloud_policy",
+            "cloud_embedding_consent"
+        ]
     );
     let mode: String = conn
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))

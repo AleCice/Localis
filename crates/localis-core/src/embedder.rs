@@ -1,7 +1,11 @@
-//! Background embedder: computes embeddings with LM Studio for the passages of current
-//! versions that have none for the configured model, in batches, on its own connection.
-//! When LM Studio is not reachable it reports `unreachable` and retries with a growing
-//! delay, without marking any document as failed.
+//! Background embedder: computes embeddings with the configured model (LM Studio or a
+//! cloud provider) for the passages of current versions that have none for it, in batches,
+//! on its own connection. When the provider is not reachable (or rate-limits) it reports
+//! `unreachable` and retries with a growing delay, without marking any document as failed.
+//!
+//! With a cloud model only the passages of projects that are `cloud_allowed` and gave
+//! consent are sent, one project per batch; the consent is checked again right before
+//! each batch, so a revocation stops the next batch. Every cloud batch is logged.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
@@ -10,8 +14,13 @@ use std::time::Duration;
 
 use rusqlite::params;
 
+use crate::cloud_log::{CloudLogEntry, CloudPurpose};
+use crate::cloud_send::CloudEnv;
 use crate::error::{CoreError, Result};
-use crate::llm::{LlmClient, EMBED_BATCH_MAX, EMBED_BATCH_TIMEOUT};
+use crate::llm::{EMBED_BATCH_MAX, EMBED_BATCH_TIMEOUT};
+use crate::mesh::client_for;
+use crate::prices::{estimate_tokens, Money};
+use crate::providers::{CloudPolicy, CloudProvider, ModelRef, ProviderId};
 use crate::retrieval::encode_vector;
 use crate::store::Store;
 
@@ -24,8 +33,10 @@ pub enum EmbeddingState {
     /// Every current passage has an embedding for the configured model.
     Idle,
     Running,
-    /// LM Studio not reachable or the model failed: retried in the background.
+    /// Provider not reachable or the model failed: retried in the background.
     Unreachable,
+    /// Cloud embedding configured, but the project is local-only or has not consented.
+    NeedsConsent,
 }
 
 impl EmbeddingState {
@@ -35,6 +46,7 @@ impl EmbeddingState {
             EmbeddingState::Idle => "idle",
             EmbeddingState::Running => "running",
             EmbeddingState::Unreachable => "unreachable",
+            EmbeddingState::NeedsConsent => "needs_consent",
         }
     }
 }
@@ -43,6 +55,7 @@ impl EmbeddingState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbedderSnapshot {
     pub state: EmbeddingState,
+    /// Embedding key (`provider:model`).
     pub model: Option<String>,
     pub message: Option<String>,
     pub detail: Option<String>,
@@ -94,6 +107,7 @@ impl EmbedderShared {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingStatus {
     pub state: EmbeddingState,
+    pub provider: Option<ProviderId>,
     pub model: Option<String>,
     pub total: u64,
     pub embedded: u64,
@@ -131,20 +145,74 @@ pub fn next_backoff(current: Option<Duration>, config: &EmbedderConfig) -> Durat
     }
 }
 
+/// `CloudEmbeddingEstimate` in `src/api/types.ts`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CloudEmbeddingEstimate {
+    pub provider: CloudProvider,
+    pub model: String,
+    pub chunks: u64,
+    pub chars: u64,
+    pub est_tokens: u64,
+    pub est_cost: Option<Money>,
+}
+
+const CURRENT_VERSION_SQL: &str = "v.version_no = (SELECT MAX(m.version_no) FROM document_versions m
+                                   WHERE m.document_id = v.document_id)";
+
 impl Store {
-    /// Passages of current versions without an embedding for `model` (oldest first).
+    /// Passages of current versions without an embedding for `model` (an embedding key,
+    /// `provider:model`), oldest first, in every project.
     pub fn pending_embeddings(&self, model: &str, limit: usize) -> Result<Vec<(i64, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT c.id, c.text FROM chunks c
              JOIN document_versions v ON v.id = c.version_id
-             WHERE v.version_no = (SELECT MAX(m.version_no) FROM document_versions m
-                                   WHERE m.document_id = v.document_id)
+             WHERE {CURRENT_VERSION_SQL}
                AND NOT EXISTS (SELECT 1 FROM chunk_embeddings e
                                WHERE e.chunk_id = c.id AND e.model = ?1)
-             ORDER BY c.id LIMIT ?2",
-        )?;
+             ORDER BY c.id LIMIT ?2"
+        ))?;
         let rows = stmt.query_map(params![model, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Like [`Store::pending_embeddings`], limited to the projects that may send passages
+    /// to a cloud provider (`cloud_allowed` + consent) and to one project per batch.
+    pub fn pending_cloud_embeddings(
+        &self,
+        model: &str,
+        limit: usize,
+    ) -> Result<Option<(String, Vec<(i64, String)>)>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT d.project_id, c.id, c.text FROM chunks c
+             JOIN document_versions v ON v.id = c.version_id
+             JOIN documents d ON d.id = v.document_id
+             JOIN projects p ON p.id = d.project_id
+             WHERE p.cloud_policy = 'cloud_allowed' AND p.cloud_embedding_consent = 1
+               AND {CURRENT_VERSION_SQL}
+               AND NOT EXISTS (SELECT 1 FROM chunk_embeddings e
+                               WHERE e.chunk_id = c.id AND e.model = ?1)
+             ORDER BY d.project_id, c.id LIMIT ?2"
+        ))?;
+        let rows: Vec<(String, i64, String)> = stmt
+            .query_map(params![model, limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let Some(project) = rows.first().map(|r| r.0.clone()) else {
+            return Ok(None);
+        };
+        let batch = rows
+            .into_iter()
+            .filter(|r| r.0 == project)
+            .map(|(_, id, text)| (id, text))
+            .collect();
+        Ok(Some((project, batch)))
+    }
+
+    /// Whether the project currently allows sending its passages to a cloud embedding model.
+    pub fn allows_cloud_embedding(&self, project_id: &str) -> Result<bool> {
+        let p = self.get_project(project_id)?;
+        Ok(p.cloud_policy == CloudPolicy::CloudAllowed && p.cloud_embedding_consent)
     }
 
     /// Stores embeddings (L2-normalized) for passages that still exist.
@@ -191,26 +259,94 @@ impl Store {
         Ok((total.max(0) as u64, embedded.max(0) as u64))
     }
 
+    /// What indexing the project with the configured cloud embedding model would send:
+    /// passages of current versions not yet embedded with it. `None` when the configured
+    /// embedding model is not a cloud model.
+    pub fn estimate_cloud_embedding(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<CloudEmbeddingEstimate>> {
+        self.ensure_project(project_id)?;
+        let Some(model) = self.llm_settings()?.embedding_model else {
+            return Ok(None);
+        };
+        let Some(provider) = model.provider.cloud() else {
+            return Ok(None);
+        };
+        let (chunks, chars): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(length(c.text)), 0)
+             FROM chunks c
+             JOIN document_versions v ON v.id = c.version_id
+             JOIN documents d ON d.id = v.document_id
+             WHERE d.project_id = ?1
+               AND v.version_no = (SELECT MAX(m.version_no) FROM document_versions m
+                                   WHERE m.document_id = d.id)
+               AND NOT EXISTS (SELECT 1 FROM chunk_embeddings e
+                               WHERE e.chunk_id = c.id AND e.model = ?2)",
+            params![project_id, model.embedding_key()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let chars = chars.max(0) as u64;
+        let est_tokens = estimate_tokens(chars);
+        let est_cost = self.price_of(&model)?.map(|p| p.cost(est_tokens, 0));
+        Ok(Some(CloudEmbeddingEstimate {
+            provider,
+            model: model.model,
+            chunks: chunks.max(0) as u64,
+            chars,
+            est_tokens,
+            est_cost,
+        }))
+    }
+
     /// Embedding progress of the project, combined with what the embedder last reported.
     pub fn embedding_status(
         &self,
         project_id: &str,
         shared: &EmbedderShared,
     ) -> Result<EmbeddingStatus> {
+        let project = self.get_project(project_id)?;
         let model = self.llm_settings()?.embedding_model;
-        let (total, embedded) = self.embedding_counts(project_id, model.as_deref())?;
-        let Some(model) = model else {
+        let key = model.as_ref().map(ModelRef::embedding_key);
+        let (total, embedded) = self.embedding_counts(project_id, key.as_deref())?;
+        let (Some(model), Some(key)) = (model, key) else {
             return Ok(EmbeddingStatus {
                 state: EmbeddingState::Disabled,
+                provider: None,
                 model: None,
                 total,
                 embedded: 0,
                 message: None,
             });
         };
+        if let Some(provider) = model.provider.cloud() {
+            let allowed = project.cloud_policy == CloudPolicy::CloudAllowed
+                && project.cloud_embedding_consent;
+            if !allowed {
+                let message = if project.cloud_policy == CloudPolicy::LocalOnly {
+                    format!(
+                        "Progetto «Solo locale»: i passaggi non vengono inviati a {} e la ricerca resta lessicale.",
+                        provider.name()
+                    )
+                } else {
+                    format!(
+                        "Per l'indicizzazione con {} serve il tuo consenso per questo progetto; finché non lo dai la ricerca resta lessicale.",
+                        provider.name()
+                    )
+                };
+                return Ok(EmbeddingStatus {
+                    state: EmbeddingState::NeedsConsent,
+                    provider: Some(model.provider),
+                    model: Some(model.model),
+                    total,
+                    embedded,
+                    message: Some(message),
+                });
+            }
+        }
         let snap = shared.snapshot();
         let (state, message) = if snap.state == EmbeddingState::Unreachable
-            && snap.model.as_deref() == Some(model.as_str())
+            && snap.model.as_deref() == Some(key.as_str())
         {
             (EmbeddingState::Unreachable, snap.message)
         } else if embedded >= total {
@@ -222,7 +358,8 @@ impl Store {
         };
         Ok(EmbeddingStatus {
             state,
-            model: Some(model),
+            provider: Some(model.provider),
+            model: Some(model.model),
             total,
             embedded,
             message,
@@ -237,32 +374,73 @@ enum Step {
 }
 
 /// One unit of work: embeds the next batch for the configured model.
-fn step(store: &mut Store, shared: &EmbedderShared, config: &EmbedderConfig) -> Result<Step> {
+fn step(
+    store: &mut Store,
+    shared: &EmbedderShared,
+    config: &EmbedderConfig,
+    cloud: &CloudEnv,
+) -> Result<Step> {
     let settings = store.llm_settings()?;
     let Some(model) = settings.embedding_model else {
         return Ok(Step::Disabled);
     };
-    let batch = store.pending_embeddings(&model, config.batch_size.clamp(1, EMBED_BATCH_MAX))?;
+    let key = model.embedding_key();
+    let cloud_provider = model.provider.cloud();
+    let batch_max = cloud_provider.map_or(EMBED_BATCH_MAX, CloudProvider::embed_batch_max);
+    let limit = config.batch_size.clamp(1, batch_max);
+    let (project, batch) = match cloud_provider {
+        None => (None, store.pending_embeddings(&key, limit)?),
+        Some(_) => match store.pending_cloud_embeddings(&key, limit)? {
+            Some((project, batch)) => (Some(project), batch),
+            None => (None, Vec::new()),
+        },
+    };
     if batch.is_empty() {
-        return Ok(Step::Idle(model));
+        return Ok(Step::Idle(key));
     }
     let current = shared.snapshot();
     shared.set(EmbedderSnapshot {
         state: EmbeddingState::Running,
-        model: Some(model.clone()),
+        model: Some(key.clone()),
         // Keep the last failure visible while retrying, until a batch succeeds.
-        ..if current.state == EmbeddingState::Unreachable && current.model.as_ref() == Some(&model)
+        ..if current.state == EmbeddingState::Unreachable && current.model.as_ref() == Some(&key)
         {
             current
         } else {
             EmbedderSnapshot::default()
         }
     });
-    let client = LlmClient::new(&settings.base_url)?;
+    let client = client_for(&model, &settings.base_url, &cloud.keys, &cloud.endpoints)?;
     let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
-    let vectors = client.embed(&model, &texts, config.batch_timeout)?;
+    if let (Some(provider), Some(project)) = (cloud_provider, &project) {
+        // Last check right before sending: consent revoked or project made local-only.
+        if !store.allows_cloud_embedding(project)? {
+            return Ok(Step::Embedded);
+        }
+        let result = client.embed(&model.model, &texts, config.batch_timeout);
+        let usage = result.as_ref().map(|(_, u)| *u).unwrap_or_default();
+        let cost = store
+            .price_of(&model)?
+            .and_then(|p| p.cost_of(&usage, false));
+        store.log_cloud_request(&CloudLogEntry {
+            provider,
+            model: Some(model.model.clone()),
+            purpose: CloudPurpose::IndexEmbedding,
+            project_id: Some(project.clone()),
+            conversation_id: None,
+            chars_sent: texts.iter().map(|t| t.chars().count() as u64).sum(),
+            usage,
+            cost,
+            error: result.as_ref().err().map(|e| e.to_string()),
+        })?;
+        let (vectors, _) = result?;
+        let items: Vec<(i64, Vec<f32>)> = batch.iter().map(|(id, _)| *id).zip(vectors).collect();
+        store.save_embeddings(&key, &items)?;
+        return Ok(Step::Embedded);
+    }
+    let (vectors, _) = client.embed(&model.model, &texts, config.batch_timeout)?;
     let items: Vec<(i64, Vec<f32>)> = batch.iter().map(|(id, _)| *id).zip(vectors).collect();
-    store.save_embeddings(&model, &items)?;
+    store.save_embeddings(&key, &items)?;
     Ok(Step::Embedded)
 }
 
@@ -274,6 +452,7 @@ pub fn run_embedder(
     wake: Receiver<()>,
     shared: Arc<EmbedderShared>,
     config: EmbedderConfig,
+    cloud: CloudEnv,
 ) {
     shared.alive.store(true, Ordering::SeqCst);
     let _alive = AliveGuard(Arc::clone(&shared));
@@ -286,7 +465,7 @@ pub fn run_embedder(
                 Err(err) => log_error("cannot open database", &err),
             }
         }
-        let wait = match store.as_mut().map(|s| step(s, &shared, &config)) {
+        let wait = match store.as_mut().map(|s| step(s, &shared, &config, &cloud)) {
             None => config.idle_poll,
             Some(Ok(Step::Disabled)) => {
                 backoff = None;
@@ -312,13 +491,18 @@ pub fn run_embedder(
                 });
                 Duration::ZERO
             }
-            Some(Err(err @ (CoreError::LlmUnavailable { .. } | CoreError::Validation { .. }))) => {
+            Some(Err(
+                err @ (CoreError::LlmUnavailable { .. }
+                | CoreError::Validation { .. }
+                | CoreError::KeyringUnavailable { .. }),
+            )) => {
                 let delay = next_backoff(backoff, &config);
                 backoff = Some(delay);
                 let model = store
                     .as_ref()
                     .and_then(|s| s.llm_settings().ok())
-                    .and_then(|s| s.embedding_model);
+                    .and_then(|s| s.embedding_model)
+                    .map(|m| m.embedding_key());
                 shared.set(EmbedderSnapshot {
                     state: EmbeddingState::Unreachable,
                     model,

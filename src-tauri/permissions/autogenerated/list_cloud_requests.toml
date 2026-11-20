@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-cloud-requests"
+description = "Enables the list_cloud_requests command without any pre-configured scope."
+commands.allow = ["list_cloud_requests"]
+
+[[permission]]
+identifier = "deny-list-cloud-requests"
+description = "Denies the list_cloud_requests command without any pre-configured scope."
+commands.deny = ["list_cloud_requests"]

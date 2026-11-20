@@ -31,9 +31,16 @@ pub enum CoreError {
     /// Stored original missing or not matching its hash.
     #[error("{message}")]
     Integrity { message: String, detail: String },
-    /// LM Studio is not reachable, no model is selected, or the model failed.
+    /// A model provider is not reachable, the key is invalid, no model is selected, or the
+    /// model failed.
     #[error("{message}")]
     LlmUnavailable { message: String, detail: String },
+    /// A cloud send without a valid confirmation, or a cloud path for a local-only project.
+    #[error("{message}")]
+    ConsentRequired { message: String },
+    /// The system keychain cannot be used (API keys are never stored elsewhere).
+    #[error("{message}")]
+    KeyringUnavailable { message: String, detail: String },
     /// The operation was stopped by the user.
     #[error("{message}")]
     Cancelled { message: String },
@@ -89,6 +96,12 @@ impl CoreError {
         }
     }
 
+    pub(crate) fn consent(message: impl Into<String>) -> Self {
+        CoreError::ConsentRequired {
+            message: message.into(),
+        }
+    }
+
     /// Error code shared with the frontend (`AppErrorCode` in `src/api/types.ts`).
     pub fn code(&self) -> &'static str {
         match self {
@@ -100,6 +113,8 @@ impl CoreError {
             CoreError::TooLarge { .. } => "too_large",
             CoreError::Integrity { .. } => "integrity",
             CoreError::LlmUnavailable { .. } => "llm_unavailable",
+            CoreError::ConsentRequired { .. } => "consent_required",
+            CoreError::KeyringUnavailable { .. } => "keyring_unavailable",
             CoreError::Cancelled { .. } => "cancelled",
             CoreError::Storage { .. } => "storage",
             CoreError::Internal(_) => "internal",
@@ -119,7 +134,8 @@ impl CoreError {
         match self {
             CoreError::Storage { detail, .. }
             | CoreError::Integrity { detail, .. }
-            | CoreError::LlmUnavailable { detail, .. } => Some(detail),
+            | CoreError::LlmUnavailable { detail, .. }
+            | CoreError::KeyringUnavailable { detail, .. } => Some(detail),
             CoreError::Internal(detail) => Some(detail),
             _ => None,
         }

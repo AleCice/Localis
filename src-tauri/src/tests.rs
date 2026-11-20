@@ -114,10 +114,12 @@ fn project_dto_is_camel_case_with_nullable_description() {
         description: None,
         created_at: "2026-01-01T00:00:00.000Z".into(),
         updated_at: "2026-01-02T00:00:00.000Z".into(),
+        cloud_policy: "local_only",
+        cloud_embedding_consent: false,
     };
     assert_eq!(
         to_json(dto.clone()),
-        r#"{"id":"id-1","name":"Tesi","description":null,"createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-02T00:00:00.000Z"}"#
+        r#"{"id":"id-1","name":"Tesi","description":null,"createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-02T00:00:00.000Z","cloudPolicy":"local_only","cloudEmbeddingConsent":false}"#
     );
     let with_description = ProjectDto {
         description: Some("note".into()),
@@ -619,7 +621,8 @@ mod chat {
     use super::to_json;
     use crate::commands::{
         AppState, CandidateDto, ChatEventDto, ChatMessageDto, ConversationDto, EmbeddingStatusDto,
-        LlmSettingsDto, LlmStatusDto, ModelInfoDto, RetrievalInfoDto, SendMessageInput, SourceDto,
+        LlmSettingsDto, LlmStatusDto, ModelInfoDto, ModelRefDto, RetrievalInfoDto,
+        SendMessageInput, SourceDto,
     };
     use crate::error::{AppError, ErrorCode};
 
@@ -633,6 +636,10 @@ mod chat {
             status: "complete",
             error: None,
             model: Some("qwen".into()),
+            provider: Some("lmstudio"),
+            route_reason: Some("Scelto manualmente nelle impostazioni.".into()),
+            usage: None,
+            cost: None,
             created_at: "2026-01-01T00:00:00.000Z".into(),
             retrieval: Some(RetrievalInfoDto {
                 mode: "hybrid",
@@ -640,6 +647,7 @@ mod chat {
                 document_ids: vec!["d1".into()],
                 scope_reason: Some("title"),
                 embedding_model: Some("nomic".into()),
+                embedding_provider: Some("lmstudio"),
                 query: "\"vero\"*".into(),
             }),
             sources: vec![SourceDto {
@@ -662,9 +670,11 @@ mod chat {
     const ANSWER_JSON: &str = concat!(
         r#"{"id":"a1","conversationId":"c1","role":"assistant","kind":"answer","#,
         r#""content":"Vero [1].","status":"complete","error":null,"model":"qwen","#,
-        r#""createdAt":"2026-01-01T00:00:00.000Z","#,
+        r#""provider":"lmstudio","routeReason":"Scelto manualmente nelle impostazioni.","#,
+        r#""usage":null,"cost":null,"createdAt":"2026-01-01T00:00:00.000Z","#,
         r#""retrieval":{"mode":"hybrid","scope":"documents","documentIds":["d1"],"#,
-        r#""scopeReason":"title","embeddingModel":"nomic","query":"\"vero\"*"},"#,
+        r#""scopeReason":"title","embeddingModel":"nomic","embeddingProvider":"lmstudio","#,
+        r#""query":"\"vero\"*"},"#,
         r#""sources":[{"rank":1,"n":1,"cited":true,"documentId":"d1","versionId":"v1","#,
         r#""title":"a.pdf","unit":3,"unitKind":"page","text":"testo","via":"both","#,
         r#""available":false}],"candidates":[]}"#
@@ -707,7 +717,26 @@ mod chat {
         let mut no_reason = answer();
         no_reason.retrieval.as_mut().unwrap().scope_reason = None;
         no_reason.retrieval.as_mut().unwrap().embedding_model = None;
-        assert!(to_json(no_reason).contains(r#""scopeReason":null,"embeddingModel":null"#));
+        no_reason.retrieval.as_mut().unwrap().embedding_provider = None;
+        assert!(to_json(no_reason).contains(
+            r#""scopeReason":null,"embeddingModel":null,"embeddingProvider":null"#
+        ));
+        let cloud = ChatMessageDto {
+            model: Some("gpt-x".into()),
+            provider: Some("openai"),
+            usage: Some(crate::commands::TokenUsageDto {
+                input_tokens: Some(1200),
+                output_tokens: None,
+            }),
+            cost: Some(crate::commands::MoneyDto {
+                amount: 0.5,
+                currency: "USD".into(),
+            }),
+            ..answer()
+        };
+        assert!(to_json(cloud).contains(
+            r#""model":"gpt-x","provider":"openai","routeReason":"Scelto manualmente nelle impostazioni.","usage":{"inputTokens":1200,"outputTokens":null},"cost":{"amount":0.5,"currency":"USD"},"createdAt""#
+        ));
     }
 
     #[test]
@@ -797,21 +826,50 @@ mod chat {
     fn settings_status_and_conversation_json_shapes() {
         let settings = LlmSettingsDto {
             base_url: "http://127.0.0.1:1234".into(),
-            chat_model: Some("qwen".into()),
+            chat_model: Some(ModelRefDto {
+                provider: "lmstudio".into(),
+                model: "qwen".into(),
+            }),
             embedding_model: None,
+            routing: "auto".into(),
+            auto_models: vec![ModelRefDto {
+                provider: "openai".into(),
+                model: "gpt-x".into(),
+            }],
         };
-        assert_eq!(
-            to_json(settings.clone()),
-            r#"{"baseUrl":"http://127.0.0.1:1234","chatModel":"qwen","embeddingModel":null}"#
-        );
-        let parsed: LlmSettingsDto = serde_json::from_str(
-            r#"{"baseUrl":"http://127.0.0.1:1234","chatModel":"qwen","embeddingModel":null}"#,
-        )
-        .unwrap();
+        let json = r#"{"baseUrl":"http://127.0.0.1:1234","chatModel":{"provider":"lmstudio","model":"qwen"},"embeddingModel":null,"routing":"auto","autoModels":[{"provider":"openai","model":"gpt-x"}]}"#;
+        assert_eq!(to_json(settings.clone()), json);
+        let parsed: LlmSettingsDto = serde_json::from_str(json).unwrap();
         assert_eq!(parsed, settings);
+        let core = localis_core::LlmSettings::try_from(parsed).unwrap();
+        assert_eq!(core.routing, localis_core::Routing::Auto);
+        assert_eq!(
+            core.auto_models[0].provider,
+            localis_core::ProviderId::Cloud(localis_core::CloudProvider::OpenAi)
+        );
         let minimal: LlmSettingsDto =
             serde_json::from_str(r#"{"baseUrl":"http://localhost:1234"}"#).unwrap();
         assert_eq!(minimal.chat_model, None);
+        assert_eq!(minimal.routing, "manual");
+        assert!(minimal.auto_models.is_empty());
+        // Unknown providers or routing modes are validation errors on the field.
+        let bad: LlmSettingsDto = serde_json::from_str(
+            r#"{"baseUrl":"http://localhost:1234","chatModel":{"provider":"acme","model":"x"}}"#,
+        )
+        .unwrap();
+        let err = localis_core::LlmSettings::try_from(bad).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Validation);
+        assert_eq!(err.field.as_deref(), Some("chatModel"));
+        let bad: LlmSettingsDto =
+            serde_json::from_str(r#"{"baseUrl":"http://localhost:1234","routing":"magic"}"#)
+                .unwrap();
+        let err = localis_core::LlmSettings::try_from(bad).unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("routing"));
+        // The 0.3 shape (model as a plain string) is rejected by the 0.4 contract.
+        assert!(serde_json::from_str::<LlmSettingsDto>(
+            r#"{"baseUrl":"http://localhost:1234","chatModel":"qwen"}"#
+        )
+        .is_err());
 
         assert_eq!(
             to_json(LlmStatusDto {
@@ -835,13 +893,14 @@ mod chat {
         );
         assert_eq!(
             to_json(EmbeddingStatusDto {
-                state: "running",
-                model: Some("nomic".into()),
+                state: "needs_consent",
+                provider: Some("openai"),
+                model: Some("text-embedding-3-small".into()),
                 total: 10,
                 embedded: 4,
                 message: None,
             }),
-            r#"{"state":"running","model":"nomic","total":10,"embedded":4,"message":null}"#
+            r#"{"state":"needs_consent","provider":"openai","model":"text-embedding-3-small","total":10,"embedded":4,"message":null}"#
         );
         assert_eq!(
             to_json(ConversationDto {
@@ -858,7 +917,7 @@ mod chat {
     #[test]
     fn send_message_input_parses() {
         let full: SendMessageInput = serde_json::from_str(
-            r#"{"conversationId":"c1","text":"ciao","documentIds":["d1","d2"]}"#,
+            r#"{"conversationId":"c1","text":"ciao","documentIds":["d1","d2"],"confirmToken":"t1"}"#,
         )
         .unwrap();
         assert_eq!(
@@ -867,8 +926,13 @@ mod chat {
                 conversation_id: "c1".into(),
                 text: "ciao".into(),
                 document_ids: vec!["d1".into(), "d2".into()],
+                confirm_token: Some("t1".into()),
             }
         );
+        let empty_token: SendMessageInput =
+            serde_json::from_str(r#"{"conversationId":"c1","text":"ciao","confirmToken":""}"#)
+                .unwrap();
+        assert_eq!(SendInput::from(empty_token).confirm_token, None);
         for json in [
             r#"{"conversationId":"c1","text":"ciao"}"#,
             r#"{"conversationId":"c1","text":"ciao","documentIds":null}"#,
@@ -950,10 +1014,11 @@ mod chat {
                 EmbeddingState::Disabled,
                 EmbeddingState::Idle,
                 EmbeddingState::Running,
-                EmbeddingState::Unreachable
+                EmbeddingState::Unreachable,
+                EmbeddingState::NeedsConsent
             ]
             .map(EmbeddingState::as_str),
-            ["disabled", "idle", "running", "unreachable"]
+            ["disabled", "idle", "running", "unreachable", "needs_consent"]
         );
     }
 
@@ -986,6 +1051,8 @@ mod chat {
             "too_large",
             "integrity",
             "llm_unavailable",
+            "consent_required",
+            "keyring_unavailable",
             "cancelled",
             "storage",
             "internal",
@@ -1024,10 +1091,12 @@ mod chat {
         let message = localis_core::send_message(
             &state,
             &state.chat,
+            &state.cloud,
             SendInput {
                 conversation_id: conversation.clone(),
                 text: "Quali documenti ho caricato?".into(),
                 document_ids: vec![],
+                confirm_token: None,
             },
             &mut |e| events.push(to_json(ChatEventDto::from(e))),
         )

@@ -10,7 +10,10 @@ use std::sync::mpsc;
 
 use std::sync::Arc;
 
-use localis_core::{CoreError, EmbedderConfig, EmbedderShared, Store, WorkerConfig};
+use localis_core::{
+    CloudEnv, CloudRuntime, CoreError, EmbedderConfig, EmbedderShared, Endpoints, Store,
+    SystemKeyring, WorkerConfig,
+};
 use tauri::Manager;
 
 use crate::commands::AppState;
@@ -47,10 +50,12 @@ fn spawn_worker(path: Result<PathBuf, AppError>) -> Option<mpsc::SyncSender<()>>
     }
 }
 
-/// Starts the background embedder on its own thread and SQLite connection. It only talks
-/// to the loopback LM Studio URL saved in the settings.
+/// Starts the background embedder on its own thread and SQLite connection. It talks to
+/// the loopback LM Studio URL saved in the settings or, for a cloud embedding model, to the
+/// provider's fixed host for consenting projects only.
 fn spawn_embedder(
     path: Result<PathBuf, AppError>,
+    cloud: CloudEnv,
 ) -> Option<(mpsc::SyncSender<()>, Arc<EmbedderShared>)> {
     let path = path.ok()?;
     let (wake, signals) = mpsc::sync_channel(1);
@@ -64,6 +69,7 @@ fn spawn_embedder(
                 signals,
                 thread_shared,
                 EmbedderConfig::default(),
+                cloud,
             )
         });
     match spawned {
@@ -83,14 +89,18 @@ pub fn run() {
             // each later command retries opening. The worker retries on its own.
             let path = db_path(app);
             let wake = spawn_worker(path.clone());
-            let embedder = spawn_embedder(path.clone());
+            // API keys live only in the system keychain. Cloud endpoints are the fixed
+            // hosts (debug builds also read the LOCALIS_TEST_* overrides, see localis-core).
+            let cloud = CloudRuntime::new(Arc::new(SystemKeyring::new()), Endpoints::from_env());
+            let embedder = spawn_embedder(path.clone(), cloud.env.clone());
             // Answers left `streaming` by a crash are marked failed as soon as the store
             // opens, before any generation can start (generations only run in this process).
             let mut state = AppState::new(move || {
                 let mut store = Store::open(path.as_ref().map_err(Clone::clone)?)?;
                 store.recover_interrupted_messages()?;
                 Ok(store)
-            });
+            })
+            .with_cloud(cloud);
             // Leftovers of interrupted imports, removed before any command can import.
             let _ = state.with_store(|store| {
                 store.sweep_temp_files();
@@ -134,6 +144,20 @@ pub fn run() {
             commands::list_messages,
             commands::send_message,
             commands::cancel_generation,
+            commands::get_keyring_status,
+            commands::list_providers,
+            commands::set_api_key,
+            commands::delete_api_key,
+            commands::list_provider_models,
+            commands::list_prices,
+            commands::set_price,
+            commands::delete_price,
+            commands::set_project_cloud_policy,
+            commands::estimate_cloud_embedding,
+            commands::set_cloud_embedding_consent,
+            commands::prepare_cloud_send,
+            commands::discard_cloud_send,
+            commands::list_cloud_requests,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Localis");

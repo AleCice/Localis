@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-estimate-cloud-embedding"
+description = "Enables the estimate_cloud_embedding command without any pre-configured scope."
+commands.allow = ["estimate_cloud_embedding"]
+
+[[permission]]
+identifier = "deny-estimate-cloud-embedding"
+description = "Denies the estimate_cloud_embedding command without any pre-configured scope."
+commands.deny = ["estimate_cloud_embedding"]

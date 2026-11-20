@@ -13,6 +13,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::error::{CoreError, Result};
+use crate::prices::Usage;
 use crate::settings::validate_base_url;
 
 /// Connection timeout for every request.
@@ -105,7 +106,7 @@ fn agent(total: Option<Duration>, per_read: Option<Duration>) -> ureq::Agent {
         .new_agent()
 }
 
-fn http_detail(status: u16, body: &str) -> String {
+pub(crate) fn http_detail(status: u16, body: &str) -> String {
     let snippet: String = body.chars().take(300).collect();
     format!("HTTP {status}: {snippet}")
 }
@@ -232,6 +233,19 @@ impl LlmClient {
         cancel: &AtomicBool,
         on_delta: &mut dyn FnMut(&str),
     ) -> StreamEnd {
+        self.chat_stream_with_usage(model, messages, cancel, on_delta)
+            .0
+    }
+
+    /// Like [`LlmClient::chat_stream`], also returning the token usage when LM Studio
+    /// reports it.
+    pub fn chat_stream_with_usage(
+        &self,
+        model: &str,
+        messages: &[PromptMessage],
+        cancel: &AtomicBool,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> (StreamEnd, Usage) {
         let url = format!("{}/v1/chat/completions", self.base_url);
         let body = json!({
             "model": model,
@@ -244,70 +258,141 @@ impl LlmClient {
         });
         let bytes = match serde_json::to_vec(&body) {
             Ok(b) => b,
-            Err(e) => return StreamEnd::Failed(CoreError::Internal(e.to_string())),
-        };
-        // The blocking HTTP read runs on its own thread; this thread polls the cancel flag.
-        let (tx, rx) = mpsc::channel::<StreamMsg>();
-        let stop = Arc::new(AtomicBool::new(false));
-        let reader_stop = Arc::clone(&stop);
-        let base = self.base_url.clone();
-        let spawned = std::thread::Builder::new()
-            .name("localis-chat-stream".into())
-            .spawn(move || stream_worker(&base, &url, bytes, &reader_stop, &tx));
-        if let Err(e) = spawned {
-            return StreamEnd::Failed(CoreError::Internal(format!("cannot spawn reader: {e}")));
-        }
-        loop {
-            if cancel.load(Ordering::SeqCst) {
-                stop.store(true, Ordering::SeqCst);
-                return StreamEnd::Cancelled;
+            Err(e) => {
+                return (
+                    StreamEnd::Failed(CoreError::Internal(e.to_string())),
+                    Usage::default(),
+                )
             }
-            match rx.recv_timeout(CANCEL_POLL) {
-                Ok(StreamMsg::Delta(text)) => {
-                    // Check the flag again: text arriving after a cancel is not delivered.
-                    if cancel.load(Ordering::SeqCst) {
-                        stop.store(true, Ordering::SeqCst);
-                        return StreamEnd::Cancelled;
-                    }
-                    on_delta(&text);
+        };
+        let base = self.base_url.clone();
+        run_stream(
+            StreamRequest {
+                agent: agent(None, Some(STREAM_READ_TIMEOUT)),
+                url,
+                headers: Vec::new(),
+                body: bytes,
+                parse: parse_openai_event,
+                model_failed: MODEL_FAILED.to_owned(),
+                on_status: Box::new(|status, text| {
+                    CoreError::llm(MODEL_FAILED, http_detail(status, text))
+                }),
+                unreachable: Box::new(move |detail| {
+                    CoreError::llm(unreachable_message(&base), detail)
+                }),
+            },
+            cancel,
+            on_delta,
+        )
+    }
+}
+
+/// One piece of a streamed response, as parsed from an SSE `data` payload.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Chunk {
+    Text(String),
+    Usage(Usage),
+    Done,
+    /// Error reported inside the stream (diagnostics).
+    Error(String),
+}
+
+/// A streamed request. Built by each provider; the key (if any) travels in `headers`.
+pub(crate) struct StreamRequest {
+    pub agent: ureq::Agent,
+    pub url: String,
+    pub headers: Vec<(&'static str, String)>,
+    pub body: Vec<u8>,
+    pub parse: fn(&str) -> Vec<Chunk>,
+    /// User-facing message of a failure reported inside the stream.
+    pub model_failed: String,
+    /// Error for a non-200 status (status, body).
+    pub on_status: Box<dyn Fn(u16, &str) -> CoreError + Send>,
+    /// Error for a network failure (diagnostics).
+    pub unreachable: Box<dyn Fn(String) -> CoreError + Send>,
+}
+
+enum StreamMsg {
+    Delta(String),
+    Usage(Usage),
+    Done,
+    Failed(CoreError),
+}
+
+/// Runs a streamed request: the blocking HTTP read runs on its own thread while this one
+/// delivers text and polls `cancel`. The end of the body counts as the end of the answer.
+pub(crate) fn run_stream(
+    req: StreamRequest,
+    cancel: &AtomicBool,
+    on_delta: &mut dyn FnMut(&str),
+) -> (StreamEnd, Usage) {
+    let (tx, rx) = mpsc::channel::<StreamMsg>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_stop = Arc::clone(&stop);
+    let spawned = std::thread::Builder::new()
+        .name("localis-chat-stream".into())
+        .spawn(move || stream_worker(req, &reader_stop, &tx));
+    let mut usage = Usage::default();
+    if let Err(e) = spawned {
+        return (
+            StreamEnd::Failed(CoreError::Internal(format!("cannot spawn reader: {e}"))),
+            usage,
+        );
+    }
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            stop.store(true, Ordering::SeqCst);
+            return (StreamEnd::Cancelled, usage);
+        }
+        match rx.recv_timeout(CANCEL_POLL) {
+            Ok(StreamMsg::Delta(text)) => {
+                // Check the flag again: text arriving after a cancel is not delivered.
+                if cancel.load(Ordering::SeqCst) {
+                    stop.store(true, Ordering::SeqCst);
+                    return (StreamEnd::Cancelled, usage);
                 }
-                Ok(StreamMsg::Done) => return StreamEnd::Finished,
-                Ok(StreamMsg::Failed(err)) => return StreamEnd::Failed(err),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return StreamEnd::Failed(CoreError::llm(MODEL_FAILED, "stream reader stopped"))
-                }
+                on_delta(&text);
+            }
+            Ok(StreamMsg::Usage(u)) => usage.merge(u),
+            Ok(StreamMsg::Done) => return (StreamEnd::Finished, usage),
+            Ok(StreamMsg::Failed(err)) => return (StreamEnd::Failed(err), usage),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return (
+                    StreamEnd::Failed(CoreError::llm(MODEL_FAILED, "stream reader stopped")),
+                    usage,
+                )
             }
         }
     }
 }
 
-enum StreamMsg {
-    Delta(String),
-    Done,
-    Failed(CoreError),
-}
-
-fn stream_worker(
-    base: &str,
-    url: &str,
-    body: Vec<u8>,
-    stop: &AtomicBool,
-    tx: &mpsc::Sender<StreamMsg>,
-) {
-    let unreachable = |detail: String| CoreError::llm(unreachable_message(base), detail);
-    let resp = agent(None, Some(STREAM_READ_TIMEOUT))
-        .post(url)
+fn stream_worker(req: StreamRequest, stop: &AtomicBool, tx: &mpsc::Sender<StreamMsg>) {
+    let StreamRequest {
+        agent,
+        url,
+        headers,
+        body,
+        parse,
+        model_failed,
+        on_status,
+        unreachable,
+    } = req;
+    let mut request = agent
+        .post(&url)
         .header("Content-Type", "application/json")
-        .header("Accept", "text/event-stream")
-        .send(&body[..]);
-    let mut resp = match resp {
+        .header("Accept", "text/event-stream");
+    for (name, value) in &headers {
+        request = request.header(*name, value.as_str());
+    }
+    let mut resp = match request.send(&body[..]) {
         Ok(r) => r,
         Err(e) => {
             let _ = tx.send(StreamMsg::Failed(unreachable(format!("POST {url}: {e}"))));
             return;
         }
     };
+    drop(headers);
     let status = resp.status().as_u16();
     if status != 200 {
         let text = resp
@@ -316,10 +401,7 @@ fn stream_worker(
             .limit(1024 * 1024)
             .read_to_string()
             .unwrap_or_default();
-        let _ = tx.send(StreamMsg::Failed(CoreError::llm(
-            MODEL_FAILED,
-            http_detail(status, &text),
-        )));
+        let _ = tx.send(StreamMsg::Failed(on_status(status, &text)));
         return;
     }
     let mut reader = resp.into_body().into_reader();
@@ -342,16 +424,20 @@ fn stream_worker(
             parser.push(&buf[..n])
         };
         for event in events {
-            let msg = match parse_chat_event(&event) {
-                ChatChunk::Text(t) if t.is_empty() => continue,
-                ChatChunk::Text(t) => StreamMsg::Delta(t),
-                ChatChunk::Skip => continue,
-                ChatChunk::Done => StreamMsg::Done,
-                ChatChunk::Error(detail) => StreamMsg::Failed(CoreError::llm(MODEL_FAILED, detail)),
-            };
-            let terminal = !matches!(msg, StreamMsg::Delta(_));
-            if tx.send(msg).is_err() || terminal {
-                return;
+            for chunk in parse(&event) {
+                let msg = match chunk {
+                    Chunk::Text(t) if t.is_empty() => continue,
+                    Chunk::Text(t) => StreamMsg::Delta(t),
+                    Chunk::Usage(u) => StreamMsg::Usage(u),
+                    Chunk::Done => StreamMsg::Done,
+                    Chunk::Error(detail) => {
+                        StreamMsg::Failed(CoreError::llm(model_failed.clone(), detail))
+                    }
+                };
+                let terminal = matches!(msg, StreamMsg::Done | StreamMsg::Failed(_));
+                if tx.send(msg).is_err() || terminal {
+                    return;
+                }
             }
         }
         if n == 0 {
@@ -426,35 +512,42 @@ impl SseParser {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum ChatChunk {
-    Text(String),
-    Skip,
-    Done,
-    Error(String),
-}
-
-fn parse_chat_event(data: &str) -> ChatChunk {
+/// OpenAI-compatible stream event (LM Studio, OpenAI, DeepSeek, Qwen): text deltas,
+/// the final `usage` chunk (`stream_options.include_usage`), `[DONE]`, errors.
+pub(crate) fn parse_openai_event(data: &str) -> Vec<Chunk> {
     let data = data.trim();
     if data == "[DONE]" {
-        return ChatChunk::Done;
+        return vec![Chunk::Done];
     }
     let Ok(value) = serde_json::from_str::<Value>(data) else {
-        return ChatChunk::Error(format!("invalid stream event: {}", truncate(data, 200)));
+        return vec![Chunk::Error(format!(
+            "invalid stream event: {}",
+            truncate(data, 200)
+        ))];
     };
     if let Some(err) = value.get("error") {
-        return ChatChunk::Error(format!("model error: {}", truncate(&err.to_string(), 300)));
+        return vec![Chunk::Error(format!(
+            "model error: {}",
+            truncate(&err.to_string(), 300)
+        ))];
     }
-    match value
+    let mut out = Vec::new();
+    if let Some(text) = value
         .pointer("/choices/0/delta/content")
         .and_then(Value::as_str)
     {
-        Some(text) => ChatChunk::Text(text.to_owned()),
-        None => ChatChunk::Skip,
+        out.push(Chunk::Text(text.to_owned()));
     }
+    if let Some(usage) = value.get("usage").filter(|u| u.is_object()) {
+        out.push(Chunk::Usage(Usage {
+            input_tokens: usage.get("prompt_tokens").and_then(Value::as_u64),
+            output_tokens: usage.get("completion_tokens").and_then(Value::as_u64),
+        }));
+    }
+    out
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
@@ -486,7 +579,7 @@ fn parse_models(body: &str, lmstudio: bool) -> Option<Vec<ModelInfo>> {
     Some(models)
 }
 
-fn parse_embeddings(body: &str, expected: usize) -> Option<Vec<Vec<f32>>> {
+pub(crate) fn parse_embeddings(body: &str, expected: usize) -> Option<Vec<Vec<f32>>> {
     let value: Value = serde_json::from_str(body).ok()?;
     let data = value.get("data")?.as_array()?;
     if data.len() != expected {
@@ -573,20 +666,27 @@ mod tests {
 
     #[test]
     fn chat_events_are_parsed() {
-        assert_eq!(parse_chat_event("[DONE]"), ChatChunk::Done);
+        assert_eq!(parse_openai_event("[DONE]"), [Chunk::Done]);
         assert_eq!(
-            parse_chat_event(r#"{"choices":[{"delta":{"content":"ciao"}}]}"#),
-            ChatChunk::Text("ciao".into())
+            parse_openai_event(r#"{"choices":[{"delta":{"content":"ciao"}}]}"#),
+            [Chunk::Text("ciao".into())]
         );
-        assert_eq!(
-            parse_chat_event(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#),
-            ChatChunk::Skip
-        );
+        assert!(parse_openai_event(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#).is_empty());
         assert!(matches!(
-            parse_chat_event(r#"{"error":{"message":"boom"}}"#),
-            ChatChunk::Error(_)
+            parse_openai_event(r#"{"error":{"message":"boom"}}"#)[..],
+            [Chunk::Error(_)]
         ));
-        assert!(matches!(parse_chat_event("not json"), ChatChunk::Error(_)));
+        assert!(matches!(parse_openai_event("not json")[..], [Chunk::Error(_)]));
+        assert_eq!(
+            parse_openai_event(
+                r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}"#
+            ),
+            [Chunk::Usage(Usage {
+                input_tokens: Some(12),
+                output_tokens: Some(3)
+            })]
+        );
+        assert!(parse_openai_event(r#"{"choices":[],"usage":null}"#).is_empty());
     }
 
     #[test]

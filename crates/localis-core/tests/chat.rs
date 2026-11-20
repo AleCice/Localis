@@ -13,9 +13,11 @@ use std::time::{Duration, Instant};
 use common::fake_lm::{
     closed_url, token_vector, ChatMode, FakeLm, ANSWER, CHAT_MODEL, EMBED_MODEL,
 };
+use common::keys::MemoryKeys;
 use common::*;
 use localis_core::{
     run_embedder, run_worker, send_message, ChatEvent, ChatMessage, ChatPhase, ChatRuntime,
+    CloudEnv, CloudRuntime, Endpoints, Keys, ModelRef,
     CoreError, EmbedderConfig, EmbedderShared, EmbeddingState, ImportFile, ImportOutcome,
     LibraryDocument, LlmClient, LlmSettings, MessageKind, MessageStatus, ModelKind, PromptMessage,
     RetrievalMode, RetrievalScope, Role, ScopeReason, SendInput, Store, StreamEnd, Via,
@@ -37,6 +39,27 @@ struct Chat {
     rt: ChatRuntime,
     fake: FakeLm,
     project: String,
+    cloud: CloudRuntime,
+}
+
+/// LM Studio embedding key of the fake embedding model.
+fn embed_key() -> String {
+    ModelRef::lmstudio(EMBED_MODEL).embedding_key()
+}
+
+fn lm(model: &str) -> Option<ModelRef> {
+    Some(ModelRef::lmstudio(model))
+}
+
+fn no_keys() -> Keys {
+    std::sync::Arc::new(MemoryKeys::default())
+}
+
+fn cloud_env() -> CloudEnv {
+    CloudEnv {
+        keys: no_keys(),
+        endpoints: Endpoints::default(),
+    }
 }
 
 impl Chat {
@@ -47,8 +70,8 @@ impl Chat {
         env.store
             .set_llm_settings(&LlmSettings {
                 base_url: fake.url.clone(),
-                chat_model: Some(CHAT_MODEL.into()),
-                embedding_model: None,
+                chat_model: lm(CHAT_MODEL),
+                ..LlmSettings::default()
             })
             .unwrap();
         let Env { dir, store } = env;
@@ -58,6 +81,7 @@ impl Chat {
             rt: ChatRuntime::new(),
             fake,
             project,
+            cloud: CloudRuntime::new(no_keys(), Endpoints::default()),
         }
     }
 
@@ -101,10 +125,12 @@ impl Chat {
         let result = send_message(
             &self.db,
             &self.rt,
+            &self.cloud,
             SendInput {
                 conversation_id: conversation.into(),
                 text: text.into(),
                 document_ids: docs.iter().map(|d| (*d).to_owned()).collect(),
+                confirm_token: None,
             },
             &mut |e| events.push(e),
         );
@@ -120,7 +146,7 @@ impl Chat {
         let client = LlmClient::new(&self.fake.url).unwrap();
         let mut store = self.store();
         loop {
-            let batch = store.pending_embeddings(EMBED_MODEL, 32).unwrap();
+            let batch = store.pending_embeddings(&embed_key(), 32).unwrap();
             if batch.is_empty() {
                 break;
             }
@@ -128,7 +154,7 @@ impl Chat {
             let vectors = client.embed(EMBED_MODEL, &texts, SHORT_TIMEOUT).unwrap();
             let items: Vec<(i64, Vec<f32>)> =
                 batch.iter().map(|(id, _)| *id).zip(vectors).collect();
-            store.save_embeddings(EMBED_MODEL, &items).unwrap();
+            store.save_embeddings(&embed_key(), &items).unwrap();
         }
     }
 
@@ -176,7 +202,11 @@ fn reset_to_v02(path: &std::path::Path) {
     conn.execute_batch(
         "DROP TABLE message_candidates; DROP TABLE message_sources; DROP TABLE messages;
          DROP TABLE conversations; DROP TABLE chunk_embeddings; DROP TABLE chunks_fts;
-         DROP TABLE chunks; DROP TABLE settings; PRAGMA user_version = 2;",
+         DROP TABLE chunks; DROP TABLE settings;
+         DROP TABLE cloud_requests; DROP TABLE model_prices;
+         ALTER TABLE projects DROP COLUMN cloud_policy;
+         ALTER TABLE projects DROP COLUMN cloud_embedding_consent;
+         PRAGMA user_version = 2;",
     )
     .unwrap();
 }
@@ -261,7 +291,7 @@ fn passages_follow_extraction_and_deletion() {
     assert!(n >= 3, "1600 chars split + second block: {n}");
     let max_len: i64 = chat.count("SELECT MAX(char_end - char_start) FROM chunks");
     assert!(max_len <= 1200);
-    chat.settings(|s| s.embedding_model = Some(EMBED_MODEL.into()));
+    chat.settings(|s| s.embedding_model = lm(EMBED_MODEL));
     chat.embed_all();
     assert_eq!(chat.count("SELECT COUNT(*) FROM chunk_embeddings"), n);
     chat.store().delete_document(&doc.id).unwrap();
@@ -454,14 +484,20 @@ fn embedder_indexes_reports_progress_and_backs_off() {
 
     // Unreachable first: honest state, growing delay, nothing marked as failed.
     chat.settings(|s| {
-        s.embedding_model = Some(EMBED_MODEL.into());
+        s.embedding_model = lm(EMBED_MODEL);
         s.base_url = closed_url();
     });
     let path = chat.path();
     let (wake, rx) = mpsc::sync_channel(1);
     let thread_shared = Arc::clone(&shared);
     let embedder = std::thread::spawn(move || {
-        run_embedder(|| Store::open(&path), rx, thread_shared, fast_embedder())
+        run_embedder(
+            || Store::open(&path),
+            rx,
+            thread_shared,
+            fast_embedder(),
+            cloud_env(),
+        )
     });
     wait_until("max backoff", Duration::from_secs(10), || {
         shared.snapshot().retry_in == Some(Duration::from_millis(200))
@@ -513,14 +549,14 @@ fn embedder_indexes_reports_progress_and_backs_off() {
     });
 
     // Changing model: old vectors stay but do not count.
-    chat.settings(|s| s.embedding_model = Some("other-embed".into()));
+    chat.settings(|s| s.embedding_model = lm("other-embed"));
     let st = chat
         .store()
         .embedding_status(&chat.project, &shared)
         .unwrap();
     assert_eq!(st.embedded, 0);
     assert_eq!(
-        chat.count("SELECT COUNT(*) FROM chunk_embeddings WHERE model = 'fake-embed'"),
+        chat.count("SELECT COUNT(*) FROM chunk_embeddings WHERE model = 'lmstudio:fake-embed'"),
         6
     );
 
@@ -928,7 +964,7 @@ fn hybrid_only_when_embeddings_exist_and_query_embedding_succeeds() {
     chat.import("analisi.md", ANALISI.as_bytes());
     chat.import("storia.txt", STORIA.as_bytes());
     let conv = chat.conversation();
-    chat.settings(|s| s.embedding_model = Some(EMBED_MODEL.into()));
+    chat.settings(|s| s.embedding_model = lm(EMBED_MODEL));
 
     // Configured but nothing embedded yet → lexical, and no query embedding attempted.
     let m = chat.ask(&conv, "derivata di una funzione");
@@ -994,7 +1030,7 @@ fn llm_unavailable_paths_keep_the_retrieval() {
 
     // Server down.
     chat.settings(|s| {
-        s.chat_model = Some(CHAT_MODEL.into());
+        s.chat_model = lm(CHAT_MODEL);
         s.base_url = closed_url();
     });
     let (res, events) = chat.send(&conv, "derivata", &[]);
@@ -1042,10 +1078,12 @@ fn cancel_mid_stream_saves_partial_and_concurrent_send_conflicts() {
             send_message(
                 &chat_ref.db,
                 &chat_ref.rt,
+                &chat_ref.cloud,
                 SendInput {
                     conversation_id: conv_ref.into(),
                     text: "derivata".into(),
                     document_ids: vec![],
+                    confirm_token: None,
                 },
                 &mut |e| {
                     let _ = tx.send(e);
@@ -1272,7 +1310,7 @@ fn hybrid_mode_does_not_answer_questions_without_search_terms() {
     let chat = Chat::new();
     chat.import("analisi.md", ANALISI.as_bytes());
     chat.import("storia.txt", STORIA.as_bytes());
-    chat.settings(|s| s.embedding_model = Some(EMBED_MODEL.into()));
+    chat.settings(|s| s.embedding_model = lm(EMBED_MODEL));
     chat.embed_all();
     let conv = chat.conversation();
     let before = chat.fake.requests("/v1/embeddings").len();
