@@ -2,6 +2,7 @@ import { memo, useMemo } from "react";
 import type { ChatMessage, Source } from "../../api/types";
 import { AlertIcon, InfoIcon } from "../../components/Icons";
 import { Spinner } from "../../components/Spinner";
+import { formatMoney, formatUsage, isCloud, providerName } from "../../lib/models";
 import { citationLabel } from "./labels";
 import { Markdown, type CitationInfo } from "./Markdown";
 import { Sources } from "./Sources";
@@ -45,13 +46,23 @@ function ErrorPart({ message, onRetry, onOpenSettings, busy }: { message: ChatMe
   if (!error) return null;
   if (error.code === "cancelled") return <p className="msg-note">Risposta interrotta.</p>;
   const unavailable = error.code === "llm_unavailable";
+  const cloud = isCloud(message.provider ? { provider: message.provider, model: message.model ?? "" } : null);
   return (
     <div className="msg-error" role="note">
       <AlertIcon />
       <div className="msg-error-body">
         <p>{error.message || (unavailable ? "LM Studio non è raggiungibile." : "Non è stato possibile completare la risposta.")}</p>
         {unavailable ? (
-          <p className="hint">Avvia LM Studio e il suo server locale, poi scegli un modello di chat in Impostazioni.</p>
+          <p className="hint">
+            {cloud
+              ? `Controlla la chiave e il modello di ${providerName(message.provider)} in Impostazioni → Provider cloud. Localis non riprova con un altro provider.`
+              : "Avvia LM Studio e il suo server locale, poi scegli un modello di chat in Impostazioni."}
+          </p>
+        ) : error.code === "keyring_unavailable" ? (
+          <p className="hint">
+            Il portachiavi di sistema non è disponibile: Localis non può leggere la chiave API. Su Linux serve un servizio
+            Secret Service attivo (ad esempio GNOME Keyring).
+          </p>
         ) : null}
         {error.detail ? (
           <details className="banner-details">
@@ -145,6 +156,7 @@ export const AssistantMessage = memo(function AssistantMessage({
     >
       {body}
       {cancelled ? <p className="msg-note">Risposta interrotta.</p> : <ErrorPart message={message} onRetry={onRetry} onOpenSettings={onOpenSettings} busy={busy} />}
+      {!streaming && message.model ? <ModelLine message={message} /> : null}
       {!streaming ? (
         <div className="msg-foot">
           <Sources sources={message.sources} onOpen={onOpenSource} />
@@ -164,3 +176,12 @@ export const AssistantMessage = memo(function AssistantMessage({
     </article>
   );
 });
+
+/** Provider and model of an answer, with the usage and cost reported after the response. */
+function ModelLine({ message }: { message: ChatMessage }) {
+  const usage = formatUsage(message.usage);
+  const parts = [`${providerName(message.provider ?? "lmstudio")} · ${message.model}`];
+  if (usage) parts.push(usage);
+  if (message.cost) parts.push(formatMoney(message.cost));
+  return <p className="msg-model">{parts.join(" · ")}</p>;
+}

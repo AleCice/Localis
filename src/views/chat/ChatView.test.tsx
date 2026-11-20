@@ -2,8 +2,17 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../../api/client";
-import type { ChatEvent, ChatMessage, Conversation, SendMessageInput } from "../../api/types";
-import { makeConversation, makeDocument, makeMessage, makeProject, makeSource } from "../../test/fixtures";
+import type { ChatEvent, ChatMessage, Conversation, Project, SendMessageInput } from "../../api/types";
+import {
+  LLM_SETTINGS,
+  makeConversation,
+  makeDocument,
+  makeMessage,
+  makePreview,
+  makeProject,
+  makeProvider,
+  makeSource,
+} from "../../test/fixtures";
 import { ChatView } from "./ChatView";
 
 vi.mock("../../api/client", () => ({
@@ -18,6 +27,11 @@ vi.mock("../../api/client", () => ({
     sendMessage: vi.fn(),
     cancelGeneration: vi.fn(),
     listDocuments: vi.fn(),
+    prepareCloudSend: vi.fn(),
+    discardCloudSend: vi.fn(),
+    getKeyringStatus: vi.fn(),
+    listProviders: vi.fn(),
+    listPrices: vi.fn(),
   },
 }));
 
@@ -32,7 +46,7 @@ function deferred<T = void>() {
   return { promise, resolve };
 }
 
-function renderChat(conversations: Conversation[] = [], messages: ChatMessage[] = []) {
+function renderChat(conversations: Conversation[] = [], messages: ChatMessage[] = [], forProject: Project = project) {
   mockedApi.listConversations.mockResolvedValue(conversations);
   mockedApi.listMessages.mockResolvedValue(messages);
   const props = {
@@ -44,7 +58,7 @@ function renderChat(conversations: Conversation[] = [], messages: ChatMessage[] 
   const user = userEvent.setup();
   render(
     <ChatView
-      project={project}
+      project={forProject}
       projectsStatus="ready"
       sidebarToggle={null}
       conversationId={null}
@@ -55,10 +69,16 @@ function renderChat(conversations: Conversation[] = [], messages: ChatMessage[] 
 }
 
 const composer = () => screen.getByRole("textbox", { name: "Domanda" });
+const SETTINGS = { ...LLM_SETTINGS, chatModel: { provider: "lmstudio" as const, model: "qwen" } };
 
 beforeEach(() => {
   vi.resetAllMocks();
-  mockedApi.getLlmSettings.mockResolvedValue({ baseUrl: "http://127.0.0.1:1234", chatModel: "qwen", embeddingModel: null });
+  mockedApi.getLlmSettings.mockResolvedValue(SETTINGS);
+  mockedApi.prepareCloudSend.mockResolvedValue(null);
+  mockedApi.discardCloudSend.mockResolvedValue();
+  mockedApi.getKeyringStatus.mockResolvedValue({ available: true, message: null, detail: null });
+  mockedApi.listProviders.mockResolvedValue([makeProvider("openai", { hasKey: true }), makeProvider("anthropic")]);
+  mockedApi.listPrices.mockResolvedValue([]);
   mockedApi.getLlmStatus.mockResolvedValue({
     reachable: true,
     message: null,
@@ -300,6 +320,7 @@ describe("inspector", () => {
         documentIds: [doc.id],
         scopeReason: "title",
         embeddingModel: "nomic-embed",
+        embeddingProvider: "lmstudio",
         query: '"teorema"* OR "zeri"',
       },
       sources: [
@@ -361,21 +382,27 @@ describe("scope and model", () => {
     mockedApi.setLlmSettings.mockImplementation(async (s) => s);
     const { user } = renderChat([]);
     const select = await screen.findByRole("combobox", { name: "Modello di chat" });
-    expect(within(select).getAllByRole("option").map((o) => o.textContent)).toEqual(["qwen", "llama (non caricato)"]);
-    await user.selectOptions(select, "llama");
+    const local = within(select).getByRole("group", { name: "Locale (LM Studio)" });
+    await waitFor(() =>
+      expect(within(local).getAllByRole("option").map((o) => o.textContent)).toEqual(["qwen", "llama (non caricato)"]),
+    );
+    await user.selectOptions(select, "lmstudio:llama");
     expect(mockedApi.setLlmSettings).toHaveBeenCalledWith({
-      baseUrl: "http://127.0.0.1:1234",
-      chatModel: "llama",
-      embeddingModel: null,
+      ...SETTINGS,
+      routing: "manual",
+      chatModel: { provider: "lmstudio", model: "llama" },
     });
   });
 
-  it("when LM Studio is unreachable shows the state and «Riprova» rechecks (no fake models)", async () => {
+  it("when LM Studio is unreachable says so in the list and «Riprova» rechecks (no fake models)", async () => {
     mockedApi.getLlmStatus.mockResolvedValue({ reachable: false, message: "LM Studio non risponde.", detail: null, models: [] });
     const { user } = renderChat([]);
-    expect(await screen.findByText("LM Studio non raggiungibile")).toBeInTheDocument();
-    expect(screen.queryByRole("combobox", { name: "Modello di chat" })).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Riprova" }));
+    const select = await screen.findByRole("combobox", { name: "Modello di chat" });
+    const local = within(select).getByRole("group", { name: "Locale (LM Studio)" });
+    await waitFor(() =>
+      expect(within(local).getAllByRole("option").map((o) => o.textContent)).toEqual(["qwen (LM Studio non raggiungibile)"]),
+    );
+    await user.click(screen.getByRole("button", { name: "Riprova a contattare LM Studio" }));
     await waitFor(() => expect(mockedApi.getLlmStatus).toHaveBeenCalledTimes(2));
   });
 });
@@ -412,5 +439,256 @@ describe("position sources", () => {
     await user.click(screen.getByRole("button", { name: "Mostra dettagli della risposta" }));
     const inspector = screen.getByRole("complementary", { name: "Dettagli della risposta" });
     expect(within(inspector).getAllByText(/inizio del documento \(nessun termine da cercare\)/).length).toBeGreaterThan(0);
+  });
+});
+
+describe("cloud send (v0.4)", () => {
+  const cloudProject = makeProject("Tesi", { cloudPolicy: "cloud_allowed" });
+  const CLOUD_SETTINGS = { ...LLM_SETTINGS, chatModel: { provider: "openai" as const, model: "gpt-test" } };
+
+  function cloudAnswer(conversation: Conversation, input: SendMessageInput) {
+    return makeMessage(conversation, "assistant", "Risposta dal cloud [1].", {
+      model: "gpt-test",
+      provider: "openai",
+      routeReason: "Scelto da te nelle impostazioni.",
+      usage: { inputTokens: 3050, outputTokens: 120 },
+      cost: { amount: 0.0089, currency: "USD" },
+      sources: [makeSource(doc, { unit: 3 })],
+      content: `Risposta dal cloud [1]. (${input.text})`,
+    });
+  }
+
+  beforeEach(() => {
+    mockedApi.getLlmSettings.mockResolvedValue(CLOUD_SETTINGS);
+  });
+
+  it("a local route sends directly, without any dialog", async () => {
+    mockedApi.getLlmSettings.mockResolvedValue(SETTINGS);
+    const conversation = makeConversation("Locale");
+    mockedApi.sendMessage.mockResolvedValue(makeMessage(conversation, "assistant", "Ok."));
+    const { user } = renderChat([conversation], [], cloudProject);
+    await waitFor(() => expect(mockedApi.listMessages).toHaveBeenCalled());
+    await user.type(composer(), "Domanda locale{Enter}");
+    await waitFor(() => expect(mockedApi.sendMessage).toHaveBeenCalledTimes(1));
+    expect(mockedApi.prepareCloudSend).toHaveBeenCalledWith({ conversationId: conversation.id, text: "Domanda locale" });
+    expect(mockedApi.sendMessage.mock.calls[0]![0]).toEqual({ conversationId: conversation.id, text: "Domanda locale" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows every detail of the payload; «Annulla» has the focus, discards the token and sends nothing", async () => {
+    const conversation = makeConversation("Cloud");
+    mockedApi.prepareCloudSend.mockResolvedValue(makePreview());
+    const { user } = renderChat([conversation], [], cloudProject);
+    await waitFor(() => expect(mockedApi.listMessages).toHaveBeenCalled());
+    await user.type(composer(), "Cosa dice il teorema degli zeri?{Enter}");
+
+    const dialog = await screen.findByRole("dialog", { name: "Inviare la domanda a OpenAI?" });
+    const cancel = within(dialog).getByRole("button", { name: "Annulla" });
+    expect(cancel).toHaveFocus();
+    expect(within(dialog).getByText(/api\.openai\.com/)).toBeInTheDocument();
+    expect(within(dialog).getByText("gpt-test")).toBeInTheDocument();
+    expect(within(dialog).getByText("Scelto da te nelle impostazioni.")).toBeInTheDocument();
+    expect(within(dialog).getByText("Cosa dice il teorema degli zeri?", { selector: "blockquote" })).toBeInTheDocument();
+    const sent = within(dialog).getByRole("list", { name: "Passaggi inviati" });
+    expect(within(sent).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "[1] Dispensa.pdf, p. 3 · 812 caratteri",
+      "[2] Appunti.md, blocco 4 · 400 caratteri",
+    ]);
+    expect(within(dialog).getByText(/1 scambio precedente della conversazione \(230 caratteri\)/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/12\.345 caratteri · circa 3\.?087 token in ingresso \(stima\) · al massimo 2\.?048 token in uscita/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/^da 0,0077\s?(USD|US\$|\$) a 0,0282\s?(USD|US\$|\$) \(stima\)$/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/I file originali restano su questo computer/)).toBeInTheDocument();
+    expect(within(dialog).queryByText("Già inviato")).not.toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Invia a OpenAI" })).toBeInTheDocument();
+    // Nothing was sent while the dialog is open.
+    expect(mockedApi.sendMessage).not.toHaveBeenCalled();
+    expect(screen.getByText(/In attesa della tua conferma/)).toBeInTheDocument();
+
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(mockedApi.discardCloudSend).toHaveBeenCalledWith("token-1");
+    expect(mockedApi.sendMessage).not.toHaveBeenCalled();
+    expect(composer()).toHaveValue("Cosa dice il teorema degli zeri?");
+    expect(screen.getByText("Invio annullato: nulla è stato inviato a OpenAI.")).toBeInTheDocument();
+  });
+
+  it("Esc cancels like «Annulla»", async () => {
+    const conversation = makeConversation("Esc");
+    mockedApi.prepareCloudSend.mockResolvedValue(makePreview());
+    const { user } = renderChat([conversation], [], cloudProject);
+    await waitFor(() => expect(mockedApi.listMessages).toHaveBeenCalled());
+    await user.type(composer(), "Domanda{Enter}");
+    await screen.findByRole("dialog", { name: "Inviare la domanda a OpenAI?" });
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(mockedApi.discardCloudSend).toHaveBeenCalledWith("token-1"));
+    expect(mockedApi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("confirming sends with the token; usage and cost appear under the answer; the next question asks again", async () => {
+    const conversation = makeConversation("Conferma");
+    let n = 0;
+    mockedApi.prepareCloudSend.mockImplementation(async (input) => makePreview({ token: `token-${++n}`, question: input.text }));
+    mockedApi.sendMessage.mockImplementation(async (input) => cloudAnswer(conversation, input));
+    const { user } = renderChat([conversation], [], cloudProject);
+    await waitFor(() => expect(mockedApi.listMessages).toHaveBeenCalled());
+
+    await user.type(composer(), "Prima domanda{Enter}");
+    let dialog = await screen.findByRole("dialog", { name: "Inviare la domanda a OpenAI?" });
+    await user.click(within(dialog).getByRole("button", { name: "Invia a OpenAI" }));
+    await waitFor(() => expect(mockedApi.sendMessage).toHaveBeenCalledTimes(1));
+    expect(mockedApi.sendMessage.mock.calls[0]![0]).toEqual({
+      conversationId: conversation.id,
+      text: "Prima domanda",
+      confirmToken: "token-1",
+    });
+    const answer = await screen.findByText(/Risposta dal cloud/, { selector: ".markdown p, p" });
+    const article = answer.closest("article")!;
+    expect(within(article).getByText(/^OpenAI · gpt-test · 3\.?050 token in ingresso, 120 in uscita · 0,0089/)).toBeInTheDocument();
+
+    await user.type(composer(), "Seconda domanda{Enter}");
+    dialog = await screen.findByRole("dialog", { name: "Inviare la domanda a OpenAI?" });
+    expect(within(dialog).getByText("Seconda domanda", { selector: "blockquote" })).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Invia a OpenAI" }));
+    await waitFor(() => expect(mockedApi.sendMessage).toHaveBeenCalledTimes(2));
+    expect(mockedApi.prepareCloudSend).toHaveBeenCalledTimes(2);
+    expect(mockedApi.sendMessage.mock.calls[1]![0]).toMatchObject({ text: "Seconda domanda", confirmToken: "token-2" });
+  });
+
+  it("without a price the cost is «non stimabile»; a query embedding already sent is declared", async () => {
+    const conversation = makeConversation("Prezzo");
+    mockedApi.prepareCloudSend.mockResolvedValue(
+      makePreview({ estCost: null, historyPairs: 0, queryEmbeddedBy: { provider: "openai", model: "embed-test" } }),
+    );
+    const { user } = renderChat([conversation], [], cloudProject);
+    await waitFor(() => expect(mockedApi.listMessages).toHaveBeenCalled());
+    await user.type(composer(), "Domanda{Enter}");
+    const dialog = await screen.findByRole("dialog", { name: "Inviare la domanda a OpenAI?" });
+    expect(within(dialog).getByText("Costo non stimabile: imposta il prezzo in Impostazioni")).toBeInTheDocument();
+    expect(within(dialog).getByText(/la domanda è stata inviata a OpenAI · embed-test/)).toBeInTheDocument();
+    expect(within(dialog).getByText("Nessuno scambio precedente della conversazione.")).toBeInTheDocument();
+  });
+
+  it("an expired confirmation (consent_required) prepares again and asks again", async () => {
+    const conversation = makeConversation("Scaduta");
+    let n = 0;
+    mockedApi.prepareCloudSend.mockImplementation(async () => makePreview({ token: `token-${++n}` }));
+    mockedApi.sendMessage
+      .mockRejectedValueOnce({ code: "consent_required", message: "Conferma non più valida." })
+      .mockImplementation(async (input) => cloudAnswer(conversation, input));
+    const { user } = renderChat([conversation], [], cloudProject);
+    await waitFor(() => expect(mockedApi.listMessages).toHaveBeenCalled());
+    await user.type(composer(), "Domanda{Enter}");
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Invia a OpenAI" }));
+
+    const again = await screen.findByRole("dialog", { name: "Inviare la domanda a OpenAI?" });
+    expect(within(again).getByText(/La conferma precedente non è più valida/)).toBeInTheDocument();
+    expect(within(again).getByRole("button", { name: "Annulla" })).toHaveFocus();
+    expect(mockedApi.prepareCloudSend).toHaveBeenCalledTimes(2);
+    await user.click(within(again).getByRole("button", { name: "Invia a OpenAI" }));
+    await waitFor(() => expect(mockedApi.sendMessage).toHaveBeenCalledTimes(2));
+    expect(mockedApi.sendMessage.mock.calls[1]![0]).toMatchObject({ confirmToken: "token-2" });
+  });
+
+  it("consent_required for a local-only project explains what to do and sends nothing", async () => {
+    const conversation = makeConversation("Solo locale");
+    mockedApi.prepareCloudSend.mockRejectedValue({
+      code: "consent_required",
+      message: "Questo progetto è impostato su «Solo locale»: nessun dato può essere inviato a un provider cloud.",
+    });
+    const { user, onGoToProjects } = renderChat([conversation]);
+    await waitFor(() => expect(mockedApi.listMessages).toHaveBeenCalled());
+    await user.type(composer(), "Domanda{Enter}");
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("«Solo locale»");
+    expect(alert).toHaveTextContent(/Nulla è stato inviato/);
+    expect(mockedApi.sendMessage).not.toHaveBeenCalled();
+    expect(composer()).toHaveValue("Domanda");
+    await user.click(within(alert).getByRole("button", { name: "Progetti → Uso del cloud" }));
+    expect(onGoToProjects).toHaveBeenCalled();
+  });
+
+  it("keyring_unavailable gives plain guidance", async () => {
+    const conversation = makeConversation("Portachiavi");
+    mockedApi.prepareCloudSend.mockResolvedValue(makePreview());
+    mockedApi.sendMessage.mockRejectedValue({ code: "keyring_unavailable", message: "Il portachiavi di sistema non è disponibile." });
+    const { user } = renderChat([conversation], [], cloudProject);
+    await waitFor(() => expect(mockedApi.listMessages).toHaveBeenCalled());
+    await user.type(composer(), "Domanda{Enter}");
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Invia a OpenAI" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Il portachiavi di sistema non è disponibile.");
+    expect(alert).toHaveTextContent(/Secret Service/);
+  });
+
+  it("the picker groups models; cloud entries are disabled with the reason; the active cloud route is stated", async () => {
+    mockedApi.listPrices.mockResolvedValue([
+      { provider: "openai", model: "gpt-test", inputPerMTok: 2.5, outputPerMTok: 10, currency: "USD" },
+      { provider: "anthropic", model: "claude-test", inputPerMTok: 3, outputPerMTok: 15, currency: "USD" },
+    ]);
+    // Local-only project: every cloud entry is disabled.
+    renderChat([], [], project);
+    const select = await screen.findByRole("combobox", { name: "Modello di chat" });
+    const cloudGroup = within(select).getByRole("group", { name: "Cloud" });
+    await waitFor(() => expect(within(cloudGroup).getAllByRole("option")).toHaveLength(2));
+    for (const option of within(cloudGroup).getAllByRole("option")) {
+      expect(option).toBeDisabled();
+      expect(option.textContent).toMatch(/— progetto solo locale$/);
+    }
+    expect(screen.getByText("Cloud non consentito in questo progetto")).toBeInTheDocument();
+  });
+
+  it("in a project that allows the cloud, only providers without a key are disabled", async () => {
+    mockedApi.listPrices.mockResolvedValue([
+      { provider: "openai", model: "gpt-test", inputPerMTok: 2.5, outputPerMTok: 10, currency: "USD" },
+      { provider: "anthropic", model: "claude-test", inputPerMTok: 3, outputPerMTok: 15, currency: "USD" },
+    ]);
+    renderChat([], [], cloudProject);
+    const select = await screen.findByRole("combobox", { name: "Modello di chat" });
+    const cloudGroup = within(select).getByRole("group", { name: "Cloud" });
+    const openai = await within(cloudGroup).findByRole("option", { name: "OpenAI · gpt-test" });
+    expect(openai).toBeEnabled();
+    expect(within(cloudGroup).getByRole("option", { name: "Anthropic · claude-test — nessuna chiave" })).toBeDisabled();
+    expect(screen.getByText("Cloud: OpenAI · gpt-test")).toBeInTheDocument();
+  });
+
+  it("offers «Automatico» when routing is automatic", async () => {
+    mockedApi.getLlmSettings.mockResolvedValue({
+      ...LLM_SETTINGS,
+      routing: "auto",
+      autoModels: [{ provider: "lmstudio", model: "qwen" }, { provider: "openai", model: "gpt-test" }],
+    });
+    renderChat([], [], cloudProject);
+    const select = await screen.findByRole("combobox", { name: "Modello di chat" });
+    await waitFor(() => expect(select).toHaveValue("auto"));
+    expect(within(select).getByRole("option", { name: "Automatico" })).toBeInTheDocument();
+  });
+
+  it("the inspector shows the routing decision and the embedding provider", async () => {
+    const conversation = makeConversation("Ispeziona cloud");
+    const answer = makeMessage(conversation, "assistant", "Vero [1].", {
+      model: "gpt-test",
+      provider: "openai",
+      routeReason: "Scelto automaticamente: LM Studio non è raggiungibile; il modello cloud più economico.",
+      usage: { inputTokens: 900, outputTokens: 50 },
+      cost: { amount: 0.0021, currency: "EUR" },
+      retrieval: {
+        mode: "hybrid",
+        scope: "project",
+        documentIds: [],
+        scopeReason: null,
+        embeddingModel: "embed-test",
+        embeddingProvider: "openai",
+        query: '"zeri"*',
+      },
+      sources: [makeSource(doc)],
+    });
+    const { user } = renderChat([conversation], [answer], cloudProject);
+    await screen.findByRole("button", { name: /^Fonte 1/ });
+    await user.click(screen.getByRole("button", { name: "Mostra dettagli della risposta" }));
+    const inspector = screen.getByRole("complementary", { name: "Dettagli della risposta" });
+    expect(within(inspector).getByText(/Scelto automaticamente: LM Studio non è raggiungibile/)).toBeInTheDocument();
+    expect(within(inspector).getByText(/OpenAI · embed-test/)).toBeInTheDocument();
+    expect(within(inspector).getByText("gpt-test")).toBeInTheDocument();
+    expect(within(inspector).getByText(/900 token in ingresso, 50 in uscita · 0,0021/)).toBeInTheDocument();
   });
 });

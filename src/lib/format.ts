@@ -39,3 +39,11 @@ export function fileExtension(name: string): string {
   const dot = name.lastIndexOf(".");
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
 }
+
+const shortDateTimeFormatter = new Intl.DateTimeFormat("it-IT", { dateStyle: "medium", timeStyle: "short" });
+
+/** Compact date and time (e.g. "12 nov 2026, 10:57") for tables. */
+export function formatDateTimeShort(iso: string): string {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : shortDateTimeFormatter.format(date);
+}

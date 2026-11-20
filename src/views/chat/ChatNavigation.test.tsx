@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../../api/client";
 import type { LibraryDocument } from "../../api/types";
 import { App } from "../../App";
-import { makeConversation, makeDocument, makeMessage, makeProject, makeSource } from "../../test/fixtures";
+import { LLM_SETTINGS, makeConversation, makeDocument, makeMessage, makeProject, makeSource, makeProvider } from "../../test/fixtures";
 
 vi.mock("../../api/client", () => ({
   api: {
@@ -16,6 +16,10 @@ vi.mock("../../api/client", () => ({
     getText: vi.fn(),
     readOriginal: vi.fn(),
     getLlmSettings: vi.fn(),
+    getKeyringStatus: vi.fn(),
+    listProviders: vi.fn(),
+    listPrices: vi.fn(),
+    listCloudRequests: vi.fn(),
     getLlmStatus: vi.fn(),
     listConversations: vi.fn(),
     listMessages: vi.fn(),
@@ -44,7 +48,11 @@ beforeEach(() => {
   vi.resetAllMocks();
   mockedApi.listFolders.mockResolvedValue([]);
   mockedApi.listJobs.mockResolvedValue([]);
-  mockedApi.getLlmSettings.mockResolvedValue({ baseUrl: "http://127.0.0.1:1234", chatModel: null, embeddingModel: null });
+  mockedApi.getLlmSettings.mockResolvedValue(LLM_SETTINGS);
+  mockedApi.getKeyringStatus.mockResolvedValue({ available: true, message: null, detail: null });
+  mockedApi.listProviders.mockResolvedValue([makeProvider("openai")]);
+  mockedApi.listPrices.mockResolvedValue([]);
+  mockedApi.listCloudRequests.mockResolvedValue([]);
   mockedApi.getLlmStatus.mockResolvedValue({ reachable: false, message: null, detail: null, models: [] });
   mockedApi.getText.mockResolvedValue([
     { unit: 1, text: "Primo blocco." },

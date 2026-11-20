@@ -1,6 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { SidebarIcon } from "./components/Icons";
 import { Sidebar, type SidebarDisplay, type ViewId } from "./components/Sidebar";
+import { CloudStoreProvider } from "./hooks/useCloud";
 import { useMediaQuery } from "./hooks/useMediaQuery";
 import { useProjects } from "./hooks/useProjects";
 import { useTheme } from "./hooks/useTheme";
@@ -120,70 +121,72 @@ export function App() {
   );
 
   return (
-    <div className="app" data-sidebar={display}>
-      <Sidebar
-        id={SIDEBAR_ID}
-        display={display}
-        view={view}
-        onNavigate={(next) => {
-          setView(next);
-          setOverlayOpen(false);
-        }}
-        onToggleLabels={toggleLabels}
-      />
-      {display === "overlay" ? (
-        <div className="sidebar-scrim" aria-hidden="true" onClick={() => setOverlayOpen(false)} />
-      ) : null}
-      <main className="main">
-        {view === "projects" ? (
-          <ProjectsView
-            store={store}
-            selectedId={selectedId}
-            onSelect={setSelectedId}
-            onboarded={onboarded}
-            onOnboarded={markOnboarded}
-            sidebarToggle={sidebarToggle}
-            onOpenLibrary={() => {
-              if (selectedProject) setSelectedId(selectedProject.id);
-              setView("library");
-            }}
-          />
-        ) : view === "library" ? (
-          <LibraryView
-            project={selectedProject}
-            projectsStatus={store.status}
-            onGoToProjects={() => setView("projects")}
-            sidebarToggle={sidebarToggle}
-            link={libraryLink}
-            onLinkHandled={() => setLibraryLink(null)}
-            onBackToChat={chatVisited ? () => setView("chat") : undefined}
-          />
-        ) : view === "settings" ? (
-          <SettingsView
-            theme={theme}
-            onThemeChange={setTheme}
-            sidebarToggle={sidebarToggle}
-            project={selectedProject}
-          />
+    <CloudStoreProvider>
+      <div className="app" data-sidebar={display}>
+        <Sidebar
+          id={SIDEBAR_ID}
+          display={display}
+          view={view}
+          onNavigate={(next) => {
+            setView(next);
+            setOverlayOpen(false);
+          }}
+          onToggleLabels={toggleLabels}
+        />
+        {display === "overlay" ? (
+          <div className="sidebar-scrim" aria-hidden="true" onClick={() => setOverlayOpen(false)} />
         ) : null}
-        {chatVisited || view === "chat" ? (
-          <div className="view-slot" hidden={view !== "chat"}>
-            <Suspense fallback={null}>
-              <ChatView
-                project={selectedProject}
-                projectsStatus={store.status}
-                onGoToProjects={() => setView("projects")}
-                sidebarToggle={sidebarToggle}
-                conversationId={conversationId}
-                onConversationChange={setConversationId}
-                onOpenSource={openSource}
-                onOpenSettings={() => setView("settings")}
-                active={view === "chat"}
-              />
-            </Suspense>
-          </div>
-        ) : null}
-      </main>
-    </div>
+        <main className="main">
+          {view === "projects" ? (
+            <ProjectsView
+              store={store}
+              selectedId={selectedId}
+              onSelect={setSelectedId}
+              onboarded={onboarded}
+              onOnboarded={markOnboarded}
+              sidebarToggle={sidebarToggle}
+              onOpenLibrary={() => {
+                if (selectedProject) setSelectedId(selectedProject.id);
+                setView("library");
+              }}
+            />
+          ) : view === "library" ? (
+            <LibraryView
+              project={selectedProject}
+              projectsStatus={store.status}
+              onGoToProjects={() => setView("projects")}
+              sidebarToggle={sidebarToggle}
+              link={libraryLink}
+              onLinkHandled={() => setLibraryLink(null)}
+              onBackToChat={chatVisited ? () => setView("chat") : undefined}
+            />
+          ) : view === "settings" ? (
+            <SettingsView
+              theme={theme}
+              onThemeChange={setTheme}
+              sidebarToggle={sidebarToggle}
+              project={selectedProject}
+            />
+          ) : null}
+          {chatVisited || view === "chat" ? (
+            <div className="view-slot" hidden={view !== "chat"}>
+              <Suspense fallback={null}>
+                <ChatView
+                  project={selectedProject}
+                  projectsStatus={store.status}
+                  onGoToProjects={() => setView("projects")}
+                  sidebarToggle={sidebarToggle}
+                  conversationId={conversationId}
+                  onConversationChange={setConversationId}
+                  onOpenSource={openSource}
+                  onOpenSettings={() => setView("settings")}
+                  active={view === "chat"}
+                />
+              </Suspense>
+            </div>
+          ) : null}
+        </main>
+      </div>
+    </CloudStoreProvider>
   );
 }

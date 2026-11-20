@@ -1,62 +1,54 @@
 import { useState } from "react";
-import type { AppError } from "../../api/types";
+import type { AppError, Project } from "../../api/types";
 import { toAppError } from "../../api/types";
+import { GroupedSelect } from "../../components/GroupedSelect";
 import { Spinner } from "../../components/Spinner";
+import type { Cloud } from "../../hooks/useCloud";
 import { useDelayedFlag } from "../../hooks/useDelayedFlag";
-import { chatModels, type LlmStore } from "../../hooks/useLlm";
+import type { LlmStore } from "../../hooks/useLlm";
+import { isCloud, parseRefKey, providerName, refKey } from "../../lib/models";
+import { buildModelGroups } from "../modelOptions";
 
-/** Chat model selector for the chat header. Only lists models LM Studio actually reports. */
-export function ModelPicker({ llm }: { llm: LlmStore }) {
+const AUTO = "auto";
+
+/**
+ * Chat model selector for the chat header: LM Studio models it reports, cloud models known to
+ * Localis (loaded in Impostazioni, priced or configured) and «Automatico» when routing is set up.
+ */
+export function ModelPicker({ llm, cloud, project }: { llm: LlmStore; cloud: Cloud; project: Project }) {
   const { settings, status, checking } = llm;
   const [error, setError] = useState<AppError | null>(null);
   const [saving, setSaving] = useState(false);
   const showChecking = useDelayedFlag(checking && !status);
 
-  if (!status || !settings) {
+  if (!settings) {
     return showChecking ? (
       <span className="model-state" role="status">
         <Spinner />
-        Verifica di LM Studio…
+        Verifica dei modelli…
       </span>
     ) : null;
   }
 
-  const recheck = (
-    <button type="button" className="btn btn-ghost btn-sm" onClick={() => void llm.recheck()} disabled={checking} aria-busy={checking}>
-      {checking ? <Spinner /> : null}
-      Riprova
-    </button>
-  );
+  const groups = buildModelGroups({
+    purpose: "chat",
+    status,
+    cloud,
+    configured: [settings.chatModel, ...settings.autoModels],
+    project,
+  });
+  const offerAuto = settings.routing === "auto" || settings.autoModels.length > 0;
+  const value = settings.routing === "auto" ? AUTO : settings.chatModel ? refKey(settings.chatModel) : "";
 
-  if (!status.reachable) {
-    return (
-      <span className="model-picker">
-        <span className="model-state is-off" title={status.message ?? undefined}>
-          LM Studio non raggiungibile
-        </span>
-        {recheck}
-      </span>
-    );
-  }
-
-  const models = chatModels(status);
-  if (models.length === 0) {
-    return (
-      <span className="model-picker">
-        <span className="model-state is-off">Nessun modello di chat in LM Studio</span>
-        {recheck}
-      </span>
-    );
-  }
-
-  const current = settings.chatModel ?? "";
-  const missing = current !== "" && !models.some((m) => m.id === current);
-
-  const choose = async (value: string) => {
+  const choose = async (next: string) => {
     setError(null);
     setSaving(true);
     try {
-      await llm.save({ ...settings, chatModel: value || null });
+      if (next === AUTO) await llm.save({ ...settings, routing: "auto" });
+      else {
+        const ref = parseRefKey(next);
+        if (ref) await llm.save({ ...settings, routing: "manual", chatModel: ref });
+      }
     } catch (err) {
       setError(toAppError(err));
     } finally {
@@ -64,25 +56,46 @@ export function ModelPicker({ llm }: { llm: LlmStore }) {
     }
   };
 
+  const manualCloud = settings.routing === "manual" && isCloud(settings.chatModel) ? settings.chatModel : null;
+  let indicator: { text: string; off: boolean } | null = null;
+  if (manualCloud) {
+    indicator =
+      project.cloudPolicy === "local_only"
+        ? { text: "Cloud non consentito in questo progetto", off: true }
+        : { text: `Cloud: ${providerName(manualCloud.provider)} · ${manualCloud.model}`, off: false };
+  }
+
   return (
     <span className="model-picker">
       <label className="model-select">
         <span className="visually-hidden">Modello di chat</span>
-        <select value={current} onChange={(e) => void choose(e.target.value)} disabled={saving} title="Modello di chat">
-          {current === "" ? (
-            <option value="" disabled>
-              Scegli un modello
-            </option>
-          ) : null}
-          {missing ? <option value={current}>{current} (non trovato in LM Studio)</option> : null}
-          {models.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.id}
-              {m.state === "not-loaded" ? " (non caricato)" : ""}
-            </option>
-          ))}
-        </select>
+        <GroupedSelect
+          value={value}
+          groups={groups}
+          leading={offerAuto ? [{ value: AUTO, label: "Automatico" }] : []}
+          placeholder="Scegli un modello"
+          onChange={(v) => void choose(v)}
+          disabled={saving}
+          title="Modello di chat"
+        />
       </label>
+      {indicator ? (
+        <span className={indicator.off ? "model-state is-off" : "model-state"}>{indicator.text}</span>
+      ) : null}
+      {status && !status.reachable ? (
+        <button
+          type="button"
+          className="btn btn-ghost btn-sm"
+          onClick={() => void llm.recheck()}
+          disabled={checking}
+          aria-busy={checking}
+          title={status.message ?? "LM Studio non raggiungibile"}
+          aria-label="Riprova a contattare LM Studio"
+        >
+          {checking ? <Spinner /> : null}
+          Riprova
+        </button>
+      ) : null}
       {error ? (
         <span className="field-error" role="alert">
           {error.message}

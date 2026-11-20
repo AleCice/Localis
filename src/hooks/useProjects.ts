@@ -14,6 +14,8 @@ export interface ProjectsStore {
   create: (input: NewProjectInput) => Promise<Project>;
   /** Deletes a project; rejects with an AppError. */
   remove: (id: string) => Promise<void>;
+  /** Replaces a project changed by another command (e.g. its cloud policy). */
+  replace: (project: Project) => void;
 }
 
 const byUpdatedDesc = (a: Project, b: Project) => b.updatedAt.localeCompare(a.updatedAt);
@@ -68,5 +70,9 @@ export function useProjects(): ProjectsStore {
     setProjects((prev) => prev.filter((p) => p.id !== id));
   }, []);
 
-  return { status, loadError, projects, reload, create, remove };
+  const replace = useCallback((project: Project) => {
+    setProjects((prev) => prev.map((p) => (p.id === project.id ? project : p)));
+  }, []);
+
+  return { status, loadError, projects, reload, create, remove, replace };
 }

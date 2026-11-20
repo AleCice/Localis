@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "./api/client";
 import type { AppError, Project } from "./api/types";
 import { App } from "./App";
-import { makeProject } from "./test/fixtures";
+import { LLM_SETTINGS, makeProject, makeProvider } from "./test/fixtures";
 import { setSystemDark } from "./test/setup";
 
 vi.mock("./api/client", () => ({
@@ -16,6 +16,10 @@ vi.mock("./api/client", () => ({
     listDocuments: vi.fn(),
     listJobs: vi.fn(),
     getLlmSettings: vi.fn(),
+    getKeyringStatus: vi.fn(),
+    listProviders: vi.fn(),
+    listPrices: vi.fn(),
+    listCloudRequests: vi.fn(),
     getLlmStatus: vi.fn(),
     getEmbeddingStatus: vi.fn(),
     listConversations: vi.fn(),
@@ -41,9 +45,13 @@ beforeEach(() => {
   mockedApi.listDocuments.mockResolvedValue([]);
   mockedApi.listFolders.mockResolvedValue([]);
   mockedApi.listJobs.mockResolvedValue([]);
-  mockedApi.getLlmSettings.mockResolvedValue({ baseUrl: "http://127.0.0.1:1234", chatModel: null, embeddingModel: null });
+  mockedApi.getLlmSettings.mockResolvedValue(LLM_SETTINGS);
+  mockedApi.getKeyringStatus.mockResolvedValue({ available: true, message: null, detail: null });
+  mockedApi.listProviders.mockResolvedValue([makeProvider("openai")]);
+  mockedApi.listPrices.mockResolvedValue([]);
+  mockedApi.listCloudRequests.mockResolvedValue([]);
   mockedApi.getLlmStatus.mockResolvedValue({ reachable: false, message: "LM Studio non risponde.", detail: null, models: [] });
-  mockedApi.getEmbeddingStatus.mockResolvedValue({ state: "disabled", model: null, total: 0, embedded: 0, message: null });
+  mockedApi.getEmbeddingStatus.mockResolvedValue({ state: "disabled", provider: null, model: null, total: 0, embedded: 0, message: null });
   mockedApi.listConversations.mockResolvedValue([]);
   mockedApi.listMessages.mockResolvedValue([]);
 });

@@ -1,5 +1,9 @@
 import type {
   ChatMessage,
+  CloudPreview,
+  CloudProviderId,
+  LlmSettings,
+  ProviderInfo,
   Conversation,
   DocumentKind,
   DocumentVersion,
@@ -24,6 +28,8 @@ export function makeProject(name: string, overrides: Partial<Project> = {}): Pro
     description: null,
     createdAt: stamp,
     updatedAt: stamp,
+    cloudPolicy: "local_only",
+    cloudEmbeddingConsent: false,
     ...overrides,
   };
 }
@@ -168,13 +174,65 @@ export function makeMessage(
     status: "complete",
     error: null,
     model: role === "assistant" ? "qwen2.5-7b-instruct" : null,
+    provider: role === "assistant" ? "lmstudio" : null,
+    routeReason: null,
+    usage: null,
+    cost: null,
     createdAt: at,
     retrieval:
       role === "assistant"
-        ? { mode: "lexical", scope: "project", documentIds: [], scopeReason: null, embeddingModel: null, query: '"teorema"* OR "zeri"' }
+        ? { mode: "lexical", scope: "project", documentIds: [], scopeReason: null, embeddingModel: null, embeddingProvider: null, query: '"teorema"* OR "zeri"' }
         : null,
     sources: [],
     candidates: [],
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------- v0.4 cloud
+
+export function makeProvider(id: CloudProviderId, overrides: Partial<ProviderInfo> = {}): ProviderInfo {
+  const meta: Record<CloudProviderId, Omit<ProviderInfo, "hasKey">> = {
+    openai: { id: "openai", name: "OpenAI", host: "api.openai.com", supportsChat: true, supportsEmbeddings: true },
+    anthropic: { id: "anthropic", name: "Anthropic", host: "api.anthropic.com", supportsChat: true, supportsEmbeddings: false },
+    gemini: { id: "gemini", name: "Google Gemini", host: "generativelanguage.googleapis.com", supportsChat: true, supportsEmbeddings: true },
+    deepseek: { id: "deepseek", name: "DeepSeek", host: "api.deepseek.com", supportsChat: true, supportsEmbeddings: false },
+    qwen: { id: "qwen", name: "Qwen (Alibaba Cloud)", host: "dashscope-intl.aliyuncs.com", supportsChat: true, supportsEmbeddings: true },
+  };
+  return { ...meta[id], hasKey: false, ...overrides };
+}
+
+export const LLM_SETTINGS: LlmSettings = {
+  baseUrl: "http://127.0.0.1:1234",
+  chatModel: null,
+  embeddingModel: null,
+  routing: "manual",
+  autoModels: [],
+};
+
+export function makePreview(overrides: Partial<CloudPreview> = {}): CloudPreview {
+  return {
+    token: "token-1",
+    route: {
+      model: { provider: "openai", model: "gpt-test" },
+      cloud: true,
+      reason: "Scelto da te nelle impostazioni.",
+    },
+    providerName: "OpenAI",
+    host: "api.openai.com",
+    question: "Cosa dice il teorema degli zeri?",
+    sources: [
+      { n: 1, title: "Dispensa.pdf", unit: 3, unitKind: "page", chars: 812, via: "lexical" },
+      { n: 2, title: "Appunti.md", unit: 4, unitKind: "block", chars: 400, via: "lexical" },
+    ],
+    historyPairs: 1,
+    historyChars: 230,
+    totalChars: 12345,
+    estInputTokens: 3087,
+    maxOutputTokens: 2048,
+    estCost: { min: { amount: 0.0077, currency: "USD" }, max: { amount: 0.0282, currency: "USD" } },
+    queryEmbeddedBy: null,
+    expiresAt: "2026-03-10T09:10:00.000Z",
     ...overrides,
   };
 }

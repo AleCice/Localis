@@ -1,11 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { api } from "../../api/client";
-import type { AppError, ChatEvent, ChatMessage, Conversation, LibraryDocument, Project, Source } from "../../api/types";
+import type {
+  AppError,
+  ChatEvent,
+  ChatMessage,
+  CloudPreview,
+  Conversation,
+  LibraryDocument,
+  Project,
+  SendMessageInput,
+  Source,
+} from "../../api/types";
 import { toAppError } from "../../api/types";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { ErrorBanner } from "../../components/ErrorBanner";
 import { ChatIcon, PanelRightIcon } from "../../components/Icons";
 import { Spinner } from "../../components/Spinner";
+import { useCloud } from "../../hooks/useCloud";
 import { useDelayedFlag } from "../../hooks/useDelayedFlag";
 import { useLlm } from "../../hooks/useLlm";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
@@ -15,6 +26,7 @@ import { readPref, STORAGE_KEYS, writePref } from "../../lib/storage";
 import { Composer, type ComposerHandle } from "./Composer";
 import { conversationItemId, ConversationList, CONVERSATIONS_ID } from "./ConversationList";
 import { Inspector, INSPECTOR_ID } from "./Inspector";
+import { CloudSendDialog } from "./CloudSendDialog";
 import { AssistantMessage, Thinking, UserMessage } from "./MessageView";
 import { ModelPicker } from "./ModelPicker";
 import { ScopeDialog } from "./ScopeDialog";
@@ -76,7 +88,22 @@ interface Generation {
   user: ChatMessage | null;
   assistant: ChatMessage | null;
   finished: boolean;
+  /** Waiting for the user to confirm a cloud send (nothing sent yet). */
+  confirming: boolean;
+  /** «Interrompi» pressed before the question was sent: drop it once planning returns. */
+  stopRequested: boolean;
+  /** sendMessage was called. */
+  sent: boolean;
 }
+
+interface PendingConfirmation {
+  preview: CloudPreview;
+  notice: string | null;
+  resolve: (confirmed: boolean) => void;
+}
+
+const REPREPARED_NOTICE =
+  "La conferma precedente non è più valida (è scaduta o i dati da inviare sono cambiati): controlla di nuovo cosa verrà inviato.";
 
 /** Appends or replaces messages by id, keeping chronological order. */
 function merge(list: ChatMessage[], extra: (ChatMessage | null)[]): ChatMessage[] {
@@ -107,6 +134,7 @@ function announcementFor(message: ChatMessage): string {
 
 function Chat({
   project,
+  onGoToProjects,
   sidebarToggle,
   conversationId,
   onConversationChange,
@@ -115,6 +143,7 @@ function Chat({
   active = true,
 }: ChatViewProps & { project: Project }) {
   const llm = useLlm();
+  const cloud = useCloud();
   const listInline = useMediaQuery(CHAT_LIST_INLINE_QUERY);
   const inspectorInline = useMediaQuery(CHAT_INSPECTOR_INLINE_QUERY);
 
@@ -137,6 +166,7 @@ function Chat({
   const [turnError, setTurnError] = useState<AppError | null>(null);
   const [announcement, setAnnouncement] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
+  const [confirmation, setConfirmation] = useState<PendingConfirmation | null>(null);
 
   const [draft, setDraft] = useState("");
   const [scope, setScope] = useState<string[]>([]);
@@ -250,13 +280,15 @@ function Chat({
   // Back from another view: settings (Impostazioni) and documents (Libreria) may have changed.
   const wasActive = useRef(active);
   const { reload: reloadLlm } = llm;
+  const { store: cloudStore } = cloud;
   useEffect(() => {
     if (active && !wasActive.current) {
       reloadLlm();
+      void cloudStore.reload();
       void loadDocuments();
     }
     wasActive.current = active;
-  }, [active, reloadLlm, loadDocuments]);
+  }, [active, reloadLlm, cloudStore, loadDocuments]);
   const docById = useMemo(() => new Map((documents ?? []).map((d) => [d.id, d])), [documents]);
   // Selected documents that were deleted meanwhile drop out of the selection.
   useEffect(() => {
@@ -332,6 +364,29 @@ function Chat({
     void loadConversations(true);
   };
 
+  /** Ends a turn that was never sent (cancelled confirmation or stop before sending): nothing is stored. */
+  const abandon = (gen: Generation, message: string) => {
+    if (gen.finished) return;
+    gen.finished = true;
+    genRef.current = null;
+    setGeneration(null);
+    setCancelling(false);
+    setDraft((d) => (d.trim() === "" ? gen.text : d));
+    setAnnouncement(message);
+    requestAnimationFrame(() => composerRef.current?.focus());
+  };
+
+  const askConfirmation = (preview: CloudPreview, notice: string | null) =>
+    new Promise<boolean>((resolve) => setConfirmation({ preview, notice, resolve }));
+
+  const settleConfirmation = (confirmed: boolean) => {
+    const pending = confirmation;
+    if (!pending) return;
+    setConfirmation(null);
+    if (!confirmed) void Promise.resolve().then(() => api.discardCloudSend(pending.preview.token)).catch(() => undefined);
+    pending.resolve(confirmed);
+  };
+
   const send = async (text: string, documentIds: string[]) => {
     const question = text.trim();
     if (!question || genRef.current) return;
@@ -346,6 +401,9 @@ function Chat({
       user: null,
       assistant: null,
       finished: false,
+      confirming: false,
+      stopRequested: false,
+      sent: false,
     };
     genRef.current = gen;
     setGeneration({ ...gen });
@@ -383,6 +441,10 @@ function Chat({
             status: "streaming",
             error: null,
             model: null,
+            provider: null,
+            routeReason: null,
+            usage: null,
+            cost: null,
             createdAt: event.userMessage.createdAt,
             retrieval: null,
             sources: [],
@@ -407,14 +469,50 @@ function Chat({
       }
     };
 
-    try {
-      const final = await api.sendMessage(
-        { conversationId: convId, text: question, ...(documentIds.length > 0 ? { documentIds } : {}) },
-        onEvent,
-      );
-      finish(gen, final, null);
-    } catch (err) {
-      finish(gen, null, toAppError(err));
+    const input: SendMessageInput = { conversationId: convId, text: question, ...(documentIds.length > 0 ? { documentIds } : {}) };
+    // Every question is planned first: a cloud route is sent only after the user confirmed its exact payload.
+    let notice: string | null = null;
+    for (;;) {
+      let preview: CloudPreview | null;
+      try {
+        preview = await api.prepareCloudSend(input);
+      } catch (err) {
+        finish(gen, null, toAppError(err));
+        return;
+      }
+      if (gen.stopRequested) {
+        if (preview) void Promise.resolve().then(() => api.discardCloudSend(preview.token)).catch(() => undefined);
+        abandon(gen, "Domanda non inviata.");
+        return;
+      }
+      let confirmToken: string | undefined;
+      if (preview) {
+        gen.confirming = true;
+        setGeneration({ ...gen });
+        const confirmed = await askConfirmation(preview, notice);
+        gen.confirming = false;
+        if (!confirmed) {
+          abandon(gen, `Invio annullato: nulla è stato inviato a ${preview.providerName}.`);
+          return;
+        }
+        confirmToken = preview.token;
+        setGeneration({ ...gen });
+      }
+      try {
+        gen.sent = true;
+        const final = await api.sendMessage(confirmToken ? { ...input, confirmToken } : input, onEvent);
+        finish(gen, final, null);
+      } catch (err) {
+        const error = toAppError(err);
+        // An expired or no longer matching confirmation: nothing was stored, ask again once.
+        if (confirmToken && error.code === "consent_required" && !gen.user && notice === null) {
+          notice = REPREPARED_NOTICE;
+          gen.sent = false;
+          continue;
+        }
+        finish(gen, null, error);
+      }
+      return;
     }
   };
 
@@ -422,6 +520,10 @@ function Chat({
     const gen = genRef.current;
     if (!gen || !gen.conversationId || cancelling) return;
     setCancelling(true);
+    if (!gen.sent) {
+      gen.stopRequested = true;
+      return;
+    }
     try {
       await api.cancelGeneration(gen.conversationId);
     } catch (err) {
@@ -568,7 +670,7 @@ function Chat({
             {current ? ` · ${current.title}` : ""}
           </p>
         </div>
-        <ModelPicker llm={llm} />
+        <ModelPicker llm={llm} cloud={cloud} project={project} />
         <button
           ref={inspectorToggleRef}
           type="button"
@@ -664,6 +766,10 @@ function Chat({
                   <UserMessage content={ownGeneration.user?.content ?? ownGeneration.text} pending={!ownGeneration.user} />
                   {ownGeneration.assistant ? (
                     <AssistantMessage message={ownGeneration.assistant} inspected={false} busy {...handlers} />
+                  ) : ownGeneration.confirming ? (
+                    <div className="msg msg-assistant" aria-busy="true">
+                      <p className="thinking">In attesa della tua conferma: nulla è stato ancora inviato.</p>
+                    </div>
                   ) : (
                     <div className="msg msg-assistant" aria-busy="true">
                       <Thinking />
@@ -671,7 +777,13 @@ function Chat({
                   )}
                 </>
               ) : null}
-              {turnError ? <ErrorBanner error={turnError} action={{ label: "Chiudi", onClick: () => setTurnError(null) }} /> : null}
+              {turnError ? (
+                <ErrorBanner
+                  error={turnError}
+                  action={{ label: "Chiudi", onClick: () => setTurnError(null) }}
+                  hint={<TurnErrorHint error={turnError} onGoToProjects={onGoToProjects} onOpenSettings={onOpenSettings} />}
+                />
+              ) : null}
             </div>
           </div>
           {notice ? (
@@ -716,6 +828,12 @@ function Chat({
         ) : null}
       </div>
 
+      <CloudSendDialog
+        preview={confirmation?.preview ?? null}
+        notice={confirmation?.notice ?? null}
+        onCancel={() => settleConfirmation(false)}
+        onConfirm={() => settleConfirmation(true)}
+      />
       <ScopeDialog
         open={scopeOpen}
         documents={documents}
@@ -742,4 +860,47 @@ function Chat({
       </ConfirmDialog>
     </div>
   );
+}
+
+/** Plain guidance for errors that need a change in settings or in the project. */
+function TurnErrorHint({
+  error,
+  onGoToProjects,
+  onOpenSettings,
+}: {
+  error: AppError;
+  onGoToProjects: () => void;
+  onOpenSettings: () => void;
+}) {
+  if (error.code === "consent_required") {
+    return (
+      <>
+        Nulla è stato inviato. Per usare un modello cloud il progetto deve consentirlo (
+        <button type="button" className="link-btn" onClick={onGoToProjects}>
+          Progetti → Uso del cloud
+        </button>
+        ) e ogni domanda va confermata; altrimenti scegli un modello locale.
+      </>
+    );
+  }
+  if (error.code === "keyring_unavailable") {
+    return (
+      <>
+        Localis non può leggere la chiave API dal portachiavi di sistema e non la conserva altrove. Su Linux serve un
+        servizio Secret Service attivo (ad esempio GNOME Keyring o KWallet). Nel frattempo puoi usare un modello locale.
+      </>
+    );
+  }
+  if (error.code === "llm_unavailable") {
+    return (
+      <>
+        Controlla il modello scelto e le chiavi in{" "}
+        <button type="button" className="link-btn" onClick={onOpenSettings}>
+          Impostazioni
+        </button>
+        .
+      </>
+    );
+  }
+  return null;
 }

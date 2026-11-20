@@ -2,14 +2,16 @@ import { useEffect, useState } from "react";
 import { api } from "../../api/client";
 import type { Project } from "../../api/types";
 import { formatDateTime } from "../../lib/format";
+import { ProjectCloudSection } from "./ProjectCloudSection";
 
 interface ProjectDetailProps {
   project: Project;
   onDelete: () => void;
   onOpenLibrary: () => void;
+  onProjectChange: (project: Project) => void;
 }
 
-export function ProjectDetail({ project, onDelete, onOpenLibrary }: ProjectDetailProps) {
+export function ProjectDetail({ project, onDelete, onOpenLibrary, onProjectChange }: ProjectDetailProps) {
   // Real count from the library; omitted if it cannot be read.
   const [docCount, setDocCount] = useState<number | null>(null);
   useEffect(() => {
@@ -66,6 +68,7 @@ export function ProjectDetail({ project, onDelete, onOpenLibrary }: ProjectDetai
           </dd>
         </div>
       </dl>
+      <ProjectCloudSection key={project.id} project={project} onChange={onProjectChange} />
     </section>
   );
 }

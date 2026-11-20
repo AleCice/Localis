@@ -1,6 +1,7 @@
 import { forwardRef, type ReactNode } from "react";
 import type { ChatMessage, Source } from "../../api/types";
 import { CloseIcon } from "../../components/Icons";
+import { formatMoney, formatUsage, providerName } from "../../lib/models";
 import { SCOPE_REASON_LABEL, unitLabel, VIA_LABEL } from "./labels";
 import { citedSources } from "./Sources";
 
@@ -107,7 +108,14 @@ export const Inspector = forwardRef<HTMLElement, InspectorProps>(function Inspec
             <Row term="Modalità">
               {retrieval.mode === "hybrid" ? (
                 <>
-                  Ibrida <span className="muted">(lessicale + semantica{retrieval.embeddingModel ? ` · ${retrieval.embeddingModel}` : ""})</span>
+                  Ibrida{" "}
+                  <span className="muted">
+                    (lessicale + semantica
+                    {retrieval.embeddingModel
+                      ? ` · ${retrieval.embeddingProvider && retrieval.embeddingProvider !== "lmstudio" ? `${providerName(retrieval.embeddingProvider)} · ` : ""}${retrieval.embeddingModel}`
+                      : ""}
+                    )
+                  </span>
                 </>
               ) : (
                 "Lessicale"
@@ -129,7 +137,21 @@ export const Inspector = forwardRef<HTMLElement, InspectorProps>(function Inspec
                 </>
               )}
             </Row>
-            <Row term="Modello di chat">{message.model ?? <span className="muted">Nessuno</span>}</Row>
+            <Row term="Modello di chat">
+              {message.model ? (
+                <>
+                  <span>{message.model}</span> <span className="muted">· {providerName(message.provider ?? "lmstudio")}</span>
+                </>
+              ) : (
+                <span className="muted">Nessuno</span>
+              )}
+            </Row>
+            {message.routeReason ? <Row term="Scelta del modello">{message.routeReason}</Row> : null}
+            {formatUsage(message.usage) || message.cost ? (
+              <Row term="Uso">
+                {[formatUsage(message.usage), message.cost ? formatMoney(message.cost) : null].filter(Boolean).join(" · ")}
+              </Row>
+            ) : null}
             <Row term="Query lessicale">
               {retrieval.query ? <code className="inspector-query">{retrieval.query}</code> : <span className="muted">—</span>}
             </Row>

@@ -2770,3 +2770,364 @@ button.inspector-src:hover {
     border-color: ButtonText;
   }
 }
+
+/* ---------- v0.4 Cloud ---------- */
+.settings .notice,
+.dialog .notice,
+.project-cloud .notice {
+  margin: 0;
+}
+
+.models-settings,
+.cloud-settings,
+.prices-settings,
+.activity-settings {
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
+.activity-settings {
+  max-width: none;
+}
+
+.settings-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.settings-head .settings-title {
+  margin: 0;
+}
+
+.models-settings .select,
+.prices-settings .select {
+  width: 100%;
+}
+
+fieldset.field {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+fieldset.field legend {
+  padding: 0;
+  margin-bottom: var(--space-2);
+}
+
+.inline-row .select.grow {
+  flex: 1 1 14rem;
+  width: auto;
+}
+
+/* Routing candidates */
+.candidate-order {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0;
+  list-style: none;
+}
+
+.candidate-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  padding: var(--space-1) var(--space-1) var(--space-1) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.candidate-pos {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.candidate-name {
+  flex: 1 1 12rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.candidate-actions {
+  display: inline-flex;
+  gap: 2px;
+  margin-left: auto;
+}
+
+/* Providers */
+.provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: 0;
+  list-style: none;
+}
+
+.provider {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.provider-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+}
+
+.provider-host {
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+.provider-key {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.provider-key .llm-status-line {
+  margin-right: auto;
+}
+
+.provider-models {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.provider-models-head {
+  align-items: center;
+}
+
+.provider-models-head .hint {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+.provider-model-list summary {
+  width: fit-content;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.provider-model-list ul {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 12rem;
+  margin-top: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  font-size: var(--text-sm);
+  list-style: none;
+  overflow: auto;
+}
+
+.provider-model-id,
+.mono {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+/* Tables (prices, activity) */
+.table-scroll {
+  position: relative; /* contains visually hidden headers inside the scroll area */
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.data-table th,
+.data-table td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.data-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.data-table th {
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.data-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.cell-strong {
+  font-weight: 550;
+  overflow-wrap: anywhere;
+}
+
+.prices-settings .data-table td:first-child {
+  min-width: 10rem;
+}
+
+.cell-break {
+  min-width: 8rem;
+  overflow-wrap: anywhere;
+}
+
+.activity-table td:first-child {
+  white-space: nowrap;
+}
+
+.row-actions {
+  white-space: nowrap;
+  text-align: right;
+}
+
+.price-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr));
+  gap: var(--space-3);
+  align-items: start;
+}
+
+.price-form .price-model {
+  grid-column: 1 / -1;
+}
+
+.price-actions {
+  display: flex;
+  align-items: flex-end;
+  align-self: end;
+}
+
+/* Project: cloud use */
+.project-cloud {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+  max-width: var(--measure);
+}
+
+.cloud-policy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.radio-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  cursor: pointer;
+}
+
+.radio-row input {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  margin: 0.2rem 0 0;
+  accent-color: var(--accent);
+}
+
+.radio-row > span {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  font-weight: 550;
+}
+
+.radio-hint {
+  font-weight: 400;
+}
+
+.cloud-indexing {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* Consent and cloud send dialogs */
+.dialog-wide {
+  width: min(40rem, calc(100vw - 2rem));
+}
+
+.consent-facts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.consent-facts dt {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.consent-facts dd {
+  overflow-wrap: anywhere;
+}
+
+.send-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-left: 1.1rem;
+}
+
+.send-question {
+  margin: var(--space-1) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border-left: 3px solid var(--border-strong);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--surface-sunken);
+  max-height: 8rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.send-sources {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 10rem;
+  margin-top: var(--space-1);
+  padding: 0;
+  font-size: var(--text-sm);
+  list-style: none;
+  overflow: auto;
+}
+
+/* Answer: provider, model, usage */
+.msg-model {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}

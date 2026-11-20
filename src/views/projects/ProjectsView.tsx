@@ -116,7 +116,12 @@ export function ProjectsView({ store, selectedId, onSelect, onboarded, onOnboard
                 <ProjectList projects={projects} selectedId={selected?.id ?? null} onSelect={onSelect} />
               </div>
               <div className="projects-detail-pane">
-                {selected ? <ProjectDetail project={selected} onDelete={() => setDeleting(selected)} onOpenLibrary={onOpenLibrary} /> : null}
+                {selected ? <ProjectDetail
+                    project={selected}
+                    onDelete={() => setDeleting(selected)}
+                    onOpenLibrary={onOpenLibrary}
+                    onProjectChange={store.replace}
+                  /> : null}
               </div>
             </div>
           ) : null}
