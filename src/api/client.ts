@@ -2,6 +2,15 @@
 // Owner: main agent.
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
+  CloudEmbeddingEstimate,
+  CloudPolicy,
+  CloudPreview,
+  CloudProviderId,
+  CloudRequest,
+  KeyringStatus,
+  ModelPrice,
+  ProviderInfo,
+  ProviderModels,
   ChatEvent,
   ChatMessage,
   Conversation,
@@ -75,6 +84,32 @@ export interface Api {
   sendMessage(input: SendMessageInput, onEvent: (event: ChatEvent) => void): Promise<ChatMessage>;
   /** Stops the generation in progress for the conversation (no-op if none). */
   cancelGeneration(conversationId: string): Promise<void>;
+
+  // v0.4 Cloud
+  getKeyringStatus(): Promise<KeyringStatus>;
+  listProviders(): Promise<ProviderInfo[]>;
+  /** Stores the key in the system keychain. The key is never returned by any command. */
+  setApiKey(provider: CloudProviderId, key: string): Promise<ProviderInfo>;
+  deleteApiKey(provider: CloudProviderId): Promise<ProviderInfo>;
+  /** Contacts the provider with its key (logged as purpose "list_models"). */
+  listProviderModels(provider: CloudProviderId): Promise<ProviderModels>;
+  listPrices(): Promise<ModelPrice[]>;
+  setPrice(price: ModelPrice): Promise<ModelPrice[]>;
+  deletePrice(provider: CloudProviderId, model: string): Promise<ModelPrice[]>;
+  setProjectCloudPolicy(projectId: string, policy: CloudPolicy): Promise<Project>;
+  estimateCloudEmbedding(projectId: string): Promise<CloudEmbeddingEstimate | null>;
+  /** Consent to index this project's passages with the configured cloud embedding model. */
+  setCloudEmbeddingConsent(projectId: string, consent: boolean): Promise<Project>;
+  /**
+   * Plans a question (retrieval + PRISM routing) without storing or sending anything to a chat model.
+   * Returns null when no cloud send is needed (local route, inventory, clarification, no evidence):
+   * then call sendMessage directly. Otherwise show the preview and, on confirmation, call sendMessage
+   * with `confirmToken`.
+   */
+  prepareCloudSend(input: SendMessageInput): Promise<CloudPreview | null>;
+  /** Drops a prepared payload the user did not confirm. */
+  discardCloudSend(token: string): Promise<void>;
+  listCloudRequests(limit?: number): Promise<CloudRequest[]>;
 }
 
 function isTauri(): boolean {
@@ -149,6 +184,22 @@ const tauriApi: Api = {
     return call<ChatMessage>("send_message", { input, onEvent: channel });
   },
   cancelGeneration: (conversationId) => call<void>("cancel_generation", { conversationId }),
+
+  getKeyringStatus: () => call<KeyringStatus>("get_keyring_status"),
+  listProviders: () => call<ProviderInfo[]>("list_providers"),
+  setApiKey: (provider, key) => call<ProviderInfo>("set_api_key", { provider, key }),
+  deleteApiKey: (provider) => call<ProviderInfo>("delete_api_key", { provider }),
+  listProviderModels: (provider) => call<ProviderModels>("list_provider_models", { provider }),
+  listPrices: () => call<ModelPrice[]>("list_prices"),
+  setPrice: (price) => call<ModelPrice[]>("set_price", { price }),
+  deletePrice: (provider, model) => call<ModelPrice[]>("delete_price", { provider, model }),
+  setProjectCloudPolicy: (projectId, policy) => call<Project>("set_project_cloud_policy", { projectId, policy }),
+  estimateCloudEmbedding: (projectId) => call<CloudEmbeddingEstimate | null>("estimate_cloud_embedding", { projectId }),
+  setCloudEmbeddingConsent: (projectId, consent) =>
+    call<Project>("set_cloud_embedding_consent", { projectId, consent }),
+  prepareCloudSend: (input) => call<CloudPreview | null>("prepare_cloud_send", { input }),
+  discardCloudSend: (token) => call<void>("discard_cloud_send", { token }),
+  listCloudRequests: (limit) => call<CloudRequest[]>("list_cloud_requests", { limit: limit ?? 100 }),
 };
 
 // The in-memory mock exists only for UI development and browser tests

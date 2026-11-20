@@ -7,6 +7,10 @@ export interface Project {
   description: string | null;
   createdAt: string; // ISO 8601 UTC
   updatedAt: string; // ISO 8601 UTC
+  /** v0.4: "local_only" (default) never sends anything to cloud providers. */
+  cloudPolicy: CloudPolicy;
+  /** v0.4: explicit consent to send this project's passages to the configured cloud embedding provider. */
+  cloudEmbeddingConsent: boolean;
 }
 
 export interface NewProjectInput {
@@ -22,7 +26,9 @@ export type AppErrorCode =
   | "unsupported" // file format not supported
   | "too_large" // file over the import size limit
   | "integrity" // stored original missing or not matching its hash
-  | "llm_unavailable" // LM Studio not reachable, no model selected or the model failed
+  | "llm_unavailable" // model provider not reachable, invalid key, no model selected or the model failed
+  | "consent_required" // v0.4: a cloud send without a valid confirmation, or a local-only project
+  | "keyring_unavailable" // v0.4: the system keychain cannot be used (no API key is stored elsewhere)
   | "cancelled" // generation stopped by the user
   | "storage"
   | "internal";
@@ -178,9 +184,15 @@ export interface Job {
 
 /** LM Studio connection. Only loopback http URLs are accepted (no remote hosts before 0.6). */
 export interface LlmSettings {
-  baseUrl: string; // default "http://127.0.0.1:1234"
-  chatModel: string | null; // model id as reported by LM Studio
-  embeddingModel: string | null; // null = lexical retrieval only
+  baseUrl: string; // LM Studio, default "http://127.0.0.1:1234"
+  /** v0.4: chat model on any provider; null = none chosen. */
+  chatModel: ModelRef | null;
+  /** v0.4: embedding model on LM Studio or a cloud provider; null = lexical retrieval only. */
+  embeddingModel: ModelRef | null;
+  /** v0.4 PRISM: "manual" uses chatModel; "auto" picks per question from autoModels (see RouteDecision). */
+  routing: "manual" | "auto";
+  /** Ordered candidates for automatic routing (local ones are always preferred when available). */
+  autoModels: ModelRef[];
 }
 
 export type ModelKind = "llm" | "embedding" | "unknown";
@@ -204,10 +216,14 @@ export type EmbeddingState =
   | "disabled" // no embedding model configured
   | "idle" // all current chunks embedded with the configured model
   | "running"
-  | "unreachable"; // LM Studio not reachable or the model failed: retried in the background
+  | "unreachable" // provider not reachable or the model failed: retried in the background
+  /** v0.4: cloud embedding configured but this project is local-only or has not given consent. */
+  | "needs_consent";
 
 export interface EmbeddingStatus {
   state: EmbeddingState;
+  /** v0.4 */
+  provider: ProviderId | null;
   model: string | null;
   /** Chunks of current versions in the project. */
   total: number;
@@ -245,6 +261,8 @@ export interface RetrievalInfo {
   /** Why the scope was chosen: user selection, a title named in the question, or the conversation history. */
   scopeReason: "selection" | "title" | "history" | null;
   embeddingModel: string | null;
+  /** v0.4 */
+  embeddingProvider: ProviderId | null;
   query: string; // lexical query actually used (for the inspector)
 }
 
@@ -280,6 +298,14 @@ export interface ChatMessage {
   status: MessageStatus;
   error: AppError | null;
   model: string | null;
+  /** v0.4: provider of `model` (assistant answers produced by a model). */
+  provider: ProviderId | null;
+  /** v0.4: why the model was chosen (PRISM), shown in the inspector. */
+  routeReason: string | null;
+  /** v0.4: token usage as reported by the provider, when it reports it. */
+  usage: TokenUsage | null;
+  /** v0.4: cost computed from `usage` and the user's prices; null when unknown. */
+  cost: Money | null;
   createdAt: string;
   retrieval: RetrievalInfo | null; // assistant answers only
   sources: Source[]; // assistant answers only, ordered by rank
@@ -291,6 +317,8 @@ export interface SendMessageInput {
   text: string;
   /** Explicit selection: restrict retrieval to these documents (empty/absent = automatic). */
   documentIds?: string[];
+  /** v0.4: required when the route is a cloud model: token from prepareCloudSend after the user confirmed. */
+  confirmToken?: string;
 }
 
 /** Streamed over a Tauri Channel during send_message. Loading states are not stored in the history. */
@@ -300,3 +328,119 @@ export type ChatEvent =
   | { type: "delta"; text: string }
   | { type: "done"; message: ChatMessage }
   | { type: "error"; error: AppError; message: ChatMessage | null };
+
+// ---------------------------------------------------------------- v0.4 Cloud (Model Mesh + PRISM)
+
+export type ProviderId = "lmstudio" | "openai" | "anthropic" | "gemini" | "deepseek" | "qwen";
+export type CloudProviderId = Exclude<ProviderId, "lmstudio">;
+
+export interface ModelRef {
+  provider: ProviderId;
+  model: string; // id as reported by the provider
+}
+
+export type CloudPolicy = "local_only" | "cloud_allowed";
+
+export interface Money {
+  amount: number;
+  currency: string; // e.g. "USD": as entered by the user in prices
+}
+
+export interface TokenUsage {
+  inputTokens: number | null;
+  outputTokens: number | null;
+}
+
+export interface ProviderInfo {
+  id: CloudProviderId;
+  name: string; // "OpenAI", "Anthropic", "Google Gemini", "DeepSeek", "Qwen (Alibaba Cloud)"
+  /** The only host Localis contacts for this provider. */
+  host: string;
+  /** True when an API key is stored in the system keychain (the key itself is never returned). */
+  hasKey: boolean;
+  supportsChat: boolean;
+  supportsEmbeddings: boolean;
+}
+
+export interface KeyringStatus {
+  available: boolean;
+  /** Italian, user-facing, when not available (e.g. no Secret Service on Linux). */
+  message: string | null;
+  detail: string | null;
+}
+
+export interface ProviderModels {
+  provider: CloudProviderId;
+  reachable: boolean;
+  message: string | null; // e.g. «Chiave API non valida.» / «OpenAI non raggiungibile.»
+  detail: string | null;
+  models: ModelInfo[];
+}
+
+/** User-entered price per million tokens; Localis ships no prices (they change too often). */
+export interface ModelPrice {
+  provider: CloudProviderId;
+  model: string;
+  inputPerMTok: number;
+  outputPerMTok: number;
+  currency: string;
+}
+
+/** PRISM decision for one question. */
+export interface RouteDecision {
+  model: ModelRef;
+  cloud: boolean;
+  /** Italian, short: e.g. «Scelto automaticamente: LM Studio non è raggiungibile; il modello cloud più economico tra quelli consentiti.» */
+  reason: string;
+}
+
+export interface CloudPreview {
+  /** Pass back as SendMessageInput.confirmToken to send exactly this payload. Expires after 10 minutes. */
+  token: string;
+  route: RouteDecision;
+  providerName: string;
+  host: string;
+  question: string;
+  /** Sources included in the request, as they will be sent. */
+  sources: { n: number; title: string; unit: number; unitKind: UnitKind; chars: number; via: Source["via"] }[];
+  historyPairs: number;
+  historyChars: number;
+  /** Total characters sent (system prompt + history + sources + question). */
+  totalChars: number;
+  estInputTokens: number; // rough estimate: characters / 4
+  maxOutputTokens: number; // the request's output limit
+  /** From the user's prices; null if no price is set for this model. */
+  estCost: { min: Money; max: Money } | null;
+  /** When the question itself was embedded by a cloud provider during retrieval (project consent given). */
+  queryEmbeddedBy: ModelRef | null;
+  /** Retrieval outcome, e.g. no_evidence/inventory never need the cloud: then prepareCloudSend returns null. */
+  expiresAt: string;
+}
+
+export interface CloudEmbeddingEstimate {
+  provider: CloudProviderId;
+  model: string;
+  /** Passages of current versions not yet embedded with this model. */
+  chunks: number;
+  chars: number;
+  estTokens: number;
+  estCost: Money | null;
+}
+
+export type CloudPurpose = "chat" | "query_embedding" | "index_embedding" | "list_models";
+
+/** Local log of every request sent to a cloud provider. */
+export interface CloudRequest {
+  id: number;
+  createdAt: string;
+  provider: CloudProviderId;
+  model: string | null;
+  purpose: CloudPurpose;
+  projectId: string | null;
+  conversationId: string | null;
+  charsSent: number;
+  usage: TokenUsage | null;
+  cost: Money | null;
+  ok: boolean;
+  error: string | null;
+}

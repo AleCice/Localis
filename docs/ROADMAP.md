@@ -33,17 +33,17 @@ LM Studio, selettore del modello, embedding locale, retrieval iniziale, chat RAG
 - Conversazione leggibile, composer sempre raggiungibile, fonti compatte e collassate, inspector richiudibile che da chiuso non occupa spazio. Caricamento con spinner discreto o «Elaborazione…», non parte della cronologia.
 - Markdown/GFM e LaTeX locale (KaTeX o equivalente) con `$...$`, `$$...$$`, `\(...\)`, `\[...\]`; raw preservato, delimitatori gestiti senza alterare i blocchi di codice, HTML raw non affidabile disabilitato, test di sanitizzazione e formule, scroll locale per tabelle, codice e formule lunghe.
 
-## 0.4 — FARO base
+## 0.4 — Cloud opzionale (anticipata dalla 0.6, su richiesta dell'utente)
+
+Model Mesh (interfaccia comune provider locali/cloud) e PRISM (router per compito, disponibilità, privacy, costo). Gemini, OpenAI, Anthropic, DeepSeek, Qwen per la chat; OpenAI, Gemini e Qwen anche per gli **embedding**. API key nel portachiavi di sistema, mai nel database, nel repository o nel frontend. Prima di **ogni** domanda inviata al cloud: provider, dati inviati (domanda, fonti, cronologia) e stima del costo, poi conferma esplicita. Indicizzazione cloud solo con consenso esplicito per progetto e stima preventiva. Nessun invio senza consenso, nessun fallback silenzioso dal locale al cloud; la modalità solo locale resta il default e sempre disponibile. Registro locale degli invii al cloud.
+
+## 0.5 — FARO base (era 0.4)
 
 Import MP3/MP4, trascrizione locale, segmenti con timestamp e salto al punto della registrazione; import slide/PDF e foto di appunti; timeline per collegare manualmente clip, slide e appunti; crop e regioni come riferimenti non distruttivi. Prova end-to-end: importare una lezione, trascriverla localmente, collegare un intervallo a una slide o foto. Niente sincronizzazione automatica complessa, grafi avanzati, multi-agent nel prodotto o download pesanti senza conferma.
 
-## 0.5 — OCR, formule e knowledge graph
+## 0.6 — OCR, formule e knowledge graph (era 0.5)
 
 OCR per documenti e manoscritti, HMER per formule in LaTeX, Visual Evidence per regioni non convertibili, Coverage Ledger (regioni elaborate, mancanti, fallite, solo visive). Qdrant locale e ricerca ibrida densa + lessicale; prime relazioni verificabili tra appunti, trascrizioni e slide. Sempre originale, pagina, regione, versione e provenienza; conversioni incerte mai presentate come certe.
-
-## 0.6 — Cloud opzionale
-
-Model Mesh (interfaccia comune provider locali/cloud) e PRISM (router per compito, disponibilità, privacy, costo). Gemini, OpenAI, Anthropic, DeepSeek, Qwen; credenziali nel portachiavi di sistema. Provider, dati inviati e stima del costo mostrati prima della conferma; nessun invio senza consenso esplicito, nessun fallback silenzioso al cloud; modalità solo locale sempre disponibile.
 
 ## 1.0 — Artifact Studio e skill
 
