@@ -798,11 +798,17 @@ fn every_provider_streams_with_usage_and_its_own_wire_format() {
                 assert_eq!(body["messages"][0]["role"], "system");
             }
         }
+        // OpenAI gets no temperature (reasoning models reject non-default values).
+        let expected = if p == CloudProvider::OpenAi {
+            None
+        } else {
+            Some(0.2)
+        };
         assert_eq!(
             body["temperature"]
                 .as_f64()
                 .or(body["generationConfig"]["temperature"].as_f64()),
-            Some(0.2)
+            expected
         );
     }
 }

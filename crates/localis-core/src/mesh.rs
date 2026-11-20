@@ -336,7 +336,8 @@ impl CloudClient {
                     "messages": messages.iter().map(roles).collect::<Vec<_>>(),
                     "stream": true,
                     "stream_options": { "include_usage": true },
-                    "temperature": TEMPERATURE,
+                    // No `temperature`: OpenAI reasoning models reject any value other than
+                    // the default, and Localis cannot tell model families apart reliably.
                     "max_completion_tokens": CLOUD_MAX_OUTPUT_TOKENS,
                 }),
             ),
@@ -762,7 +763,7 @@ mod tests {
         assert_eq!(b["messages"].as_array().unwrap().len(), 4);
         assert_eq!(b["stream_options"]["include_usage"], true);
         assert_eq!(b["max_completion_tokens"], 2048);
-        assert_eq!(b["temperature"], 0.2);
+        assert!(b.get("temperature").is_none());
         let (_, b) = client(CloudProvider::DeepSeek)
             .chat_body("ds", &prompt())
             .unwrap();
