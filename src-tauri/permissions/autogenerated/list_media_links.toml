@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-media-links"
+description = "Enables the list_media_links command without any pre-configured scope."
+commands.allow = ["list_media_links"]
+
+[[permission]]
+identifier = "deny-list-media-links"
+description = "Denies the list_media_links command without any pre-configured scope."
+commands.deny = ["list_media_links"]

@@ -1253,6 +1253,9 @@ pub struct PreviewSourceDto {
     pub unit_kind: &'static str,
     pub chars: u64,
     pub via: &'static str,
+    /// v0.5: transcript passages only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_ms: Option<u64>,
 }
 
 impl From<PreviewSource> for PreviewSourceDto {
@@ -1264,6 +1267,7 @@ impl From<PreviewSource> for PreviewSourceDto {
             unit_kind: s.unit_kind.as_str(),
             chars: s.chars,
             via: s.via.as_str(),
+            start_ms: s.start_ms,
         }
     }
 }

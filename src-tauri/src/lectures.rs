@@ -310,7 +310,7 @@ fn model_list(models: &ModelManager) -> Vec<WhisperModelDto> {
 pub async fn list_whisper_models(
     state: State<'_, AppState>,
 ) -> Result<Vec<WhisperModelDto>, AppError> {
-    Ok(model_list(&models(&state)?))
+    Ok(model_list(&*models(&state)?))
 }
 
 /// Starts the download (after the user confirmed the size in the UI); returns at once.

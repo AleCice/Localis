@@ -35,7 +35,9 @@ use crate::library::TextStatus;
 use crate::media::{decode_to_whisper, DecodeError, WHISPER_SAMPLE_RATE};
 use crate::models::{ModelManager, WhisperModelId};
 use crate::store::{now, Store};
-use crate::whisper::{default_threads, Language, Recognized, TranscribeError, TranscribeRequest, Transcriber};
+use crate::whisper::{
+    default_threads, Language, Recognized, TranscribeError, TranscribeRequest, Transcriber,
+};
 
 pub const JOB_KIND_TRANSCRIBE: &str = "transcribe";
 
@@ -53,7 +55,8 @@ const MODEL_LOAD_FAILED: &str =
     "Il modello di trascrizione non può essere caricato: prova a scaricarlo di nuovo.";
 const CODEC_UNSUPPORTED: &str =
     "Codifica audio non supportata: trascrizione non disponibile per questa codifica.";
-const AUDIO_CORRUPT: &str = "L'audio non può essere decodificato: il file potrebbe essere danneggiato.";
+const AUDIO_CORRUPT: &str =
+    "L'audio non può essere decodificato: il file potrebbe essere danneggiato.";
 const TOO_LONG: &str = "La registrazione supera la durata massima trascrivibile (6 ore).";
 const WHISPER_FAILED: &str = "La trascrizione non è riuscita.";
 const BLOB_MISSING: &str = "Il file originale non si trova nell'archivio di Localis.";
@@ -441,8 +444,12 @@ impl Store {
                         text: s.text.trim().to_owned(),
                     })
                     .collect();
-                for table in ["transcript_segments", "transcriptions", "document_text", "chunks"]
-                {
+                for table in [
+                    "transcript_segments",
+                    "transcriptions",
+                    "document_text",
+                    "chunks",
+                ] {
                     tx.execute(
                         &format!("DELETE FROM {table} WHERE version_id = ?1"),
                         params![job.version_id],
@@ -547,7 +554,8 @@ impl Store {
             return Err(CoreError::not_found("Il file audio/video non esiste più."));
         }
         let path = self.blobs()?.path_for(&version.sha256)?;
-        let ok = std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == version.size_bytes);
+        let ok =
+            std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == version.size_bytes);
         if !ok {
             return Err(CoreError::Integrity {
                 message: BLOB_MISSING.to_owned(),
@@ -582,10 +590,16 @@ impl Store {
         poll: Duration,
     ) -> TranscriptionOutcome {
         let (Some(model), Some(language)) = (job.model, job.language) else {
-            return failed(WHISPER_FAILED, "invalid model or language stored in the job");
+            return failed(
+                WHISPER_FAILED,
+                "invalid model or language stored in the job",
+            );
         };
         let Some(model_path) = models.installed_path(model) else {
-            return failed(MODEL_NOT_INSTALLED, format!("model {} not installed", model.as_str()));
+            return failed(
+                MODEL_NOT_INSTALLED,
+                format!("model {} not installed", model.as_str()),
+            );
         };
         let path = match self.blobs().and_then(|b| b.path_for(&job.sha256)) {
             Ok(path) => path,
@@ -712,7 +726,9 @@ pub fn run_transcriber(
                     if !recovered {
                         match opened.fail_interrupted_transcriptions() {
                             Ok(_) => recovered = true,
-                            Err(err) => log_error("cannot recover interrupted transcriptions", &err),
+                            Err(err) => {
+                                log_error("cannot recover interrupted transcriptions", &err)
+                            }
                         }
                     }
                     store = Some(opened);
@@ -776,7 +792,11 @@ mod tests {
             assert!(*unit >= 1);
         }
         // Every segment's text is in exactly one passage, in order.
-        let joined: String = passages.iter().map(|p| p.2.as_str()).collect::<Vec<_>>().join(" ");
+        let joined: String = passages
+            .iter()
+            .map(|p| p.2.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         assert_eq!(joined.split_whitespace().count(), 300);
         // Units are increasing first-segment indexes.
         assert!(passages.windows(2).all(|w| w[0].0 < w[1].0));
@@ -784,7 +804,11 @@ mod tests {
 
     #[test]
     fn overlong_segment_is_split() {
-        let segments = vec![seg(1, "breve"), seg(2, &"x ".repeat(CHUNK_MAX_CHARS)), seg(3, "fine")];
+        let segments = vec![
+            seg(1, "breve"),
+            seg(2, &"x ".repeat(CHUNK_MAX_CHARS)),
+            seg(3, "fine"),
+        ];
         let passages = segment_passages(&segments);
         assert_eq!(passages[0], (1, 1, "breve".to_owned()));
         assert!(passages.iter().filter(|p| p.0 == 2).count() >= 2);

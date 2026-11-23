@@ -906,7 +906,11 @@ mod tests {
             ("transcriptions", 0),
             ("media_links", 0),
         ] {
-            assert_eq!(count(&store, &format!("SELECT COUNT(*) FROM {table}")), n, "{table}");
+            assert_eq!(
+                count(&store, &format!("SELECT COUNT(*) FROM {table}")),
+                n,
+                "{table}"
+            );
         }
         assert_eq!(store.foreign_key_violations().unwrap(), 0);
         let fk: i64 = store
@@ -946,8 +950,18 @@ mod tests {
             .is_err());
         // Cascades through the rebuilt tables.
         store.delete_document("d").unwrap();
-        for table in ["document_versions", "document_text", "jobs", "chunks", "chunk_embeddings"] {
-            assert_eq!(count(&store, &format!("SELECT COUNT(*) FROM {table}")), 0, "{table}");
+        for table in [
+            "document_versions",
+            "document_text",
+            "jobs",
+            "chunks",
+            "chunk_embeddings",
+        ] {
+            assert_eq!(
+                count(&store, &format!("SELECT COUNT(*) FROM {table}")),
+                0,
+                "{table}"
+            );
         }
         // Snapshots in message sources outlive the document.
         assert!(!store.list_messages("c").unwrap()[0].sources[0].available);

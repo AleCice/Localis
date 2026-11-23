@@ -235,6 +235,8 @@ mod library {
             page_count: Some(2),
             image_width: None,
             image_height: None,
+            duration_ms: None,
+            transcription: None,
         }
     }
 
@@ -355,7 +357,8 @@ mod library {
                 r#""current":{"id":"v1","documentId":"d1","versionNo":1,"originalName":"a.pdf","#,
                 r#""kind":"pdf","mediaType":"application/pdf","sizeBytes":1234,"sha256":"ab","#,
                 r#""sourceModifiedAt":null,"importedAt":"2026-01-01T00:00:00.000Z","#,
-                r#""textStatus":"no_text","pageCount":2,"imageWidth":null,"imageHeight":null},"#,
+                r#""textStatus":"no_text","pageCount":2,"imageWidth":null,"imageHeight":null,"#,
+                r#""durationMs":null,"transcription":null},"#,
                 r#""versionCount":1}"#
             )
         );
@@ -389,7 +392,9 @@ mod library {
         assert_eq!(
             to_json(TextUnitDto {
                 unit: 3,
-                text: "testo".into()
+                text: "testo".into(),
+                start_ms: None,
+                end_ms: None,
             }),
             r#"{"unit":3,"text":"testo"}"#
         );
@@ -402,6 +407,7 @@ mod library {
                 unit: 2,
                 unit_kind: "page",
                 snippet: "\u{2}città\u{3} eterna".into(),
+                start_ms: None,
             }),
             r#"{"documentId":"d1","versionId":"v1","title":"a.pdf","folderId":null,"unit":2,"unitKind":"page","snippet":"\u0002città\u0003 eterna"}"#
         );
@@ -412,13 +418,14 @@ mod library {
                 version_id: "v1".into(),
                 kind: "extract_text".into(),
                 state: "failed",
+                progress: None,
                 attempts: 1,
                 error: Some("Il PDF non può essere letto.".into()),
                 error_detail: Some("xref".into()),
                 created_at: "c".into(),
                 updated_at: "u".into(),
             }),
-            r#"{"id":7,"documentId":"d1","versionId":"v1","kind":"extract_text","state":"failed","attempts":1,"error":"Il PDF non può essere letto.","errorDetail":"xref","createdAt":"c","updatedAt":"u"}"#
+            r#"{"id":7,"documentId":"d1","versionId":"v1","kind":"extract_text","state":"failed","progress":null,"attempts":1,"error":"Il PDF non può essere letto.","errorDetail":"xref","createdAt":"c","updatedAt":"u"}"#
         );
     }
 
@@ -463,6 +470,11 @@ mod library {
         assert_eq!(states, ["queued", "running", "done", "failed"]);
         assert_eq!(UnitKind::Page.as_str(), "page");
         assert_eq!(UnitKind::Block.as_str(), "block");
+        // v0.5
+        assert_eq!(DocumentKind::Audio.as_str(), "audio");
+        assert_eq!(DocumentKind::Video.as_str(), "video");
+        assert_eq!(UnitKind::Segment.as_str(), "segment");
+        assert_eq!(localis_core::JOB_KIND_TRANSCRIBE, "transcribe");
     }
 
     #[test]
@@ -660,6 +672,7 @@ mod chat {
                 unit: 3,
                 unit_kind: "page",
                 text: "testo".into(),
+                start_ms: None,
                 via: "both",
                 available: false,
             }],
@@ -1267,6 +1280,7 @@ mod cloud {
                 unit_kind: UnitKind::Page,
                 chars: 120,
                 via: Via::Both,
+                start_ms: None,
             }],
             history_pairs: 1,
             history_chars: 40,
@@ -1408,5 +1422,420 @@ mod cloud {
         .unwrap_err()
         .into();
         assert_eq!(err.code, ErrorCode::ConsentRequired);
+    }
+}
+
+// ---------------------------------------------------------------- v0.5 FARO
+
+mod lectures {
+    use std::sync::Arc;
+
+    use localis_core::{
+        Language, ModelManager, NewProject, Store, Uploads, WhisperModelId, WhisperModelId as M,
+    };
+    use tauri::http::{HeaderMap, HeaderName, HeaderValue, Request};
+
+    use super::{tempdir, to_json};
+    use crate::commands::{AppState, DocumentVersionDto, ImportResultDto, JobDto};
+    use crate::error::{AppError, ErrorCode};
+    use crate::headers::ChunkHeaders;
+    use crate::lectures::{
+        BeginUploadInput, MediaLinkDto, MediaLinkInputDto, RegionDto, TranscriptSegmentDto,
+        TranscriptionInfoDto, UploadHandleDto, WhisperModelDto,
+    };
+    use crate::media_protocol;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../crates/localis-core/tests/fixtures")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn new_dto_json_shapes() {
+        assert_eq!(
+            to_json(UploadHandleDto {
+                upload_id: "u1".into(),
+                chunk_bytes: 8_388_608
+            }),
+            r#"{"uploadId":"u1","chunkBytes":8388608}"#
+        );
+        let models = ModelManager::new(tempdir().join("models"));
+        let tiny: WhisperModelDto = models.list().remove(0).into();
+        assert_eq!(
+            to_json(tiny),
+            concat!(
+                r#"{"id":"tiny","name":"Whisper Tiny","fileName":"ggml-tiny.bin","#,
+                r#""sizeBytes":77691713,"#,
+                r#""sha256":"be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21","#,
+                r#""installed":false,"download":null,"error":null}"#
+            )
+        );
+        let ids: Vec<&str> = models.list().iter().map(|m| m.spec.id.as_str()).collect();
+        assert_eq!(ids, ["tiny", "base", "small", "large-v3-turbo-q5"]);
+        let downloading = WhisperModelDto {
+            download: Some(crate::lectures::DownloadDto {
+                received_bytes: 10,
+                total_bytes: 20,
+            }),
+            ..models.list().remove(1).into()
+        };
+        assert!(to_json(downloading).contains(r#""download":{"receivedBytes":10,"totalBytes":20}"#));
+        assert_eq!(
+            to_json(TranscriptionInfoDto {
+                model: "small".into(),
+                language: "it".into(),
+                created_at: "c".into(),
+                segment_count: 12
+            }),
+            r#"{"model":"small","language":"it","createdAt":"c","segmentCount":12}"#
+        );
+        assert_eq!(
+            to_json(TranscriptSegmentDto {
+                index: 1,
+                start_ms: 1000,
+                end_ms: 2500,
+                text: "Buongiorno".into()
+            }),
+            r#"{"index":1,"startMs":1000,"endMs":2500,"text":"Buongiorno"}"#
+        );
+        let link = MediaLinkDto {
+            id: "l1".into(),
+            project_id: "p".into(),
+            media_document_id: "md".into(),
+            media_version_id: "mv".into(),
+            start_ms: 1000,
+            end_ms: 2000,
+            target_document_id: "td".into(),
+            target_version_id: "tv".into(),
+            target_page: Some(3),
+            region: Some(RegionDto {
+                x: 0.1,
+                y: 0.2,
+                w: 0.5,
+                h: 0.25,
+            }),
+            note: None,
+            created_at: "c".into(),
+            updated_at: "u".into(),
+            media_title: "lezione.mp4".into(),
+            target_title: "slide.pdf".into(),
+            available: true,
+        };
+        assert_eq!(
+            to_json(link),
+            concat!(
+                r#"{"id":"l1","projectId":"p","mediaDocumentId":"md","mediaVersionId":"mv","#,
+                r#""startMs":1000,"endMs":2000,"targetDocumentId":"td","targetVersionId":"tv","#,
+                r#""targetPage":3,"region":{"x":0.1,"y":0.2,"w":0.5,"h":0.25},"note":null,"#,
+                r#""createdAt":"c","updatedAt":"u","mediaTitle":"lezione.mp4","#,
+                r#""targetTitle":"slide.pdf","available":true}"#
+            )
+        );
+        // Optional v0.5 fields appear only for segments.
+        let unit = crate::commands::TextUnitDto {
+            unit: 2,
+            text: "t".into(),
+            start_ms: Some(5),
+            end_ms: Some(9),
+        };
+        assert_eq!(
+            to_json(unit),
+            r#"{"unit":2,"text":"t","startMs":5,"endMs":9}"#
+        );
+    }
+
+    #[test]
+    fn inputs_parse_from_camel_case() {
+        let input: BeginUploadInput = serde_json::from_str(
+            r#"{"projectId":"p","fileName":"l.mp4","sizeBytes":5000000000,"lastModified":1,"documentId":null}"#,
+        )
+        .unwrap();
+        assert_eq!(input.size_bytes, 5_000_000_000);
+        assert_eq!(input.folder_id, None);
+        let link: MediaLinkInputDto = serde_json::from_str(
+            r#"{"mediaVersionId":"m","startMs":-5,"endMs":10,"targetVersionId":"t","region":{"x":0,"y":0,"w":1,"h":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (link.start_ms, link.target_page, link.note),
+            (-5, None, None)
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-upload-id"),
+            HeaderValue::from_static("abc-1"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-offset"),
+            HeaderValue::from_static("8388608"),
+        );
+        assert_eq!(
+            ChunkHeaders::parse(&headers).unwrap(),
+            ChunkHeaders {
+                upload_id: "abc-1".into(),
+                offset: 8_388_608
+            }
+        );
+        for bad in ["-1", "", "1e3", "99999999999999999999999"] {
+            headers.insert(
+                HeaderName::from_static("x-offset"),
+                HeaderValue::from_str(bad).unwrap(),
+            );
+            assert!(ChunkHeaders::parse(&headers).is_err(), "{bad}");
+        }
+        headers.insert(
+            HeaderName::from_static("x-offset"),
+            HeaderValue::from_static("0"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-upload-id"),
+            HeaderValue::from_static("../x"),
+        );
+        assert!(ChunkHeaders::parse(&headers).is_err());
+    }
+
+    struct App {
+        dir: std::path::PathBuf,
+        state: AppState,
+        project: String,
+    }
+
+    fn app() -> App {
+        let dir = tempdir();
+        let db = dir.join("localis.db");
+        let state = AppState::new(move || Ok(Store::open(&db)?))
+            .with_uploads(Arc::new(Uploads::new(&dir.join("originals"))))
+            .with_models(Arc::new(ModelManager::new(dir.join("models/whisper"))));
+        let project = state
+            .with_store(|s| {
+                Ok(s.create_project(NewProject {
+                    name: "Lezioni".into(),
+                    description: None,
+                })?
+                .id)
+            })
+            .unwrap();
+        App {
+            dir,
+            state,
+            project,
+        }
+    }
+
+    /// The chunked import path of `finish_upload`, through the managed state.
+    fn upload(app: &App, name: &str, bytes: &[u8]) -> ImportResultDto {
+        let uploads = app.state.uploads.clone().unwrap();
+        let input = localis_core::BeginUpload {
+            project_id: app.project.clone(),
+            file_name: name.into(),
+            size_bytes: bytes.len() as u64,
+            ..Default::default()
+        };
+        app.state
+            .with_store(|s| Ok(s.check_upload_target(&input)?))
+            .unwrap();
+        let id = uploads.begin(input).unwrap().upload_id;
+        let mut offset = 0;
+        for chunk in bytes.chunks(4096) {
+            uploads.write_chunk(&id, offset, chunk).unwrap();
+            offset += chunk.len() as u64;
+        }
+        let finished = uploads.finish(&id).unwrap();
+        let file = finished.prepare().unwrap();
+        app.state
+            .with_store(|s| Ok(s.import_upload(&finished, &file)?))
+            .unwrap()
+            .into()
+    }
+
+    fn get(path: &str, range: Option<&str>) -> Request<Vec<u8>> {
+        let mut b = Request::builder()
+            .method("GET")
+            .uri(format!("localis-media://localhost{path}"));
+        if let Some(r) = range {
+            b = b.header("range", r);
+        }
+        b.body(Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn upload_then_stream_with_ranges() {
+        let app = app();
+        let mp3 = fixture("lezione.mp3");
+        let ImportResultDto::Imported { document } = upload(&app, "lezione.mp3", &mp3) else {
+            panic!("expected imported");
+        };
+        let v: DocumentVersionDto = document.current;
+        assert_eq!((v.kind, v.media_type.as_str()), ("audio", "audio/mpeg"));
+        assert!(v.duration_ms.is_some_and(|d| d > 9000));
+        let json = to_json(v.clone());
+        assert!(json.contains(r#""textStatus":"not_applicable""#), "{json}");
+        assert!(json.contains(r#""transcription":null"#), "{json}");
+
+        let path = format!("/{}", v.id);
+        let r = media_protocol::handle(&app.state, &get(&path, None));
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.body(), &mp3);
+        assert_eq!(r.headers()["content-type"], "audio/mpeg");
+        assert_eq!(r.headers()["accept-ranges"], "bytes");
+        let r = media_protocol::handle(&app.state, &get(&path, Some("bytes=100-")));
+        assert_eq!(r.status(), 206);
+        assert_eq!(r.body(), &mp3[100..]);
+        assert_eq!(
+            r.headers()["content-range"],
+            format!("bytes 100-{}/{}", mp3.len() - 1, mp3.len()).as_str()
+        );
+        let r = media_protocol::handle(
+            &app.state,
+            &get(&path, Some(&format!("bytes={}-", mp3.len()))),
+        );
+        assert_eq!(r.status(), 416);
+        // Unknown ids, non-media versions and anything that is not an id: 404.
+        assert_eq!(
+            media_protocol::handle(&app.state, &get("/nope", None)).status(),
+            404
+        );
+        assert_eq!(
+            media_protocol::handle(&app.state, &get("/../localis.db", None)).status(),
+            404
+        );
+        let ImportResultDto::Imported { document: txt } =
+            upload(&app, "note.txt", b"appunti di testo")
+        else {
+            panic!()
+        };
+        assert_eq!(
+            media_protocol::handle(&app.state, &get(&format!("/{}", txt.current.id), None))
+                .status(),
+            404
+        );
+        // A stored file that changed size is not served.
+        let sha = &v.sha256;
+        let blob = app.dir.join("originals").join(&sha[..2]).join(sha);
+        std::fs::write(&blob, b"troncato").unwrap();
+        assert_eq!(
+            media_protocol::handle(&app.state, &get(&path, None)).status(),
+            500
+        );
+    }
+
+    #[test]
+    fn transcription_and_link_errors_map_to_codes_and_fields() {
+        let app = app();
+        let ImportResultDto::Imported { document } =
+            upload(&app, "lezione.mp4", &fixture("lezione.mp4"))
+        else {
+            panic!()
+        };
+        let v = document.current.id;
+        // Queued job JSON: kind transcribe, progress null.
+        let job: JobDto = app
+            .state
+            .with_store(|s| Ok(s.start_transcription(&v, M::Base, Language::Auto)?))
+            .unwrap()
+            .into();
+        let json = to_json(job.clone());
+        assert!(
+            json.contains(r#""kind":"transcribe","state":"queued","progress":null"#),
+            "{json}"
+        );
+        let err: AppError = app
+            .state
+            .with_store(|s| Ok(s.start_transcription(&v, M::Base, Language::It)?))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        let cancelled: JobDto = app
+            .state
+            .with_store(|s| Ok(s.cancel_job(job.id)?))
+            .unwrap()
+            .into();
+        assert_eq!(cancelled.state, "failed");
+        assert_eq!(
+            cancelled.error.as_deref(),
+            Some(localis_core::TRANSCRIPTION_CANCELLED)
+        );
+        let status = app
+            .state
+            .with_store(|s| Ok(s.get_version(&v)?.text_status.as_str()))
+            .unwrap();
+        assert_eq!(status, "not_applicable");
+        let bad_model: AppError = WhisperModelId::parse_input("huge").unwrap_err().into();
+        assert_eq!(
+            (bad_model.code, bad_model.field.as_deref()),
+            (ErrorCode::Validation, Some("model"))
+        );
+
+        // Link validation errors carry the camelCase field the form shows them under.
+        let ImportResultDto::Imported { document: photo } = upload(&app, "foto.png", &png()) else {
+            panic!()
+        };
+        let input = |start: i64, end: i64, page: Option<i64>| MediaLinkInputDto {
+            media_version_id: v.clone(),
+            start_ms: start,
+            end_ms: end,
+            target_version_id: photo.current.id.clone(),
+            target_page: page,
+            region: None,
+            note: None,
+        };
+        for (i, field) in [
+            (input(-1, 10, None), "startMs"),
+            (input(10, 5, None), "endMs"),
+            (input(0, 10, Some(1)), "targetPage"),
+            (
+                MediaLinkInputDto {
+                    region: Some(RegionDto {
+                        x: 0.5,
+                        y: 0.5,
+                        w: 0.6,
+                        h: 0.1,
+                    }),
+                    ..input(0, 10, None)
+                },
+                "region",
+            ),
+            (
+                MediaLinkInputDto {
+                    note: Some("n".repeat(2001)),
+                    ..input(0, 10, None)
+                },
+                "note",
+            ),
+        ] {
+            let core = localis_core::MediaLinkInput::from(i);
+            let err: AppError = app
+                .state
+                .with_store(|s| Ok(s.create_media_link(&core)?))
+                .unwrap_err();
+            assert_eq!(
+                (err.code, err.field.as_deref()),
+                (ErrorCode::Validation, Some(field))
+            );
+        }
+        let ok = localis_core::MediaLinkInput::from(input(0, 1000, None));
+        let link: MediaLinkDto = app
+            .state
+            .with_store(|s| Ok(s.create_media_link(&ok)?))
+            .unwrap()
+            .into();
+        assert_eq!(
+            (link.media_title.as_str(), link.target_page),
+            ("lezione.mp4", None)
+        );
+    }
+
+    /// A 1×1 PNG.
+    fn png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
     }
 }

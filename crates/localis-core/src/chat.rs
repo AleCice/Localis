@@ -1888,6 +1888,7 @@ pub fn prepare_cloud_send<A: StoreAccess>(
             unit_kind: e.unit_kind,
             chars: e.text.chars().count() as u64,
             via: searched.ranked[i].via,
+            start_ms: e.start_ms,
         })
         .collect();
     let history_chars = searched

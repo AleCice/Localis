@@ -16,10 +16,9 @@ use localis_core::{
     decode_to_whisper, detect_format, detect_media_file, kind_for_file_name, run_transcriber,
     sha256_hex, BeginUpload, CoreError, DecodeError, DocumentKind, ImportOutcome, JobState,
     Language, LibraryDocument, MediaLinkInput, ModelManager, ModelSpec, Recognized,
-    RecognizedSegment, Region, Store, TextStatus, TranscribeError, TranscribeRequest,
-    Transcriber, TranscriberConfig, TranscriptionOutcome, UnitKind, Uploads, WhisperModelId,
-    WhisperTranscriber, MODEL_NOT_INSTALLED, TRANSCRIPTION_CANCELLED, TRANSCRIPTION_INTERRUPTED,
-    UPLOAD_CHUNK_BYTES,
+    RecognizedSegment, Region, Store, TextStatus, TranscribeError, TranscribeRequest, Transcriber,
+    TranscriberConfig, TranscriptionOutcome, UnitKind, Uploads, WhisperModelId, WhisperTranscriber,
+    MODEL_NOT_INSTALLED, TRANSCRIPTION_CANCELLED, TRANSCRIPTION_INTERRUPTED, UPLOAD_CHUNK_BYTES,
 };
 
 const POLL: Duration = Duration::from_millis(20);
@@ -73,7 +72,9 @@ fn media_formats_are_recognized_with_duration() {
         let bytes = fixture_bytes(name);
         let f = detect_format(name, &bytes).unwrap();
         assert_eq!((f.kind, f.media_type), (kind, media_type), "{name}");
-        let ms = f.duration_ms.unwrap_or_else(|| panic!("{name}: no duration"));
+        let ms = f
+            .duration_ms
+            .unwrap_or_else(|| panic!("{name}: no duration"));
         assert!((9_000..10_000).contains(&ms), "{name}: {ms} ms");
         // Same result from the file (chunked uploads), without reading it whole.
         let from_file = detect_media_file(name, &fixture(name)).unwrap().unwrap();
@@ -109,14 +110,26 @@ fn media_mismatches_and_damage_are_unsupported() {
         ("finto.mp3", mp4.clone(), "non è un audio MP3"),
         ("finto.mp4", mp3.clone(), "non è un video MP4"),
         ("finto.m4a", b"%PDF-1.4".to_vec(), "non è un audio M4A"),
-        ("testo.mp3", b"solo testo, niente audio".to_vec(), "non è un audio MP3"),
+        (
+            "testo.mp3",
+            b"solo testo, niente audio".to_vec(),
+            "non è un audio MP3",
+        ),
         // Right signature, broken container.
-        ("rotto.mp4", {
-            let mut b = mp4[..64].to_vec();
-            b.extend(std::iter::repeat_n(0u8, 256));
-            b
-        }, "danneggiato"),
-        ("muto.m4a", fixture_bytes("muto.mp4"), "non contiene una traccia audio"),
+        (
+            "rotto.mp4",
+            {
+                let mut b = mp4[..64].to_vec();
+                b.extend(std::iter::repeat_n(0u8, 256));
+                b
+            },
+            "danneggiato",
+        ),
+        (
+            "muto.m4a",
+            fixture_bytes("muto.mp4"),
+            "non contiene una traccia audio",
+        ),
     ];
     for (name, bytes, expected) in cases {
         match detect_format(name, &bytes) {
@@ -128,10 +141,15 @@ fn media_mismatches_and_damage_are_unsupported() {
     }
     // A text file starting like an ID3 tag is still text.
     assert_eq!(
-        detect_format("nota.txt", b"ID3 e altre sigle").unwrap().kind,
+        detect_format("nota.txt", b"ID3 e altre sigle")
+            .unwrap()
+            .kind,
         DocumentKind::Text
     );
-    assert_eq!(kind_for_file_name("Lezione.MP4").unwrap(), DocumentKind::Video);
+    assert_eq!(
+        kind_for_file_name("Lezione.MP4").unwrap(),
+        DocumentKind::Video
+    );
     assert!(matches!(
         kind_for_file_name("a.ogg"),
         Err(CoreError::Unsupported { .. })
@@ -154,7 +172,9 @@ fn decoding_gives_16khz_mono_of_the_right_length() {
         let peak = audio.samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(peak > 0.05 && peak <= 1.0, "{name}: peak {peak}");
         // The first second is silence (see make_fixtures.sh).
-        let lead = audio.samples[..12_000].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let lead = audio.samples[..12_000]
+            .iter()
+            .fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(lead < 0.05, "{name}: lead {lead}");
     }
     // Stereo 44.1 kHz WAV: downmixed and resampled, pitch preserved.
@@ -281,7 +301,13 @@ fn chunked_upload_imports_media_and_follows_the_import_rules() {
     assert_eq!(doc2.current.media_type, "audio/mp4");
 
     // A video: dimensions recorded.
-    let video = imported(u.upload(&p, "lezione.mp4", &fixture_bytes("lezione.mp4"), 7_777, None));
+    let video = imported(u.upload(
+        &p,
+        "lezione.mp4",
+        &fixture_bytes("lezione.mp4"),
+        7_777,
+        None,
+    ));
     assert_eq!(video.current.kind, DocumentKind::Video);
     assert_eq!(
         (video.current.image_width, video.current.image_height),
@@ -294,7 +320,11 @@ fn chunked_upload_imports_media_and_follows_the_import_rules() {
     assert_eq!(notes.current.text_status, TextStatus::Pending);
     assert_eq!(u.env.run_jobs(), 1);
     assert_eq!(
-        u.env.store.get_version(&notes.current.id).unwrap().text_status,
+        u.env
+            .store
+            .get_version(&notes.current.id)
+            .unwrap()
+            .text_status,
         TextStatus::Extracted
     );
     assert_eq!(u.temp_files(), 0);
@@ -334,9 +364,16 @@ fn chunked_upload_checks_offsets_size_and_target() {
         u.uploads.write_chunk(&id, 0, &mp3[..1]),
         Err(CoreError::NotFound { .. })
     ));
-    assert!(matches!(u.uploads.finish(&id), Err(CoreError::NotFound { .. })));
+    assert!(matches!(
+        u.uploads.finish(&id),
+        Err(CoreError::NotFound { .. })
+    ));
     drop(finished);
-    assert_eq!(u.temp_files(), 0, "dropping an unimported upload removes it");
+    assert_eq!(
+        u.temp_files(),
+        0,
+        "dropping an unimported upload removes it"
+    );
 
     // Block size limit.
     let big = vec![0u8; UPLOAD_CHUNK_BYTES as usize + 1];
@@ -362,30 +399,47 @@ fn chunked_upload_checks_offsets_size_and_target() {
         begin("dispense.pdf", 200 * 1024 * 1024 + 1),
         Err(CoreError::TooLarge { .. })
     ));
-    assert!(matches!(begin("a.mp3", 0), Err(CoreError::Validation { .. })));
-    assert!(matches!(begin("a.exe", 10), Err(CoreError::Unsupported { .. })));
-    assert!(matches!(begin("../a.mp3", 10), Err(CoreError::Validation { .. })));
+    assert!(matches!(
+        begin("a.mp3", 0),
+        Err(CoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        begin("a.exe", 10),
+        Err(CoreError::Unsupported { .. })
+    ));
+    assert!(matches!(
+        begin("../a.mp3", 10),
+        Err(CoreError::Validation { .. })
+    ));
 
     // Destination checks.
     let check = |store: &Store, input: BeginUpload| store.check_upload_target(&input);
     assert!(matches!(
-        check(&u.env.store, BeginUpload {
-            project_id: "missing".into(),
-            file_name: "a.mp3".into(),
-            size_bytes: 1,
-            ..BeginUpload::default()
-        }),
+        check(
+            &u.env.store,
+            BeginUpload {
+                project_id: "missing".into(),
+                file_name: "a.mp3".into(),
+                size_bytes: 1,
+                ..BeginUpload::default()
+            }
+        ),
         Err(CoreError::NotFound { .. })
     ));
-    let pdf_doc = u.env.import(&p, "slide.pdf", &pdf(&[&text_page(&[b"Slide"])]));
+    let pdf_doc = u
+        .env
+        .import(&p, "slide.pdf", &pdf(&[&text_page(&[b"Slide"])]));
     assert!(matches!(
-        check(&u.env.store, BeginUpload {
-            project_id: p.clone(),
-            file_name: "a.mp3".into(),
-            size_bytes: 1,
-            document_id: Some(pdf_doc.id.clone()),
-            ..BeginUpload::default()
-        }),
+        check(
+            &u.env.store,
+            BeginUpload {
+                project_id: p.clone(),
+                file_name: "a.mp3".into(),
+                size_bytes: 1,
+                document_id: Some(pdf_doc.id.clone()),
+                ..BeginUpload::default()
+            }
+        ),
         Err(CoreError::Validation { field: "file", .. })
     ));
     let other = u.env.project("Altro").id;
@@ -399,14 +453,20 @@ fn chunked_upload_checks_offsets_size_and_target() {
         })
         .unwrap();
     assert!(matches!(
-        check(&u.env.store, BeginUpload {
-            project_id: p.clone(),
-            folder_id: Some(folder.id),
-            file_name: "a.mp3".into(),
-            size_bytes: 1,
-            ..BeginUpload::default()
-        }),
-        Err(CoreError::Validation { field: "folderId", .. })
+        check(
+            &u.env.store,
+            BeginUpload {
+                project_id: p.clone(),
+                folder_id: Some(folder.id),
+                file_name: "a.mp3".into(),
+                size_bytes: 1,
+                ..BeginUpload::default()
+            }
+        ),
+        Err(CoreError::Validation {
+            field: "folderId",
+            ..
+        })
     ));
 
     // Content that does not match the extension is refused at finish; temp removed.
@@ -414,10 +474,17 @@ fn chunked_upload_checks_offsets_size_and_target() {
     let id = u.begin(&p, "finto.mp3", fake.len() as u64, None);
     u.uploads.write_chunk(&id, 0, &fake).unwrap();
     let finished = u.uploads.finish(&id).unwrap();
-    assert!(matches!(finished.prepare(), Err(CoreError::Unsupported { .. })));
+    assert!(matches!(
+        finished.prepare(),
+        Err(CoreError::Unsupported { .. })
+    ));
     drop(finished);
     let _ = u.env.store.list_documents(&p).unwrap();
-    assert_eq!(u.temp_files(), 1, "only the 4 GB upload begun above remains");
+    assert_eq!(
+        u.temp_files(),
+        1,
+        "only the 4 GB upload begun above remains"
+    );
 }
 
 #[test]
@@ -531,9 +598,17 @@ fn models_with_tiny(dir: &Path) -> ModelManager {
 
 const SEGMENTS: &[(u64, u64, &str)] = &[
     (1_000, 3_200, " Buongiorno a tutti."),
-    (3_200, 6_100, "Oggi parliamo della derivata di una funzione."),
+    (
+        3_200,
+        6_100,
+        "Oggi parliamo della derivata di una funzione.",
+    ),
     (6_100, 6_150, "[BLANK_AUDIO]"),
-    (6_150, 9_300, "La derivata misura la velocità di variazione."),
+    (
+        6_150,
+        9_300,
+        "La derivata misura la velocità di variazione.",
+    ),
 ];
 
 struct Lecture {
@@ -612,7 +687,10 @@ fn transcription_feeds_text_passages_and_search() {
     let version = l.env.store.get_version(&v).unwrap();
     assert_eq!(version.text_status, TextStatus::Extracted);
     let info = version.transcription.unwrap();
-    assert_eq!((info.model.as_str(), info.language.as_str()), ("tiny", "it"));
+    assert_eq!(
+        (info.model.as_str(), info.language.as_str()),
+        ("tiny", "it")
+    );
     assert_eq!(info.segment_count, 3);
 
     let segments = l.env.store.get_transcript(&v).unwrap();
@@ -625,7 +703,10 @@ fn transcription_feeds_text_passages_and_search() {
     let units = l.env.store.get_text(&v).unwrap();
     assert_eq!(units.len(), 3);
     assert_eq!(units[2].unit, 3);
-    assert_eq!((units[2].start_ms, units[2].end_ms), (Some(6_150), Some(9_300)));
+    assert_eq!(
+        (units[2].start_ms, units[2].end_ms),
+        (Some(6_150), Some(9_300))
+    );
 
     // Search finds segments, with unit kind and start.
     let hits = l.env.store.search(&l.project, "velocita", None).unwrap();
@@ -648,7 +729,10 @@ fn transcription_feeds_text_passages_and_search() {
     assert_eq!(passages[0].start_ms, Some(1_000));
     // The documents list carries the transcription.
     let listed = &l.env.store.list_documents(&l.project).unwrap()[0];
-    assert_eq!(listed.current.transcription.as_ref().unwrap().segment_count, 3);
+    assert_eq!(
+        listed.current.transcription.as_ref().unwrap().segment_count,
+        3
+    );
 }
 
 #[test]
@@ -675,7 +759,10 @@ fn a_new_transcript_replaces_the_old_one_only_on_success() {
     l.run(failing.as_ref());
     let job = l.job();
     assert_eq!(job.state, JobState::Failed);
-    assert_eq!(job.error.as_deref(), Some("La trascrizione non è riuscita."));
+    assert_eq!(
+        job.error.as_deref(),
+        Some("La trascrizione non è riuscita.")
+    );
     assert_eq!(job.error_detail.as_deref(), Some("boom"));
     assert_eq!(l.env.store.get_transcript(&v).unwrap().len(), 4);
     assert_eq!(
@@ -690,8 +777,20 @@ fn a_new_transcript_replaces_the_old_one_only_on_success() {
     let segments = l.env.store.get_transcript(&v).unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(l.env.store.get_text(&v).unwrap().len(), 1);
-    assert!(l.env.store.search(&l.project, "derivata", None).unwrap().is_empty());
-    assert_eq!(l.env.store.search(&l.project, "integrali", None).unwrap().len(), 1);
+    assert!(l
+        .env
+        .store
+        .search(&l.project, "derivata", None)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        l.env
+            .store
+            .search(&l.project, "integrali", None)
+            .unwrap()
+            .len(),
+        1
+    );
 
     // No speech: no_text, transcript empty.
     l.env
@@ -704,8 +803,9 @@ fn a_new_transcript_replaces_the_old_one_only_on_success() {
     assert_eq!(version.transcription.unwrap().segment_count, 0);
     assert!(l.env.store.get_text(&v).unwrap().is_empty());
     assert_eq!(
-        l.env
-            .count(&format!("SELECT COUNT(*) FROM chunks WHERE version_id = '{v}'")),
+        l.env.count(&format!(
+            "SELECT COUNT(*) FROM chunks WHERE version_id = '{v}'"
+        )),
         0
     );
 }
@@ -728,7 +828,10 @@ fn transcription_rules_and_honest_failures() {
     ));
     assert!(matches!(
         localis_core::parse_language("pt"),
-        Err(CoreError::Validation { field: "language", .. })
+        Err(CoreError::Validation {
+            field: "language",
+            ..
+        })
     ));
     assert!(matches!(
         l.env
@@ -778,7 +881,9 @@ fn transcription_rules_and_honest_failures() {
     ));
 
     // A video without audio: imported, but not transcribable.
-    let muto = l.env.import(&l.project, "muto.mp4", &fixture_bytes("muto.mp4"));
+    let muto = l
+        .env
+        .import(&l.project, "muto.mp4", &fixture_bytes("muto.mp4"));
     l.env
         .store
         .start_transcription(&muto.current.id, WhisperModelId::Tiny, Language::It)
@@ -786,7 +891,10 @@ fn transcription_rules_and_honest_failures() {
     l.run(engine.as_ref());
     let job = l.job();
     assert_eq!(job.state, JobState::Failed);
-    assert!(job.error.unwrap().contains("trascrizione non disponibile per questa codifica"));
+    assert!(job
+        .error
+        .unwrap()
+        .contains("trascrizione non disponibile per questa codifica"));
 }
 
 #[test]
@@ -837,7 +945,10 @@ fn running_transcription_is_cancelled_through_the_abort_flag() {
         if j.state == JobState::Running && j.progress.is_some_and(|p| p > 10) {
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(20), "never ran: {j:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "never ran: {j:?}"
+        );
         std::thread::sleep(POLL);
     }
     let cancelled = ui.cancel_job(job.id).unwrap();
@@ -846,15 +957,28 @@ fn running_transcription_is_cancelled_through_the_abort_flag() {
     // The engine sees the abort flag and returns; the worker loop goes on.
     let start = Instant::now();
     while done.load(Ordering::SeqCst) < 1 {
-        assert!(start.elapsed() < Duration::from_secs(20), "worker did not stop");
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "worker did not stop"
+        );
         std::thread::sleep(POLL);
     }
     let j = ui.get_job(job.id).unwrap();
     assert_eq!(j.error.as_deref(), Some(TRANSCRIPTION_CANCELLED));
-    assert_eq!(ui.get_transcript(&v).unwrap().len(), 4, "old transcript kept");
-    assert_eq!(ui.get_version(&v).unwrap().text_status, TextStatus::Extracted);
+    assert_eq!(
+        ui.get_transcript(&v).unwrap().len(),
+        4,
+        "old transcript kept"
+    );
+    assert_eq!(
+        ui.get_version(&v).unwrap().text_status,
+        TextStatus::Extracted
+    );
     // Cancelling again is a conflict.
-    assert!(matches!(ui.cancel_job(job.id), Err(CoreError::Conflict { .. })));
+    assert!(matches!(
+        ui.cancel_job(job.id),
+        Err(CoreError::Conflict { .. })
+    ));
     drop(wake);
     worker.join().unwrap();
 
@@ -895,7 +1019,10 @@ fn interrupted_transcriptions_fail_at_startup_and_extraction_is_not_blocked() {
     let job = restarted.get_job(claimed.id).unwrap();
     assert_eq!(job.state, JobState::Failed);
     assert_eq!(job.error.as_deref(), Some(TRANSCRIPTION_INTERRUPTED));
-    assert_eq!(restarted.get_version(&v).unwrap().text_status, TextStatus::Failed);
+    assert_eq!(
+        restarted.get_version(&v).unwrap().text_status,
+        TextStatus::Failed
+    );
     // Retry runs it again.
     restarted.retry_job(claimed.id).unwrap();
     assert!(restarted
@@ -924,7 +1051,9 @@ fn deleting_documents_and_projects_removes_transcripts_and_links() {
         .start_transcription(&v, WhisperModelId::Tiny, Language::It)
         .unwrap();
     l.run(FakeEngine::with(SEGMENTS).as_ref());
-    let slide = l.env.import(&l.project, "slide.pdf", &pdf(&[&text_page(&[b"Derivata"])]));
+    let slide = l
+        .env
+        .import(&l.project, "slide.pdf", &pdf(&[&text_page(&[b"Derivata"])]));
     l.env.run_jobs();
     let link = l
         .env
@@ -951,14 +1080,21 @@ fn deleting_documents_and_projects_removes_transcripts_and_links() {
     // Only the PDF's text remains; the video's blob is gone.
     assert!(!l.env.blob_path(&l.doc.current.sha256).exists());
     // Project deletion: everything, but never the Whisper models.
-    let again = l.env.import(&l.project, "lezione.mp4", &fixture_bytes("lezione.mp4"));
+    let again = l
+        .env
+        .import(&l.project, "lezione.mp4", &fixture_bytes("lezione.mp4"));
     l.env
         .store
         .start_transcription(&again.current.id, WhisperModelId::Tiny, Language::It)
         .unwrap();
     l.run(FakeEngine::with(SEGMENTS).as_ref());
     l.env.store.delete_project(&l.project).unwrap();
-    for table in ["transcript_segments", "transcriptions", "media_links", "chunks"] {
+    for table in [
+        "transcript_segments",
+        "transcriptions",
+        "media_links",
+        "chunks",
+    ] {
         assert_eq!(count(&l, table), 0, "{table}");
     }
     assert!(l.models.installed_path(WhisperModelId::Tiny).is_some());
@@ -1004,9 +1140,15 @@ fn media_links_validation_cascade_and_backlinks() {
     assert_eq!(link.project_id, l.project);
     assert_eq!(link.media_document_id, l.doc.id);
     assert_eq!(link.target_document_id, slides.id);
-    assert_eq!((link.start_ms, link.end_ms, link.target_page), (1_000, 4_000, Some(2)));
+    assert_eq!(
+        (link.start_ms, link.end_ms, link.target_page),
+        (1_000, 4_000, Some(2))
+    );
     assert_eq!(link.note.as_deref(), Some("Teorema"));
-    assert_eq!((link.media_title.as_str(), link.target_title.as_str()), ("lezione.mp3", "slide.pdf"));
+    assert_eq!(
+        (link.media_title.as_str(), link.target_title.as_str()),
+        ("lezione.mp3", "slide.pdf")
+    );
     assert!(link.available);
     assert_eq!(link.region.unwrap().w, 0.5);
 
@@ -1027,11 +1169,26 @@ fn media_links_validation_cascade_and_backlinks() {
         other => panic!("{other:?}"),
     };
     let s = &mut l.env.store;
-    assert_eq!(field(s.create_media_link(&input(&slides.current.id, None))), "targetPage");
-    assert_eq!(field(s.create_media_link(&input(&slides.current.id, Some(3)))), "targetPage");
-    assert_eq!(field(s.create_media_link(&input(&slides.current.id, Some(0)))), "targetPage");
-    assert_eq!(field(s.create_media_link(&input(&photo.current.id, Some(1)))), "targetPage");
-    assert_eq!(field(s.create_media_link(&input(&notes.current.id, None))), "targetVersionId");
+    assert_eq!(
+        field(s.create_media_link(&input(&slides.current.id, None))),
+        "targetPage"
+    );
+    assert_eq!(
+        field(s.create_media_link(&input(&slides.current.id, Some(3)))),
+        "targetPage"
+    );
+    assert_eq!(
+        field(s.create_media_link(&input(&slides.current.id, Some(0)))),
+        "targetPage"
+    );
+    assert_eq!(
+        field(s.create_media_link(&input(&photo.current.id, Some(1)))),
+        "targetPage"
+    );
+    assert_eq!(
+        field(s.create_media_link(&input(&notes.current.id, None))),
+        "targetVersionId"
+    );
     assert_eq!(
         field(s.create_media_link(&MediaLinkInput {
             start_ms: -1,
@@ -1102,7 +1259,10 @@ fn media_links_validation_cascade_and_backlinks() {
         ImportOutcome::Imported(d) => d,
         other => panic!("{other:?}"),
     };
-    assert_eq!(field(s.create_media_link(&input(&foreign.current.id, None))), "targetVersionId");
+    assert_eq!(
+        field(s.create_media_link(&input(&foreign.current.id, None))),
+        "targetVersionId"
+    );
     assert!(matches!(
         s.create_media_link(&input("missing", None)),
         Err(CoreError::NotFound { .. })
@@ -1110,7 +1270,11 @@ fn media_links_validation_cascade_and_backlinks() {
 
     // Lists, update, delete.
     assert_eq!(s.list_media_links(&v).unwrap().len(), 2);
-    assert_eq!(s.list_media_links(&v).unwrap()[0].id, image_link.id, "by start");
+    assert_eq!(
+        s.list_media_links(&v).unwrap()[0].id,
+        image_link.id,
+        "by start"
+    );
     let back = s.list_links_for_target(&slides.current.id).unwrap();
     assert_eq!(back.len(), 1);
     assert_eq!(back[0].id, link.id);
@@ -1126,7 +1290,10 @@ fn media_links_validation_cascade_and_backlinks() {
             },
         )
         .unwrap();
-    assert_eq!((updated.start_ms, updated.target_page, updated.region), (2_000, Some(1), None));
+    assert_eq!(
+        (updated.start_ms, updated.target_page, updated.region),
+        (2_000, Some(1), None)
+    );
     assert_eq!(updated.created_at, link.created_at);
     assert!(matches!(
         s.update_media_link("missing", &input(&photo.current.id, None)),
@@ -1184,8 +1351,14 @@ fn model_download_verifies_size_and_hash() {
     let listed = models.list();
     assert!(listed[0].installed);
     assert_eq!(listed[0].error, None);
-    assert_eq!(std::fs::read(models.dir().join("ggml-tiny.bin")).unwrap(), good);
-    assert_eq!(hf.hits(), [format!("{HF_PATH}ggml-tiny.bin"), "/cdn/tiny".to_owned()]);
+    assert_eq!(
+        std::fs::read(models.dir().join("ggml-tiny.bin")).unwrap(),
+        good
+    );
+    assert_eq!(
+        hf.hits(),
+        [format!("{HF_PATH}ggml-tiny.bin"), "/cdn/tiny".to_owned()]
+    );
 
     // Wrong hash (same size): error, no file, no temp left.
     let mut bad = good.clone();
@@ -1242,7 +1415,9 @@ fn model_download_runs_in_background_and_can_be_cancelled() {
     let start = Instant::now();
     loop {
         let m = &models.list()[0];
-        if m.download.is_some_and(|(received, total)| received > 0 && total == 25_600) {
+        if m.download
+            .is_some_and(|(received, total)| received > 0 && total == 25_600)
+        {
             break;
         }
         assert!(start.elapsed() < Duration::from_secs(10), "{m:?}");
@@ -1257,7 +1432,11 @@ fn model_download_runs_in_background_and_can_be_cancelled() {
     let m = &models.list()[0];
     assert!(!m.installed);
     assert_eq!(m.error, None, "a cancellation is not an error");
-    assert_eq!(std::fs::read_dir(models.dir()).unwrap().count(), 0, "temp removed");
+    assert_eq!(
+        std::fs::read_dir(models.dir()).unwrap().count(),
+        0,
+        "temp removed"
+    );
     assert_eq!(hf.hits().len(), 1, "only the fake server was contacted");
 }
 
@@ -1302,7 +1481,10 @@ fn real_whisper_transcribes_italian_speech() {
     let Some(model) = whisper_test_model("real_whisper_transcribes_italian_speech") else {
         return;
     };
-    for (name, language) in [("lezione.mp3", Language::It), ("lezione.mp4", Language::Auto)] {
+    for (name, language) in [
+        ("lezione.mp3", Language::It),
+        ("lezione.mp4", Language::Auto),
+    ] {
         let mut env = Env::new();
         let p = env.project("Analisi").id;
         let doc = env.import(&p, name, &fixture_bytes(name));
@@ -1329,12 +1511,24 @@ fn real_whisper_transcribes_italian_speech() {
             started.elapsed().as_secs_f32()
         );
         // Synthetic TTS + the tiny model: require a few expected words, not exact text.
-        let expected = ["buongiorno", "oggi", "derivata", "funzione", "misura", "variazione"];
+        let expected = [
+            "buongiorno",
+            "oggi",
+            "derivata",
+            "funzione",
+            "misura",
+            "variazione",
+        ];
         let found = expected.iter().filter(|w| text.contains(*w)).count();
-        assert!(found >= 2, "{name}: only {found} expected words in {text:?}");
+        assert!(
+            found >= 2,
+            "{name}: only {found} expected words in {text:?}"
+        );
         assert!(!segments.is_empty());
         assert!(segments.windows(2).all(|w| w[0].start_ms <= w[1].start_ms));
-        assert!(segments.iter().all(|s| s.end_ms <= 10_500 && s.start_ms <= s.end_ms));
+        assert!(segments
+            .iter()
+            .all(|s| s.end_ms <= 10_500 && s.start_ms <= s.end_ms));
         let version = env.store.get_version(&doc.current.id).unwrap();
         assert_eq!(version.text_status, TextStatus::Extracted);
         assert_eq!(version.transcription.unwrap().language, "it", "{name}");
@@ -1367,7 +1561,10 @@ fn real_whisper_reports_progress_and_aborts() {
     };
     let out = WhisperTranscriber.transcribe(&request).unwrap();
     assert_eq!(progress.load(Ordering::SeqCst), 100);
-    assert!(out.segments.iter().all(|s| !localis_core::is_non_speech(&s.text)));
+    assert!(out
+        .segments
+        .iter()
+        .all(|s| !localis_core::is_non_speech(&s.text)));
     // An abort flag already set stops whisper.
     let abort = AtomicBool::new(true);
     let request = TranscribeRequest {

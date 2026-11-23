@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-create-media-link"
+description = "Enables the create_media_link command without any pre-configured scope."
+commands.allow = ["create_media_link"]
+
+[[permission]]
+identifier = "deny-create-media-link"
+description = "Denies the create_media_link command without any pre-configured scope."
+commands.deny = ["create_media_link"]

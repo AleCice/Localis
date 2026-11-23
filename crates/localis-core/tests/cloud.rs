@@ -1273,7 +1273,10 @@ fn migration_3_to_4_keeps_settings_embeddings_and_messages() {
         .unwrap();
     }
     let store = env.reopen();
-    assert_eq!(store.schema_version().unwrap(), localis_core::SCHEMA_VERSION);
+    assert_eq!(
+        store.schema_version().unwrap(),
+        localis_core::SCHEMA_VERSION
+    );
     let s = store.llm_settings().unwrap();
     assert_eq!(
         s.chat_model,

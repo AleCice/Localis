@@ -1365,7 +1365,11 @@ fn transcript_segments_are_cited_with_their_time() {
         &lecture.current.id,
         &[
             (1_000, 3_000, "Buongiorno a tutti."),
-            (754_000, 760_000, "La derivata misura la velocità di variazione della funzione."),
+            (
+                754_000,
+                760_000,
+                "La derivata misura la velocità di variazione della funzione.",
+            ),
         ],
     );
     let conv = chat.conversation();
@@ -1391,8 +1395,17 @@ fn transcript_segments_are_cited_with_their_time() {
         .to_owned();
     assert!(prompt.contains("[1] «lezione.mp3», 00:01\n"), "{prompt}");
     let reloaded = chat.store().list_messages(&conv).unwrap();
-    let again = reloaded.last().unwrap().sources.iter().find(|s| s.n.is_some()).unwrap();
-    assert_eq!((again.unit_kind, again.start_ms), (localis_core::UnitKind::Segment, Some(1_000)));
+    let again = reloaded
+        .last()
+        .unwrap()
+        .sources
+        .iter()
+        .find(|s| s.n.is_some())
+        .unwrap();
+    assert_eq!(
+        (again.unit_kind, again.start_ms),
+        (localis_core::UnitKind::Segment, Some(1_000))
+    );
     // Inventory describes recordings honestly.
     let inventory = chat.ask(&conv, "Quali documenti ci sono nel progetto?");
     assert_eq!(inventory.kind, MessageKind::Inventory);

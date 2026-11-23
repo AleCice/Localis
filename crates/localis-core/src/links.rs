@@ -19,7 +19,8 @@ const MEDIA_REQUIRED: &str = "Si possono collegare solo registrazioni audio o vi
 const TARGET_KIND: &str = "La destinazione deve essere un PDF o un'immagine.";
 const OTHER_PROJECT: &str = "La destinazione appartiene a un altro progetto.";
 const START_INVALID: &str = "L'inizio deve essere un istante valido della registrazione.";
-const END_INVALID: &str = "La fine deve essere dopo l'inizio e non oltre la durata della registrazione.";
+const END_INVALID: &str =
+    "La fine deve essere dopo l'inizio e non oltre la durata della registrazione.";
 const PAGE_REQUIRED: &str = "Indica la pagina del PDF.";
 const PAGE_INVALID: &str = "La pagina non esiste nel PDF.";
 const PAGE_NOT_FOR_IMAGES: &str = "Le immagini non hanno pagine.";
@@ -168,7 +169,11 @@ impl Store {
         if target_doc.project_id != media_doc.project_id {
             return Err(CoreError::validation("targetVersionId", OTHER_PROJECT));
         }
-        if input.start_ms < 0 || media.duration_ms.is_some_and(|d| input.start_ms as u64 >= d) {
+        if input.start_ms < 0
+            || media
+                .duration_ms
+                .is_some_and(|d| input.start_ms as u64 >= d)
+        {
             return Err(CoreError::validation("startMs", START_INVALID));
         }
         if input.end_ms <= input.start_ms
@@ -355,7 +360,10 @@ mod tests {
     #[test]
     fn note_rules() {
         assert_eq!(validate_note(Some("  ")).unwrap(), None);
-        assert_eq!(validate_note(Some(" a\nb ")).unwrap().as_deref(), Some("a\nb"));
+        assert_eq!(
+            validate_note(Some(" a\nb ")).unwrap().as_deref(),
+            Some("a\nb")
+        );
         assert!(validate_note(Some(&"è".repeat(LINK_NOTE_MAX))).is_ok());
         assert!(validate_note(Some(&"è".repeat(LINK_NOTE_MAX + 1))).is_err());
         assert!(validate_note(Some("a\u{0}b")).is_err());

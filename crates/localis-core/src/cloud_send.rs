@@ -179,6 +179,8 @@ pub struct PreviewSource {
     pub unit_kind: UnitKind,
     pub chars: u64,
     pub via: Via,
+    /// v0.5: start of a transcript passage.
+    pub start_ms: Option<u64>,
 }
 
 /// What will be sent, shown before the user confirms (`CloudPreview`).

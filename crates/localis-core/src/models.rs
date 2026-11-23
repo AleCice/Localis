@@ -375,7 +375,10 @@ impl ModelManager {
 
     /// Asks a running download to stop (no-op otherwise).
     pub fn cancel_download(&self, id: WhisperModelId) {
-        if let Some(d) = lock(&self.entries).get(&id).and_then(|e| e.download.as_ref()) {
+        if let Some(d) = lock(&self.entries)
+            .get(&id)
+            .and_then(|e| e.download.as_ref())
+        {
             d.cancel.store(true, Ordering::SeqCst);
         }
     }
@@ -465,9 +468,11 @@ impl ModelManager {
                 ));
             }
         }
-        let temp = self
-            .dir
-            .join(format!("{TEMP_PREFIX}{}-{}", spec.file_name, uuid::Uuid::new_v4()));
+        let temp = self.dir.join(format!(
+            "{TEMP_PREFIX}{}-{}",
+            spec.file_name,
+            uuid::Uuid::new_v4()
+        ));
         let result = self.stream_to(&temp, response.into_body().into_reader(), spec, download);
         match result {
             Ok(()) => fs::rename(&temp, self.final_path(spec)).map_err(|e| {
@@ -505,7 +510,8 @@ impl ModelManager {
                 return Err(failed(VERIFY_FAILED, "more bytes than expected"));
             }
             hasher.update(&buf[..n]);
-            file.write_all(&buf[..n]).map_err(|e| failed(DISK_FAILED, e))?;
+            file.write_all(&buf[..n])
+                .map_err(|e| failed(DISK_FAILED, e))?;
             download.received.store(received, Ordering::Relaxed);
         }
         let actual = hex_digest(&hasher.finalize());
@@ -560,7 +566,10 @@ fn resolve_location(base: &str, location: &str) -> String {
         return format!("{}{location}", &base[..authority_end]);
     }
     // Relative path: replace the last segment.
-    let last_slash = base.rfind('/').filter(|&i| i >= authority_end).unwrap_or(authority_end);
+    let last_slash = base
+        .rfind('/')
+        .filter(|&i| i >= authority_end)
+        .unwrap_or(authority_end);
     format!("{}/{location}", &base[..last_slash])
 }
 
@@ -611,10 +620,19 @@ mod tests {
     #[test]
     fn location_resolution() {
         let base = "https://huggingface.co/a/b/c.bin";
-        assert_eq!(resolve_location(base, "https://x.hf.co/y"), "https://x.hf.co/y");
+        assert_eq!(
+            resolve_location(base, "https://x.hf.co/y"),
+            "https://x.hf.co/y"
+        );
         assert_eq!(resolve_location(base, "/z"), "https://huggingface.co/z");
-        assert_eq!(resolve_location(base, "//cdn.hf.co/q"), "https://cdn.hf.co/q");
-        assert_eq!(resolve_location(base, "d.bin"), "https://huggingface.co/a/b/d.bin");
+        assert_eq!(
+            resolve_location(base, "//cdn.hf.co/q"),
+            "https://cdn.hf.co/q"
+        );
+        assert_eq!(
+            resolve_location(base, "d.bin"),
+            "https://huggingface.co/a/b/d.bin"
+        );
     }
 
     #[test]

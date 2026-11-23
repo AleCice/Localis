@@ -43,7 +43,9 @@ impl ChunkHeaders {
         let offset = valid
             .then(|| raw.parse::<u64>().ok())
             .flatten()
-            .ok_or_else(|| AppError::bad_request("header x-offset is not a non-negative integer"))?;
+            .ok_or_else(|| {
+                AppError::bad_request("header x-offset is not a non-negative integer")
+            })?;
         Ok(ChunkHeaders { upload_id, offset })
     }
 }

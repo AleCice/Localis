@@ -123,7 +123,11 @@ impl BlobStore {
         if let Err(err) = result {
             return Err(CoreError::storage(
                 WRITE_MESSAGE,
-                format!("cannot move {} to {}: {err}", temp.display(), path.display()),
+                format!(
+                    "cannot move {} to {}: {err}",
+                    temp.display(),
+                    path.display()
+                ),
             ));
         }
         sync_dir(dir);

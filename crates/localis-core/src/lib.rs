@@ -68,32 +68,21 @@ pub use library::{
     IMPORT_MAX_BYTES,
 };
 pub use links::{MediaLink, MediaLinkInput, Region, LINK_NOTE_MAX};
-pub use media::{decode_to_whisper, DecodeError, DecodedAudio, TRANSCRIBE_MAX_MS, WHISPER_SAMPLE_RATE};
-pub use models::{
-    allowed_hf_url, catalog as whisper_catalog, ModelManager, ModelSpec, WhisperModel,
-    WhisperModelId, HF_ORIGIN, MODELS_DIR,
-};
-#[cfg(debug_assertions)]
-pub use models::TEST_HF_BASE_URL_VAR;
-pub use transcribe::{
-    format_timestamp, parse_language, run_transcriber, segment_passages, ClaimedTranscription,
-    TranscriberConfig, TranscriptSegment, TranscriptionOutcome, EXTRACTION_CANCELLED,
-    JOB_KIND_TRANSCRIBE, MODEL_NOT_INSTALLED, TRANSCRIPTION_CANCELLED, TRANSCRIPTION_INTERRUPTED,
-};
-pub use uploads::{
-    BeginUpload, FinishedUpload, UploadHandle, Uploads, UPLOADS_DIR, UPLOADS_MAX,
-    UPLOAD_CHUNK_BYTES, UPLOAD_IDLE_TIMEOUT,
-};
-pub use whisper::{
-    default_threads, is_non_speech, Language, Recognized, RecognizedSegment, TranscribeError,
-    TranscribeRequest, Transcriber, WhisperTranscriber,
-};
 pub use llm::{
     LlmClient, LlmStatus, ModelInfo, ModelKind, PromptMessage, SseParser, StreamEnd,
     CONNECT_TIMEOUT, EMBED_BATCH_MAX, SHORT_TIMEOUT,
 };
+pub use media::{
+    decode_to_whisper, DecodeError, DecodedAudio, TRANSCRIBE_MAX_MS, WHISPER_SAMPLE_RATE,
+};
 pub use mesh::{
     client_for, missing_key_message, CloudClient, ModelClient, CLOUD_MAX_OUTPUT_TOKENS, TEMPERATURE,
+};
+#[cfg(debug_assertions)]
+pub use models::TEST_HF_BASE_URL_VAR;
+pub use models::{
+    allowed_hf_url, catalog as whisper_catalog, ModelManager, ModelSpec, WhisperModel,
+    WhisperModelId, HF_ORIGIN, MODELS_DIR,
 };
 pub use prices::{estimate_tokens, validate_price, ModelPrice, Money, Usage, PRICE_MAX};
 pub use prism::{
@@ -118,4 +107,17 @@ pub use settings::{
     DEFAULT_BASE_URL,
 };
 pub use store::{NewProject, Project, Store, ORIGINALS_DIR, SCHEMA_VERSION};
+pub use transcribe::{
+    format_timestamp, parse_language, run_transcriber, segment_passages, ClaimedTranscription,
+    TranscriberConfig, TranscriptSegment, TranscriptionOutcome, EXTRACTION_CANCELLED,
+    JOB_KIND_TRANSCRIBE, MODEL_NOT_INSTALLED, TRANSCRIPTION_CANCELLED, TRANSCRIPTION_INTERRUPTED,
+};
+pub use uploads::{
+    BeginUpload, FinishedUpload, UploadHandle, Uploads, UPLOADS_DIR, UPLOADS_MAX,
+    UPLOAD_CHUNK_BYTES, UPLOAD_IDLE_TIMEOUT,
+};
 pub use validation::{validate_description, validate_name, DESCRIPTION_MAX, NAME_MAX};
+pub use whisper::{
+    default_threads, is_non_speech, Language, Recognized, RecognizedSegment, TranscribeError,
+    TranscribeRequest, Transcriber, WhisperTranscriber,
+};

@@ -734,13 +734,20 @@ impl Store {
         upload: &crate::uploads::FinishedUpload,
         file: &ImportFile<'_>,
     ) -> Result<ImportOutcome> {
-        match upload.input.document_id.as_deref().filter(|d| !d.is_empty()) {
+        match upload
+            .input
+            .document_id
+            .as_deref()
+            .filter(|d| !d.is_empty())
+        {
             Some(document_id) => {
                 let document = self.get_document(document_id)?;
                 if document.project_id != upload.input.project_id {
                     return Err(CoreError::not_found(DOCUMENT_NOT_FOUND));
                 }
-                Ok(ImportOutcome::Imported(self.import_version(document_id, file)?))
+                Ok(ImportOutcome::Imported(
+                    self.import_version(document_id, file)?,
+                ))
             }
             None => self.import_document(
                 &upload.input.project_id,

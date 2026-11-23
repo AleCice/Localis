@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-finish-upload"
+description = "Enables the finish_upload command without any pre-configured scope."
+commands.allow = ["finish_upload"]
+
+[[permission]]
+identifier = "deny-finish-upload"
+description = "Denies the finish_upload command without any pre-configured scope."
+commands.deny = ["finish_upload"]

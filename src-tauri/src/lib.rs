@@ -1,6 +1,8 @@
 mod commands;
 mod error;
 mod headers;
+mod lectures;
+mod media_protocol;
 
 #[cfg(test)]
 mod tests;
@@ -11,8 +13,9 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use localis_core::{
-    CloudEnv, CloudRuntime, CoreError, EmbedderConfig, EmbedderShared, Endpoints, Store,
-    SystemKeyring, WorkerConfig,
+    CloudEnv, CloudRuntime, CoreError, EmbedderConfig, EmbedderShared, Endpoints, ModelManager,
+    Store, SystemKeyring, TranscriberConfig, Uploads, WhisperTranscriber, WorkerConfig, MODELS_DIR,
+    ORIGINALS_DIR,
 };
 use tauri::Manager;
 
@@ -81,6 +84,54 @@ fn spawn_embedder(
     }
 }
 
+/// v0.5: starts the transcription worker on its own thread and SQLite connection, separate
+/// from the extraction worker so extraction never waits behind a long transcription. After
+/// each transcription it wakes the embedder (`on_done`).
+fn spawn_transcriber(
+    path: Result<PathBuf, AppError>,
+    models: Arc<ModelManager>,
+    embedder: Option<mpsc::SyncSender<()>>,
+) -> Option<mpsc::SyncSender<()>> {
+    let path = path.ok()?;
+    let (wake, signals) = mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("localis-transcriber".into())
+        .spawn(move || {
+            localis_core::run_transcriber(
+                || Store::open(&path),
+                signals,
+                TranscriberConfig::default(),
+                Arc::new(WhisperTranscriber),
+                models,
+                move || {
+                    if let Some(wake) = &embedder {
+                        let _ = wake.try_send(());
+                    }
+                },
+            )
+        });
+    match spawned {
+        Ok(_) => Some(wake),
+        Err(err) => {
+            eprintln!("localis: cannot start the transcription worker: {err}");
+            None
+        }
+    }
+}
+
+/// v0.5: discards chunked uploads idle for more than an hour, every few minutes.
+fn spawn_upload_sweeper(uploads: Arc<Uploads>) {
+    let spawned = std::thread::Builder::new()
+        .name("localis-upload-sweeper".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(300));
+            uploads.sweep_expired();
+        });
+    if let Err(err) = spawned {
+        eprintln!("localis: cannot start the upload sweeper: {err}");
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -93,6 +144,27 @@ pub fn run() {
             // hosts (debug builds also read the LOCALIS_TEST_* overrides, see localis-core).
             let cloud = CloudRuntime::new(Arc::new(SystemKeyring::new()), Endpoints::from_env());
             let embedder = spawn_embedder(path.clone(), cloud.env.clone());
+            // v0.5: uploads in `originals/.uploads`, Whisper models in `models/whisper`
+            // (never deleted with projects). Leftovers of interrupted runs are removed now.
+            let data_dir = path
+                .as_ref()
+                .ok()
+                .and_then(|p| p.parent())
+                .map(PathBuf::from);
+            let lectures = data_dir.map(|dir| {
+                let uploads = Arc::new(Uploads::new(&dir.join(ORIGINALS_DIR)));
+                uploads.sweep_all();
+                let models = Arc::new(ModelManager::new(dir.join(MODELS_DIR)));
+                models.sweep_temp_files();
+                (uploads, models)
+            });
+            let transcriber = lectures.as_ref().and_then(|(_, models)| {
+                spawn_transcriber(
+                    path.clone(),
+                    Arc::clone(models),
+                    embedder.as_ref().map(|(wake, _)| wake.clone()),
+                )
+            });
             // Answers left `streaming` by a crash are marked failed as soon as the store
             // opens, before any generation can start (generations only run in this process).
             let mut state = AppState::new(move || {
@@ -112,8 +184,23 @@ pub fn run() {
             if let Some((wake, shared)) = embedder {
                 state = state.with_embedder(wake, shared);
             }
+            if let Some((uploads, models)) = lectures {
+                spawn_upload_sweeper(Arc::clone(&uploads));
+                state = state.with_uploads(uploads).with_models(models);
+            }
+            if let Some(wake) = transcriber {
+                state = state.with_transcriber(wake);
+            }
             app.manage(state);
             Ok(())
+        })
+        // v0.5: audio/video playback with HTTP Range (see media_protocol.rs).
+        .register_asynchronous_uri_scheme_protocol("localis-media", |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let state = app.state::<AppState>();
+                responder.respond(media_protocol::handle(&state, &request));
+            });
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_projects,
@@ -158,6 +245,22 @@ pub fn run() {
             commands::prepare_cloud_send,
             commands::discard_cloud_send,
             commands::list_cloud_requests,
+            lectures::begin_upload,
+            lectures::upload_chunk,
+            lectures::finish_upload,
+            lectures::cancel_upload,
+            lectures::list_whisper_models,
+            lectures::download_whisper_model,
+            lectures::cancel_whisper_download,
+            lectures::delete_whisper_model,
+            lectures::start_transcription,
+            lectures::cancel_job,
+            lectures::get_transcript,
+            lectures::list_media_links,
+            lectures::list_links_for_target,
+            lectures::create_media_link,
+            lectures::update_media_link,
+            lectures::delete_media_link,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Localis");

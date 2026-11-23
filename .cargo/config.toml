@@ -1,0 +1,5 @@
+[env]
+# whisper.cpp (via whisper-rs-sys) defaults to GGML_NATIVE=ON, which tunes the binary to the
+# build machine's CPU: a release built that way may crash with "illegal instruction" on older
+# CPUs. Build a portable binary instead (runtime CPU feature detection still applies).
+GGML_NATIVE = "OFF"

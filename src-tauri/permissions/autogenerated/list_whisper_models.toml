@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-whisper-models"
+description = "Enables the list_whisper_models command without any pre-configured scope."
+commands.allow = ["list_whisper_models"]
+
+[[permission]]
+identifier = "deny-list-whisper-models"
+description = "Denies the list_whisper_models command without any pre-configured scope."
+commands.deny = ["list_whisper_models"]

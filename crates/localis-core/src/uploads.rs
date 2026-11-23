@@ -196,15 +196,18 @@ impl Uploads {
         if active.len() >= UPLOADS_MAX {
             return Err(CoreError::conflict(TOO_MANY));
         }
-        fs::create_dir_all(&self.dir)
-            .map_err(|err| CoreError::storage(WRITE_MESSAGE, format!("{}: {err}", self.dir.display())))?;
+        fs::create_dir_all(&self.dir).map_err(|err| {
+            CoreError::storage(WRITE_MESSAGE, format!("{}: {err}", self.dir.display()))
+        })?;
         let id = uuid::Uuid::new_v4().to_string();
         let path = self.dir.join(format!("{id}.part"));
         let file = File::options()
             .write(true)
             .create_new(true)
             .open(&path)
-            .map_err(|err| CoreError::storage(WRITE_MESSAGE, format!("{}: {err}", path.display())))?;
+            .map_err(|err| {
+                CoreError::storage(WRITE_MESSAGE, format!("{}: {err}", path.display()))
+            })?;
         active.insert(
             id.clone(),
             Arc::new(Mutex::new(Upload {
