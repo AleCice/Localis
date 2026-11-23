@@ -35,6 +35,12 @@ pub struct AppState {
     pub(crate) embedder_status: Arc<EmbedderShared>,
     /// Keychain, cloud endpoints and prepared cloud requests awaiting confirmation.
     pub(crate) cloud: CloudRuntime,
+    /// v0.5: chunked uploads in progress (temporary files inside `originals/.uploads`).
+    pub(crate) uploads: Option<Arc<localis_core::Uploads>>,
+    /// v0.5: Whisper models (`<app_data>/models/whisper`).
+    pub(crate) models: Option<Arc<localis_core::ModelManager>>,
+    /// v0.5: wakes the transcription worker (capacity 1).
+    transcriber: Option<SyncSender<()>>,
 }
 
 impl AppState {
@@ -48,6 +54,34 @@ impl AppState {
             embedder: None,
             embedder_status: EmbedderShared::new(),
             cloud: CloudRuntime::new(Arc::new(SystemKeyring::new()), Endpoints::from_env()),
+            uploads: None,
+            models: None,
+            transcriber: None,
+        }
+    }
+
+    /// v0.5: chunked uploads.
+    pub fn with_uploads(mut self, uploads: Arc<localis_core::Uploads>) -> Self {
+        self.uploads = Some(uploads);
+        self
+    }
+
+    /// v0.5: the Whisper model manager.
+    pub fn with_models(mut self, models: Arc<localis_core::ModelManager>) -> Self {
+        self.models = Some(models);
+        self
+    }
+
+    /// v0.5: the transcription worker.
+    pub fn with_transcriber(mut self, wake: SyncSender<()>) -> Self {
+        self.transcriber = Some(wake);
+        self
+    }
+
+    /// Signals the transcription worker that a job may be queued. Never blocks.
+    pub(crate) fn wake_transcriber(&self) {
+        if let Some(wake) = &self.transcriber {
+            let _ = wake.try_send(());
         }
     }
 
@@ -245,6 +279,10 @@ pub struct DocumentVersionDto {
     pub page_count: Option<u32>,
     pub image_width: Option<u32>,
     pub image_height: Option<u32>,
+    /// v0.5
+    pub duration_ms: Option<u64>,
+    /// v0.5
+    pub transcription: Option<crate::lectures::TranscriptionInfoDto>,
 }
 
 impl From<DocumentVersion> for DocumentVersionDto {
@@ -264,6 +302,8 @@ impl From<DocumentVersion> for DocumentVersionDto {
             page_count: v.page_count,
             image_width: v.image_width,
             image_height: v.image_height,
+            duration_ms: v.duration_ms,
+            transcription: v.transcription.map(Into::into),
         }
     }
 }
@@ -320,6 +360,11 @@ impl From<ImportOutcome> for ImportResultDto {
 pub struct TextUnitDto {
     pub unit: u32,
     pub text: String,
+    /// v0.5: transcript segments only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_ms: Option<u64>,
 }
 
 impl From<TextUnit> for TextUnitDto {
@@ -327,6 +372,8 @@ impl From<TextUnit> for TextUnitDto {
         TextUnitDto {
             unit: u.unit,
             text: u.text,
+            start_ms: u.start_ms,
+            end_ms: u.end_ms,
         }
     }
 }
@@ -352,6 +399,9 @@ pub struct SearchHitDto {
     pub unit: u32,
     pub unit_kind: &'static str,
     pub snippet: String,
+    /// v0.5: segment hits only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_ms: Option<u64>,
 }
 
 impl From<SearchHit> for SearchHitDto {
@@ -364,6 +414,7 @@ impl From<SearchHit> for SearchHitDto {
             unit: h.unit,
             unit_kind: h.unit_kind.as_str(),
             snippet: h.snippet,
+            start_ms: h.start_ms,
         }
     }
 }
@@ -377,6 +428,8 @@ pub struct JobDto {
     pub version_id: String,
     pub kind: String,
     pub state: &'static str,
+    /// v0.5
+    pub progress: Option<u8>,
     pub attempts: u32,
     pub error: Option<String>,
     pub error_detail: Option<String>,
@@ -392,6 +445,7 @@ impl From<Job> for JobDto {
             version_id: j.version_id,
             kind: j.kind,
             state: j.state.as_str(),
+            progress: j.progress,
             attempts: j.attempts,
             error: j.error,
             error_detail: j.error_detail,
@@ -401,7 +455,7 @@ impl From<Job> for JobDto {
     }
 }
 
-fn map_all<T, D: From<T>>(items: Vec<T>) -> Vec<D> {
+pub(crate) fn map_all<T, D: From<T>>(items: Vec<T>) -> Vec<D> {
     items.into_iter().map(D::from).collect()
 }
 
@@ -549,6 +603,7 @@ pub async fn list_jobs(
 pub async fn retry_job(state: State<'_, AppState>, id: i64) -> Result<JobDto, AppError> {
     let job = state.with_store(|store| Ok(store.retry_job(id)?))?;
     state.wake_worker();
+    state.wake_transcriber();
     Ok(job.into())
 }
 
@@ -772,6 +827,9 @@ pub struct SourceDto {
     pub unit: u32,
     pub unit_kind: &'static str,
     pub text: String,
+    /// v0.5: transcript passages only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_ms: Option<u64>,
     pub via: &'static str,
     pub available: bool,
 }
@@ -788,6 +846,7 @@ impl From<Source> for SourceDto {
             unit: s.unit,
             unit_kind: s.unit_kind.as_str(),
             text: s.text,
+            start_ms: s.start_ms,
             via: s.via.as_str(),
             available: s.available,
         }
@@ -932,7 +991,7 @@ impl From<ChatEvent> for ChatEventDto {
 }
 
 /// Runs blocking work (network, long generations) off the async runtime's workers.
-async fn blocking<R: Send + 'static>(
+pub(crate) async fn blocking<R: Send + 'static>(
     f: impl FnOnce() -> Result<R, AppError> + Send + 'static,
 ) -> Result<R, AppError> {
     tauri::async_runtime::spawn_blocking(f)

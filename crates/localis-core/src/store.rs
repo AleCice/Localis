@@ -257,6 +257,135 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX cloud_requests_project ON cloud_requests (project_id);
     CREATE INDEX cloud_requests_conversation ON cloud_requests (conversation_id);",
+    // 5: lectures (FARO base): audio/video versions with duration, transcription jobs with
+    // progress, transcripts (segments also feed document_text/chunks, hence FTS and
+    // embeddings), manual media links, segment sources in chat. CHECK constraints cannot be
+    // altered in SQLite, so three tables are rebuilt (foreign keys are off while migrating,
+    // see `Store::migrate`; rows, ids and indexes are preserved).
+    "CREATE TABLE document_versions_v5 (
+        id                  TEXT PRIMARY KEY NOT NULL,
+        document_id         TEXT NOT NULL REFERENCES documents (id) ON DELETE CASCADE,
+        version_no          INTEGER NOT NULL CHECK (version_no >= 1),
+        original_name       TEXT NOT NULL,
+        kind                TEXT NOT NULL CHECK (kind IN
+                                ('pdf', 'text', 'markdown', 'docx', 'image', 'audio', 'video')),
+        media_type          TEXT NOT NULL,
+        size_bytes          INTEGER NOT NULL,
+        sha256              TEXT NOT NULL,
+        source_modified_at  TEXT,
+        imported_at         TEXT NOT NULL,
+        text_status         TEXT NOT NULL
+                            CHECK (text_status IN
+                                ('pending', 'extracted', 'no_text', 'failed', 'not_applicable')),
+        page_count          INTEGER,
+        image_width         INTEGER,
+        image_height        INTEGER,
+        duration_ms         INTEGER CHECK (duration_ms >= 0),
+        UNIQUE (document_id, version_no)
+    );
+    INSERT INTO document_versions_v5 (id, document_id, version_no, original_name, kind,
+        media_type, size_bytes, sha256, source_modified_at, imported_at, text_status,
+        page_count, image_width, image_height)
+    SELECT id, document_id, version_no, original_name, kind, media_type, size_bytes, sha256,
+        source_modified_at, imported_at, text_status, page_count, image_width, image_height
+    FROM document_versions;
+    DROP TABLE document_versions;
+    ALTER TABLE document_versions_v5 RENAME TO document_versions;
+    CREATE INDEX document_versions_sha256 ON document_versions (sha256);
+
+    CREATE TABLE jobs_v5 (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_id    TEXT NOT NULL REFERENCES document_versions (id) ON DELETE CASCADE,
+        kind          TEXT NOT NULL CHECK (kind IN ('extract_text', 'transcribe')),
+        state         TEXT NOT NULL CHECK (state IN ('queued', 'running', 'done', 'failed')),
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        error         TEXT,
+        error_detail  TEXT,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL,
+        progress      INTEGER CHECK (progress BETWEEN 0 AND 100),
+        model         TEXT,
+        language      TEXT
+    );
+    INSERT INTO jobs_v5 (id, version_id, kind, state, attempts, error, error_detail,
+        created_at, updated_at)
+    SELECT id, version_id, kind, state, attempts, error, error_detail, created_at, updated_at
+    FROM jobs;
+    DROP TABLE jobs;
+    ALTER TABLE jobs_v5 RENAME TO jobs;
+    CREATE INDEX jobs_state ON jobs (state, id);
+    CREATE INDEX jobs_version ON jobs (version_id);
+    CREATE INDEX jobs_kind_state ON jobs (kind, state, id);
+
+    CREATE TABLE message_sources_v5 (
+        message_id   TEXT NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+        rank         INTEGER NOT NULL CHECK (rank >= 1),
+        n            INTEGER CHECK (n >= 1),
+        cited        INTEGER NOT NULL DEFAULT 0 CHECK (cited IN (0, 1)),
+        document_id  TEXT NOT NULL,
+        version_id   TEXT NOT NULL,
+        title        TEXT NOT NULL,
+        unit         INTEGER NOT NULL,
+        unit_kind    TEXT NOT NULL CHECK (unit_kind IN ('page', 'block', 'segment')),
+        text         TEXT NOT NULL,
+        via          TEXT NOT NULL CHECK (via IN ('lexical', 'semantic', 'both', 'position')),
+        start_ms     INTEGER,
+        PRIMARY KEY (message_id, rank)
+    );
+    INSERT INTO message_sources_v5 (message_id, rank, n, cited, document_id, version_id,
+        title, unit, unit_kind, text, via)
+    SELECT message_id, rank, n, cited, document_id, version_id, title, unit, unit_kind, text,
+        via
+    FROM message_sources;
+    DROP TABLE message_sources;
+    ALTER TABLE message_sources_v5 RENAME TO message_sources;
+
+    CREATE TABLE transcriptions (
+        version_id     TEXT PRIMARY KEY NOT NULL
+                       REFERENCES document_versions (id) ON DELETE CASCADE,
+        model          TEXT NOT NULL,
+        language       TEXT NOT NULL,
+        segment_count  INTEGER NOT NULL CHECK (segment_count >= 0),
+        created_at     TEXT NOT NULL
+    );
+
+    CREATE TABLE transcript_segments (
+        version_id  TEXT NOT NULL REFERENCES document_versions (id) ON DELETE CASCADE,
+        idx         INTEGER NOT NULL CHECK (idx >= 1),
+        start_ms    INTEGER NOT NULL CHECK (start_ms >= 0),
+        end_ms      INTEGER NOT NULL CHECK (end_ms >= start_ms),
+        text        TEXT NOT NULL,
+        PRIMARY KEY (version_id, idx)
+    );
+
+    CREATE TABLE media_links (
+        id                  TEXT PRIMARY KEY NOT NULL,
+        project_id          TEXT NOT NULL REFERENCES projects (id) ON DELETE CASCADE,
+        media_document_id   TEXT NOT NULL REFERENCES documents (id) ON DELETE CASCADE,
+        media_version_id    TEXT NOT NULL REFERENCES document_versions (id) ON DELETE CASCADE,
+        start_ms            INTEGER NOT NULL CHECK (start_ms >= 0),
+        end_ms              INTEGER NOT NULL CHECK (end_ms > start_ms),
+        target_document_id  TEXT NOT NULL REFERENCES documents (id) ON DELETE CASCADE,
+        target_version_id   TEXT NOT NULL REFERENCES document_versions (id) ON DELETE CASCADE,
+        target_page         INTEGER CHECK (target_page >= 1),
+        region_x            REAL,
+        region_y            REAL,
+        region_w            REAL,
+        region_h            REAL,
+        note                TEXT,
+        media_title         TEXT NOT NULL,
+        target_title        TEXT NOT NULL,
+        created_at          TEXT NOT NULL,
+        updated_at          TEXT NOT NULL,
+        CHECK ((region_x IS NULL AND region_y IS NULL AND region_w IS NULL AND region_h IS NULL)
+            OR (region_x >= 0 AND region_y >= 0 AND region_w > 0 AND region_h > 0
+                AND region_x + region_w <= 1.000001 AND region_y + region_h <= 1.000001))
+    );
+    CREATE INDEX media_links_media ON media_links (media_version_id, start_ms);
+    CREATE INDEX media_links_target ON media_links (target_version_id);
+    CREATE INDEX media_links_project ON media_links (project_id);
+    CREATE INDEX media_links_media_document ON media_links (media_document_id);
+    CREATE INDEX media_links_target_document ON media_links (target_document_id);",
 ];
 
 /// Schema version this build of the app knows about.
@@ -421,6 +550,40 @@ impl Store {
         if current == SCHEMA_VERSION {
             return Ok(());
         }
+        // Table rebuilds (migration 5) must not fire ON DELETE CASCADE: foreign keys are
+        // off while migrating (the pragma is a no-op inside a transaction, so it is set
+        // here) and the result is checked before they are turned back on.
+        self.conn
+            .pragma_update(None, "foreign_keys", false)
+            .map_err(open_err)?;
+        let result = self.apply_migrations();
+        let check = self.foreign_key_violations();
+        self.conn
+            .pragma_update(None, "foreign_keys", true)
+            .map_err(open_err)?;
+        result?;
+        // The migrations only copy rows that already satisfied the constraints; a violation
+        // would be a bug, logged rather than making the database unopenable.
+        match check {
+            Ok(0) => {}
+            Ok(n) => eprintln!("localis: {n} foreign key violations after migrating"),
+            Err(err) => eprintln!("localis: cannot check foreign keys after migrating: {err}"),
+        }
+        Ok(())
+    }
+
+    fn foreign_key_violations(&self) -> rusqlite::Result<usize> {
+        let mut stmt = self.conn.prepare("PRAGMA foreign_key_check")?;
+        let mut rows = stmt.query([])?;
+        let mut n = 0;
+        while rows.next()?.is_some() {
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    fn apply_migrations(&mut self) -> Result<()> {
+        let open_err = |err: rusqlite::Error| CoreError::storage(OPEN_MESSAGE, err);
         for (index, sql) in MIGRATIONS.iter().enumerate() {
             let target = index as u32 + 1;
             // IMMEDIATE takes the write lock up front, so a concurrent opener cannot
@@ -687,6 +850,110 @@ mod tests {
             }
             other => panic!("expected storage error, got {other:?}"),
         }
+    }
+
+    /// A v0.4 database (migrations 1–4 exactly as released) with data in every table that
+    /// migration 5 rebuilds.
+    fn v04_database(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        for sql in &MIGRATIONS[..4] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             INSERT INTO projects (id, name, created_at, updated_at, cloud_policy)
+               VALUES ('p', 'Tesi', 't0', 't0', 'cloud_allowed');
+             INSERT INTO folders VALUES ('f', 'p', NULL, 'Fonti', 't0', 't0');
+             INSERT INTO documents VALUES ('d', 'p', 'f', 'note.txt', 't0', 't0');
+             INSERT INTO document_versions VALUES ('v', 'd', 1, 'note.txt', 'text',
+               'text/plain', 5, '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824',
+               NULL, 't0', 'extracted', NULL, NULL, NULL);
+             INSERT INTO document_text (version_id, unit, text) VALUES ('v', 1, 'derivata prima');
+             INSERT INTO jobs (id, version_id, kind, state, attempts, created_at, updated_at)
+               VALUES (41, 'v', 'extract_text', 'done', 1, 't0', 't0');
+             INSERT INTO chunks (version_id, unit, ordinal, char_start, char_end, text)
+               VALUES ('v', 1, 1, 0, 14, 'derivata prima');
+             INSERT INTO chunk_embeddings VALUES (1, 'lmstudio:e', 2, x'0000803f00000000');
+             INSERT INTO conversations VALUES ('c', 'p', 'Domanda', 't0', 't0');
+             INSERT INTO messages (id, conversation_id, seq, role, kind, content, status,
+               created_at, updated_at) VALUES ('m', 'c', 2, 'assistant', 'answer', 'R [1]',
+               'complete', 't0', 't0');
+             INSERT INTO message_sources VALUES ('m', 1, 1, 1, 'd', 'v', 'note.txt', 1, 'block',
+               'derivata prima', 'lexical');
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_4_to_5_keeps_data_and_constraints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("localis.db");
+        v04_database(&path);
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 5);
+        // Rows survived the rebuilds, nothing cascaded away.
+        let count = |store: &Store, sql: &str| -> i64 {
+            store.conn.query_row(sql, [], |r| r.get(0)).unwrap()
+        };
+        for (table, n) in [
+            ("document_versions", 1),
+            ("document_text", 1),
+            ("jobs", 1),
+            ("chunks", 1),
+            ("chunk_embeddings", 1),
+            ("message_sources", 1),
+            ("transcriptions", 0),
+            ("media_links", 0),
+        ] {
+            assert_eq!(count(&store, &format!("SELECT COUNT(*) FROM {table}")), n, "{table}");
+        }
+        assert_eq!(store.foreign_key_violations().unwrap(), 0);
+        let fk: i64 = store
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1, "foreign keys back on after migrating");
+        let v = store.get_version("v").unwrap();
+        assert_eq!((v.duration_ms, v.transcription.is_none()), (None, true));
+        let job = store.get_job(41).unwrap();
+        assert_eq!((job.kind.as_str(), job.progress), ("extract_text", None));
+        // FTS and passages still work.
+        assert_eq!(store.search("p", "derivata", None).unwrap().len(), 1);
+        let messages = store.list_messages("c").unwrap();
+        assert_eq!(messages[0].sources.len(), 1);
+        assert_eq!(messages[0].sources[0].start_ms, None);
+        assert!(messages[0].sources[0].available);
+        // The new CHECKs accept the new values; AUTOINCREMENT continues after the old ids.
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO document_versions (id, document_id, version_no, original_name, kind,
+                   media_type, size_bytes, sha256, imported_at, text_status, duration_ms)
+                 VALUES ('a', 'd', 2, 'l.mp3', 'audio', 'audio/mpeg', 1, 'x', 't', 'pending', 5);
+                 INSERT INTO jobs (version_id, kind, state, created_at, updated_at, progress)
+                 VALUES ('a', 'transcribe', 'running', 't', 't', 40);",
+            )
+            .unwrap();
+        assert_eq!(store.conn.last_insert_rowid(), 42);
+        assert!(store
+            .conn
+            .execute(
+                "INSERT INTO jobs (version_id, kind, state, created_at, updated_at, progress)
+                 VALUES ('a', 'transcribe', 'running', 't', 't', 101)",
+                [],
+            )
+            .is_err());
+        // Cascades through the rebuilt tables.
+        store.delete_document("d").unwrap();
+        for table in ["document_versions", "document_text", "jobs", "chunks", "chunk_embeddings"] {
+            assert_eq!(count(&store, &format!("SELECT COUNT(*) FROM {table}")), 0, "{table}");
+        }
+        // Snapshots in message sources outlive the document.
+        assert!(!store.list_messages("c").unwrap()[0].sources[0].available);
+        drop(store);
+        // Reopening does not migrate again.
+        assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 5);
     }
 
     #[test]

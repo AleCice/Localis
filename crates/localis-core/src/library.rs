@@ -5,7 +5,7 @@ use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 
 use crate::blobs::sha256_hex;
 use crate::error::{CoreError, Result};
-use crate::formats::{detect_format, DetectedFormat, DocumentKind};
+use crate::formats::{detect_format, detect_media_file, DetectedFormat, DocumentKind};
 use crate::store::{now, Store};
 use crate::validation::{name_key, validate_name};
 
@@ -22,6 +22,7 @@ const FOLDER_OTHER_PROJECT: &str = "La cartella non appartiene a questo progetto
 const FILE_NAME_INVALID: &str = "Il nome del file non è valido.";
 const FILE_EMPTY: &str = "Il file è vuoto.";
 const FILE_TOO_LARGE: &str = "Il file supera il limite di 200 MB.";
+const MEDIA_TOO_LARGE: &str = "Il file audio/video supera il limite di 4 GB.";
 const SAME_KIND_REQUIRED: &str = "La nuova versione deve essere dello stesso formato.";
 const VERSION_DUPLICATE: &str = "Questa versione è già presente nel documento.";
 
@@ -96,6 +97,21 @@ pub struct DocumentVersion {
     pub page_count: Option<u32>,
     pub image_width: Option<u32>,
     pub image_height: Option<u32>,
+    /// v0.5: audio/video duration in milliseconds, when known.
+    pub duration_ms: Option<u64>,
+    /// v0.5: the current transcript of an audio/video version, if any.
+    pub transcription: Option<TranscriptionInfo>,
+}
+
+/// Summary of the transcript of an audio/video version (`TranscriptionInfo` in types.ts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptionInfo {
+    /// Whisper model id (`tiny`, `base`, `small`, `large-v3-turbo-q5`).
+    pub model: String,
+    /// Detected or chosen ISO 639-1 code.
+    pub language: String,
+    pub created_at: String,
+    pub segment_count: u32,
 }
 
 /// A document with its current (latest) version.
@@ -120,18 +136,33 @@ pub enum ImportOutcome {
     Duplicate(LibraryDocument),
 }
 
-/// One unit of extracted text: a PDF page or a text block/paragraph (1-based).
+/// One unit of extracted text: a PDF page, a text block/paragraph or (v0.5) a transcript
+/// segment (1-based).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextUnit {
     pub unit: u32,
     pub text: String,
+    /// Transcript segments only.
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
+}
+
+/// Where the bytes of a file being imported are.
+#[derive(Debug, Clone)]
+enum ImportSource<'a> {
+    /// Received whole (at most [`IMPORT_MAX_BYTES`]).
+    Bytes(&'a [u8]),
+    /// v0.5: assembled by a chunked upload in a temporary file inside the originals
+    /// directory; moved (renamed) into the archive on import.
+    TempFile(std::path::PathBuf),
 }
 
 /// A file ready to be imported: validated, recognized and hashed. Building it needs no
 /// database access, so callers can do it before taking any lock.
 #[derive(Debug, Clone)]
 pub struct ImportFile<'a> {
-    bytes: &'a [u8],
+    source: ImportSource<'a>,
+    size: u64,
     file_name: String,
     format: DetectedFormat,
     sha256: String,
@@ -151,10 +182,49 @@ impl<'a> ImportFile<'a> {
         check_size(bytes.len())?;
         let format = detect_format(&file_name, bytes)?;
         Ok(ImportFile {
-            bytes,
+            source: ImportSource::Bytes(bytes),
+            size: bytes.len() as u64,
             file_name,
             format,
             sha256: sha256_hex(bytes),
+            source_modified_at: last_modified_ms.and_then(iso_from_millis),
+        })
+    }
+
+    /// v0.5: a file assembled by a chunked upload at `path` (inside the originals
+    /// directory), with its size and sha256 computed while it was received. Audio/video are
+    /// probed from the file; other formats (at most 200 MB) are read to be recognized.
+    pub fn prepare_temp_file(
+        file_name: &str,
+        last_modified_ms: Option<i64>,
+        path: &std::path::Path,
+        size: u64,
+        sha256: &str,
+    ) -> Result<ImportFile<'static>> {
+        let file_name = validate_file_name(file_name)?;
+        if size == 0 {
+            return Err(CoreError::validation("file", FILE_EMPTY));
+        }
+        let format = match detect_media_file(&file_name, path)? {
+            Some(format) => format,
+            None => {
+                check_size(usize::try_from(size).unwrap_or(usize::MAX))?;
+                let bytes = std::fs::read(path).map_err(|err| {
+                    CoreError::storage(
+                        "Impossibile leggere il file caricato.",
+                        format!("{}: {err}", path.display()),
+                    )
+                })?;
+                detect_format(&file_name, &bytes)?
+            }
+        };
+        check_kind_size(format.kind, size)?;
+        Ok(ImportFile {
+            source: ImportSource::TempFile(path.to_path_buf()),
+            size,
+            file_name,
+            format,
+            sha256: sha256.to_owned(),
             source_modified_at: last_modified_ms.and_then(iso_from_millis),
         })
     }
@@ -170,6 +240,28 @@ impl<'a> ImportFile<'a> {
     pub fn sha256(&self) -> &str {
         &self.sha256
     }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+/// v0.5: size limit by kind (audio/video 4 GB, others 200 MB).
+pub fn check_kind_size(kind: DocumentKind, size: u64) -> Result<()> {
+    if size == 0 {
+        return Err(CoreError::validation("file", FILE_EMPTY));
+    }
+    if size > kind.max_bytes() {
+        return Err(CoreError::TooLarge {
+            message: if kind.is_media() {
+                MEDIA_TOO_LARGE
+            } else {
+                FILE_TOO_LARGE
+            }
+            .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Rejects empty and over-limit sizes (`validation` / `too_large`).
@@ -185,7 +277,7 @@ pub fn check_size(len: usize) -> Result<()> {
     Ok(())
 }
 
-fn validate_file_name(raw: &str) -> Result<String> {
+pub(crate) fn validate_file_name(raw: &str) -> Result<String> {
     let name = raw.trim();
     if name.is_empty()
         || name.chars().count() > FILE_NAME_MAX
@@ -242,7 +334,11 @@ fn bad_value(idx: usize, value: String) -> rusqlite::Error {
 
 const VERSION_COLUMNS: &str = "v.id, v.document_id, v.version_no, v.original_name, v.kind,
     v.media_type, v.size_bytes, v.sha256, v.source_modified_at, v.imported_at, v.text_status,
-    v.page_count, v.image_width, v.image_height";
+    v.page_count, v.image_width, v.image_height, v.duration_ms,
+    (SELECT t.model FROM transcriptions t WHERE t.version_id = v.id),
+    (SELECT t.language FROM transcriptions t WHERE t.version_id = v.id),
+    (SELECT t.created_at FROM transcriptions t WHERE t.version_id = v.id),
+    (SELECT t.segment_count FROM transcriptions t WHERE t.version_id = v.id)";
 
 fn row_to_version(row: &Row<'_>, at: usize) -> rusqlite::Result<DocumentVersion> {
     let kind: String = row.get(at + 4)?;
@@ -263,6 +359,18 @@ fn row_to_version(row: &Row<'_>, at: usize) -> rusqlite::Result<DocumentVersion>
         page_count: row.get(at + 11)?,
         image_width: row.get(at + 12)?,
         image_height: row.get(at + 13)?,
+        duration_ms: row
+            .get::<_, Option<i64>>(at + 14)?
+            .and_then(|d| u64::try_from(d).ok()),
+        transcription: match row.get::<_, Option<String>>(at + 15)? {
+            Some(model) => Some(TranscriptionInfo {
+                model,
+                language: row.get(at + 16)?,
+                created_at: row.get(at + 17)?,
+                segment_count: row.get(at + 18)?,
+            }),
+            None => None,
+        },
     })
 }
 
@@ -520,7 +628,7 @@ impl Store {
             return Ok(ImportOutcome::Duplicate(self.get_document(&id)?));
         }
 
-        self.blobs()?.put(&file.sha256, file.bytes)?;
+        self.put_import_blob(file)?;
         let document_id = uuid::Uuid::new_v4().to_string();
         let inserted = (|| -> Result<()> {
             let tx = self
@@ -567,7 +675,7 @@ impl Store {
             });
         }
 
-        self.blobs()?.put(&file.sha256, file.bytes)?;
+        self.put_import_blob(file)?;
         let inserted = (|| -> Result<()> {
             let tx = self
                 .conn
@@ -594,6 +702,52 @@ impl Store {
             return Err(err);
         }
         self.get_document(document_id)
+    }
+
+    /// v0.5: checks, before a chunked upload starts, that its destination exists: the
+    /// project, the folder (in the project) or, for a new version, the document (in the
+    /// project and of the same kind as the file).
+    pub fn check_upload_target(&self, upload: &crate::uploads::BeginUpload) -> Result<()> {
+        let kind = crate::formats::kind_for_file_name(&upload.file_name)?;
+        self.ensure_project(&upload.project_id)?;
+        if let Some(folder) = upload.folder_id.as_deref().filter(|f| !f.is_empty()) {
+            self.folder_in_project(folder, &upload.project_id, "folderId")?;
+        }
+        if let Some(document_id) = upload.document_id.as_deref().filter(|d| !d.is_empty()) {
+            let document = self.get_document(document_id)?;
+            if document.project_id != upload.project_id {
+                return Err(CoreError::not_found(DOCUMENT_NOT_FOUND));
+            }
+            if document.current.kind != kind {
+                return Err(CoreError::validation("file", SAME_KIND_REQUIRED));
+            }
+        }
+        Ok(())
+    }
+
+    /// v0.5: imports a finished chunked upload (prepared with
+    /// [`crate::FinishedUpload::prepare`]) as a new document or, with `documentId`, as a new
+    /// version (`Imported`). Same rules as [`Store::import_document`] and
+    /// [`Store::import_version`].
+    pub fn import_upload(
+        &mut self,
+        upload: &crate::uploads::FinishedUpload,
+        file: &ImportFile<'_>,
+    ) -> Result<ImportOutcome> {
+        match upload.input.document_id.as_deref().filter(|d| !d.is_empty()) {
+            Some(document_id) => {
+                let document = self.get_document(document_id)?;
+                if document.project_id != upload.input.project_id {
+                    return Err(CoreError::not_found(DOCUMENT_NOT_FOUND));
+                }
+                Ok(ImportOutcome::Imported(self.import_version(document_id, file)?))
+            }
+            None => self.import_document(
+                &upload.input.project_id,
+                upload.input.folder_id.as_deref(),
+                file,
+            ),
+        }
     }
 
     /// Moves a document to a folder of the same project, or to the root (`None`).
@@ -632,6 +786,15 @@ impl Store {
         Ok(())
     }
 
+    /// Stores the original of `file` in the archive (writing its bytes, or moving the
+    /// temporary file of a chunked upload).
+    fn put_import_blob(&self, file: &ImportFile<'_>) -> Result<()> {
+        match &file.source {
+            ImportSource::Bytes(bytes) => self.blobs()?.put(&file.sha256, bytes),
+            ImportSource::TempFile(path) => self.blobs()?.put_file(&file.sha256, path),
+        }
+    }
+
     /// Bytes of the stored original of a version, verified against its sha256.
     pub fn read_original(&self, version_id: &str) -> Result<Vec<u8>> {
         let version = self.get_version(version_id)?;
@@ -641,14 +804,19 @@ impl Store {
     /// Extracted text of a version, ordered by unit.
     pub fn get_text(&self, version_id: &str) -> Result<Vec<TextUnit>> {
         self.get_version(version_id)?;
-        let mut stmt = self
-            .conn
-            .prepare("SELECT unit, text FROM document_text WHERE version_id = ?1 ORDER BY unit")?;
+        // Units of a transcript are its segments, with their time span.
+        let mut stmt = self.conn.prepare(
+            "SELECT t.unit, t.text, s.start_ms, s.end_ms FROM document_text t
+             LEFT JOIN transcript_segments s ON s.version_id = t.version_id AND s.idx = t.unit
+             WHERE t.version_id = ?1 ORDER BY t.unit",
+        )?;
         let units = stmt
             .query_map(params![version_id], |r| {
                 Ok(TextUnit {
                     unit: r.get(0)?,
                     text: r.get(1)?,
+                    start_ms: r.get::<_, Option<i64>>(2)?.map(|v| v.max(0) as u64),
+                    end_ms: r.get::<_, Option<i64>>(3)?.map(|v| v.max(0) as u64),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -673,8 +841,8 @@ fn insert_version(
     tx.execute(
         "INSERT INTO document_versions (id, document_id, version_no, original_name, kind,
              media_type, size_bytes, sha256, source_modified_at, imported_at, text_status,
-             page_count, image_width, image_height)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13)",
+             page_count, image_width, image_height, duration_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14)",
         params![
             version_id,
             document_id,
@@ -682,13 +850,16 @@ fn insert_version(
             file.file_name,
             format.kind.as_str(),
             format.media_type,
-            i64::try_from(file.bytes.len()).unwrap_or(i64::MAX),
+            i64::try_from(file.size).unwrap_or(i64::MAX),
             file.sha256,
             file.source_modified_at,
             now,
             status.as_str(),
             format.image_size.map(|s| s.0),
             format.image_size.map(|s| s.1),
+            format
+                .duration_ms
+                .map(|d| i64::try_from(d).unwrap_or(i64::MAX)),
         ],
     )?;
     if format.kind.has_text() {

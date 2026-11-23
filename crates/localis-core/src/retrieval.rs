@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::params;
 
 use crate::error::Result;
-use crate::formats::DocumentKind;
 use crate::search::UnitKind;
 use crate::store::Store;
 
@@ -693,6 +692,8 @@ pub struct Passage {
     pub char_start: usize,
     pub char_end: usize,
     pub text: String,
+    /// v0.5: start of the first segment, for transcript passages.
+    pub start_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -735,7 +736,8 @@ pub struct Ranked {
 }
 
 const PASSAGE_COLUMNS: &str = "c.id, d.id, v.id, d.title, c.unit, v.kind, c.char_start,
-    c.char_end, c.text";
+    c.char_end, c.text,
+    (SELECT s.start_ms FROM transcript_segments s WHERE s.version_id = v.id AND s.idx = c.unit)";
 
 fn row_to_passage(r: &rusqlite::Row<'_>) -> rusqlite::Result<Passage> {
     let kind: String = r.get(5)?;
@@ -745,14 +747,11 @@ fn row_to_passage(r: &rusqlite::Row<'_>) -> rusqlite::Result<Passage> {
         version_id: r.get(2)?,
         title: r.get(3)?,
         unit: r.get(4)?,
-        unit_kind: if DocumentKind::parse(&kind) == Some(DocumentKind::Pdf) {
-            UnitKind::Page
-        } else {
-            UnitKind::Block
-        },
+        unit_kind: UnitKind::for_kind(&kind),
         char_start: r.get::<_, i64>(6)?.max(0) as usize,
         char_end: r.get::<_, i64>(7)?.max(0) as usize,
         text: r.get(8)?,
+        start_ms: r.get::<_, Option<i64>>(9)?.map(|v| v.max(0) as u64),
     })
 }
 
@@ -869,7 +868,7 @@ impl Store {
         let mut rows = stmt.query(params![model, project_id, docs_json(document_ids)])?;
         let mut scored = Vec::new();
         while let Some(row) = rows.next()? {
-            let blob: Vec<u8> = row.get(9)?;
+            let blob: Vec<u8> = row.get(10)?;
             let vector = decode_vector(&blob);
             if vector.len() != query.len() {
                 continue;
@@ -1172,6 +1171,7 @@ mod tests {
             char_start: start,
             char_end: start + text.chars().count(),
             text: text.into(),
+            start_ms: None,
         }
     }
 

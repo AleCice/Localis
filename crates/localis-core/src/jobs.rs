@@ -1,4 +1,6 @@
-//! Background jobs (text extraction) and the worker loop that runs them.
+//! Background jobs and the extraction worker loop. v0.5 adds transcription jobs
+//! (`kind = 'transcribe'`), run by their own worker (see `transcribe.rs`): the extraction
+//! queue below only ever claims `extract_text` jobs.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
@@ -18,7 +20,7 @@ const JOB_NOT_FAILED: &str = "Si possono ripetere solo le attività non riuscite
 /// Max jobs returned by [`Store::list_jobs`].
 pub const JOBS_LIST_MAX: u32 = 200;
 
-/// Kind of the only job type in this version.
+/// Text extraction job kind.
 pub const JOB_KIND_EXTRACT_TEXT: &str = "extract_text";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,9 +57,11 @@ pub struct Job {
     pub id: i64,
     pub document_id: String,
     pub version_id: String,
-    /// Always [`JOB_KIND_EXTRACT_TEXT`] in this version.
+    /// [`JOB_KIND_EXTRACT_TEXT`] or `transcribe` (v0.5).
     pub kind: String,
     pub state: JobState,
+    /// v0.5: 0–100 while a transcription runs; `None` when unknown.
+    pub progress: Option<u8>,
     pub attempts: u32,
     /// Italian, user-facing; only when failed.
     pub error: Option<String>,
@@ -77,7 +81,7 @@ pub struct ClaimedJob {
 }
 
 const JOB_SELECT: &str = "SELECT j.id, v.document_id, j.version_id, j.kind, j.state, j.attempts,
-        j.error, j.error_detail, j.created_at, j.updated_at
+        j.error, j.error_detail, j.created_at, j.updated_at, j.progress
     FROM jobs j JOIN document_versions v ON v.id = j.version_id";
 
 fn row_to_job(row: &Row<'_>) -> rusqlite::Result<Job> {
@@ -99,6 +103,9 @@ fn row_to_job(row: &Row<'_>) -> rusqlite::Result<Job> {
         error_detail: row.get(7)?,
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
+        progress: row
+            .get::<_, Option<i64>>(10)?
+            .map(|p| p.clamp(0, 100) as u8),
     })
 }
 
@@ -147,7 +154,8 @@ impl Store {
         }
         let now = now(&tx)?;
         tx.execute(
-            "UPDATE jobs SET state = 'queued', error = NULL, error_detail = NULL, updated_at = ?2
+            "UPDATE jobs SET state = 'queued', error = NULL, error_detail = NULL,
+                 progress = NULL, updated_at = ?2
              WHERE id = ?1",
             params![id, now],
         )?;
@@ -164,7 +172,8 @@ impl Store {
     pub fn requeue_interrupted_jobs(&mut self) -> Result<usize> {
         let now = now(&self.conn)?;
         Ok(self.conn.execute(
-            "UPDATE jobs SET state = 'queued', updated_at = ?1 WHERE state = 'running'",
+            "UPDATE jobs SET state = 'queued', updated_at = ?1
+             WHERE state = 'running' AND kind = 'extract_text'",
             params![now],
         )?)
     }
@@ -178,7 +187,8 @@ impl Store {
             .query_row(
                 "SELECT j.id, j.version_id, v.kind, v.sha256
                  FROM jobs j JOIN document_versions v ON v.id = j.version_id
-                 WHERE j.state = 'queued' ORDER BY j.id LIMIT 1",
+                 WHERE j.state = 'queued' AND j.kind = 'extract_text'
+                 ORDER BY j.id LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )

@@ -204,6 +204,7 @@ fn reset_to_v02(path: &std::path::Path) {
          DROP TABLE conversations; DROP TABLE chunk_embeddings; DROP TABLE chunks_fts;
          DROP TABLE chunks; DROP TABLE settings;
          DROP TABLE cloud_requests; DROP TABLE model_prices;
+         DROP TABLE media_links; DROP TABLE transcript_segments; DROP TABLE transcriptions;
          ALTER TABLE projects DROP COLUMN cloud_policy;
          ALTER TABLE projects DROP COLUMN cloud_embedding_consent;
          PRAGMA user_version = 2;",
@@ -1320,4 +1321,84 @@ fn hybrid_mode_does_not_answer_questions_without_search_terms() {
     assert!(chat.fake.requests("/v1/chat/completions").is_empty());
     // No query embedding was even requested.
     assert_eq!(chat.fake.requests("/v1/embeddings").len(), before);
+}
+
+// ------------------------------------------------------------------ v0.5 transcripts
+
+/// Stores a transcript for `version` as the transcription worker would.
+fn store_transcript(store: &mut Store, version: &str, segments: &[(u64, u64, &str)]) {
+    store
+        .start_transcription(
+            version,
+            localis_core::WhisperModelId::Small,
+            localis_core::Language::It,
+        )
+        .unwrap();
+    let job = store.claim_next_transcription().unwrap().unwrap();
+    let outcome = localis_core::TranscriptionOutcome::Done {
+        recognized: localis_core::Recognized {
+            language: "it".into(),
+            segments: segments
+                .iter()
+                .map(|&(s, e, t)| localis_core::RecognizedSegment {
+                    start_ms: s,
+                    end_ms: e,
+                    text: t.into(),
+                })
+                .collect(),
+        },
+        duration_ms: 9_500,
+    };
+    store.finish_transcription(&job, &outcome).unwrap();
+}
+
+#[test]
+fn transcript_segments_are_cited_with_their_time() {
+    let chat = Chat::new();
+    let mp3 = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lezione.mp3"),
+    )
+    .unwrap();
+    let lecture = chat.import("lezione.mp3", &mp3);
+    store_transcript(
+        &mut chat.store(),
+        &lecture.current.id,
+        &[
+            (1_000, 3_000, "Buongiorno a tutti."),
+            (754_000, 760_000, "La derivata misura la velocità di variazione della funzione."),
+        ],
+    );
+    let conv = chat.conversation();
+    let answer = chat.ask(&conv, "Che cosa misura la derivata?");
+    assert_eq!(answer.kind, MessageKind::Answer);
+    let source = answer
+        .sources
+        .iter()
+        .find(|s| s.n.is_some())
+        .expect("the transcript passage is evidence");
+    assert_eq!(source.unit_kind, localis_core::UnitKind::Segment);
+    assert_eq!(source.title, "lezione.mp3");
+    // Passages group consecutive segments: the unit is the first one of the passage.
+    assert_eq!(source.unit, 1);
+    assert_eq!(source.start_ms, Some(1_000));
+    assert!(source.text.contains("velocità di variazione"));
+    // The prompt locates the passage by time; the snapshot survives a reload.
+    let req: serde_json::Value =
+        serde_json::from_str(&chat.fake.requests("/v1/chat/completions")[0].body).unwrap();
+    let prompt = req["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(prompt.contains("[1] «lezione.mp3», 00:01\n"), "{prompt}");
+    let reloaded = chat.store().list_messages(&conv).unwrap();
+    let again = reloaded.last().unwrap().sources.iter().find(|s| s.n.is_some()).unwrap();
+    assert_eq!((again.unit_kind, again.start_ms), (localis_core::UnitKind::Segment, Some(1_000)));
+    // Inventory describes recordings honestly.
+    let inventory = chat.ask(&conv, "Quali documenti ci sono nel progetto?");
+    assert_eq!(inventory.kind, MessageKind::Inventory);
+    assert!(
+        inventory.content.contains("audio") && inventory.content.contains("trascrizione"),
+        "{}",
+        inventory.content
+    );
 }

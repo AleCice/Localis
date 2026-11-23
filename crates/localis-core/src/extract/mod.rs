@@ -44,9 +44,9 @@ pub fn extract(kind: DocumentKind, bytes: &[u8]) -> ExtractResult {
         DocumentKind::Pdf => pdf::extract(bytes),
         DocumentKind::Text | DocumentKind::Markdown => text::extract(bytes),
         DocumentKind::Docx => docx::extract(bytes),
-        DocumentKind::Image => Err(ExtractError::new(
+        DocumentKind::Image | DocumentKind::Audio | DocumentKind::Video => Err(ExtractError::new(
             "Questo formato non ha testo da estrarre.",
-            "extract called for an image",
+            "extract called for an image or a recording",
         )),
     }
 }

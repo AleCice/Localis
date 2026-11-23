@@ -13,8 +13,11 @@ mod formats;
 mod jobs;
 mod keys;
 mod library;
+mod links;
 mod llm;
+mod media;
 mod mesh;
+mod models;
 mod prices;
 mod prism;
 mod providers;
@@ -22,7 +25,10 @@ mod retrieval;
 mod search;
 mod settings;
 mod store;
+mod transcribe;
+mod uploads;
 mod validation;
+mod whisper;
 
 pub use blobs::sha256_hex;
 pub use chat::{
@@ -45,7 +51,10 @@ pub use embedder::{
     EmbedderSnapshot, EmbeddingState, EmbeddingStatus,
 };
 pub use error::{CoreError, Result};
-pub use formats::{detect_format, DetectedFormat, DocumentKind};
+pub use formats::{
+    detect_format, detect_media_file, kind_for_file_name, DetectedFormat, DocumentKind,
+    MEDIA_IMPORT_MAX_BYTES,
+};
 pub use jobs::{
     run_worker, ClaimedJob, Job, JobState, WorkerConfig, JOBS_LIST_MAX, JOB_KIND_EXTRACT_TEXT,
 };
@@ -54,8 +63,30 @@ pub use keys::{
     API_KEY_MAX, KEYRING_SERVICE,
 };
 pub use library::{
-    check_size, DocumentVersion, Folder, ImportFile, ImportOutcome, LibraryDocument, NewFolder,
-    TextStatus, TextUnit, FILE_NAME_MAX, IMPORT_MAX_BYTES,
+    check_kind_size, check_size, DocumentVersion, Folder, ImportFile, ImportOutcome,
+    LibraryDocument, NewFolder, TextStatus, TextUnit, TranscriptionInfo, FILE_NAME_MAX,
+    IMPORT_MAX_BYTES,
+};
+pub use links::{MediaLink, MediaLinkInput, Region, LINK_NOTE_MAX};
+pub use media::{decode_to_whisper, DecodeError, DecodedAudio, TRANSCRIBE_MAX_MS, WHISPER_SAMPLE_RATE};
+pub use models::{
+    allowed_hf_url, catalog as whisper_catalog, ModelManager, ModelSpec, WhisperModel,
+    WhisperModelId, HF_ORIGIN, MODELS_DIR,
+};
+#[cfg(debug_assertions)]
+pub use models::TEST_HF_BASE_URL_VAR;
+pub use transcribe::{
+    format_timestamp, parse_language, run_transcriber, segment_passages, ClaimedTranscription,
+    TranscriberConfig, TranscriptSegment, TranscriptionOutcome, EXTRACTION_CANCELLED,
+    JOB_KIND_TRANSCRIBE, MODEL_NOT_INSTALLED, TRANSCRIPTION_CANCELLED, TRANSCRIPTION_INTERRUPTED,
+};
+pub use uploads::{
+    BeginUpload, FinishedUpload, UploadHandle, Uploads, UPLOADS_DIR, UPLOADS_MAX,
+    UPLOAD_CHUNK_BYTES, UPLOAD_IDLE_TIMEOUT,
+};
+pub use whisper::{
+    default_threads, is_non_speech, Language, Recognized, RecognizedSegment, TranscribeError,
+    TranscribeRequest, Transcriber, WhisperTranscriber,
 };
 pub use llm::{
     LlmClient, LlmStatus, ModelInfo, ModelKind, PromptMessage, SseParser, StreamEnd,

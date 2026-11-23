@@ -26,6 +26,28 @@ pub struct VersionHeaders {
     pub last_modified: Option<i64>,
 }
 
+/// v0.5: headers of `upload_chunk`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkHeaders {
+    pub upload_id: String,
+    /// Byte offset of the block in the file.
+    pub offset: u64,
+}
+
+impl ChunkHeaders {
+    pub fn parse(headers: &HeaderMap) -> Result<Self, AppError> {
+        let upload_id = required_id(headers, "x-upload-id")?;
+        let raw = header(headers, "x-offset")?
+            .ok_or_else(|| AppError::bad_request("header x-offset missing"))?;
+        let valid = !raw.is_empty() && raw.len() <= 20 && raw.bytes().all(|b| b.is_ascii_digit());
+        let offset = valid
+            .then(|| raw.parse::<u64>().ok())
+            .flatten()
+            .ok_or_else(|| AppError::bad_request("header x-offset is not a non-negative integer"))?;
+        Ok(ChunkHeaders { upload_id, offset })
+    }
+}
+
 impl ImportHeaders {
     pub fn parse(headers: &HeaderMap) -> Result<Self, AppError> {
         Ok(ImportHeaders {

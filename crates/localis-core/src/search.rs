@@ -22,6 +22,8 @@ pub enum UnitKind {
     Page,
     /// Text block or paragraph.
     Block,
+    /// v0.5: transcript segment of an audio/video (unit = 1-based segment index).
+    Segment,
 }
 
 impl UnitKind {
@@ -29,6 +31,25 @@ impl UnitKind {
         match self {
             UnitKind::Page => "page",
             UnitKind::Block => "block",
+            UnitKind::Segment => "segment",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "page" => UnitKind::Page,
+            "block" => UnitKind::Block,
+            "segment" => UnitKind::Segment,
+            _ => return None,
+        })
+    }
+
+    /// Unit kind of the text of a document kind (stored as text).
+    pub(crate) fn for_kind(kind: &str) -> Self {
+        match DocumentKind::parse(kind) {
+            Some(DocumentKind::Pdf) => UnitKind::Page,
+            Some(DocumentKind::Audio | DocumentKind::Video) => UnitKind::Segment,
+            _ => UnitKind::Block,
         }
     }
 }
@@ -43,6 +64,8 @@ pub struct SearchHit {
     pub unit_kind: UnitKind,
     /// Plain text excerpt; matched terms wrapped in U+0002 … U+0003.
     pub snippet: String,
+    /// v0.5: start of the segment, for `Segment` hits.
+    pub start_ms: Option<u64>,
 }
 
 /// Builds a safe FTS5 query from user input: words only (never FTS syntax), each quoted,
@@ -89,7 +112,9 @@ impl Store {
             .clamp(1, SEARCH_MAX_LIMIT);
         let mut stmt = self.conn.prepare(
             "SELECT d.id, v.id, d.title, d.folder_id, t.unit, v.kind,
-                    snippet(document_text_fts, 0, ?3, ?4, ?5, ?6)
+                    snippet(document_text_fts, 0, ?3, ?4, ?5, ?6),
+                    (SELECT s.start_ms FROM transcript_segments s
+                     WHERE s.version_id = t.version_id AND s.idx = t.unit)
              FROM document_text_fts
              JOIN document_text t ON t.id = document_text_fts.rowid
              JOIN document_versions v ON v.id = t.version_id
@@ -119,12 +144,9 @@ impl Store {
                     title: r.get(2)?,
                     folder_id: r.get(3)?,
                     unit: r.get(4)?,
-                    unit_kind: if DocumentKind::parse(&kind) == Some(DocumentKind::Pdf) {
-                        UnitKind::Page
-                    } else {
-                        UnitKind::Block
-                    },
+                    unit_kind: UnitKind::for_kind(&kind),
                     snippet: r.get(6)?,
+                    start_ms: r.get::<_, Option<i64>>(7)?.map(|v| v.max(0) as u64),
                 })
             },
         )?;

@@ -26,6 +26,31 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Lowercase hex of a finished sha256 digest.
+pub(crate) fn hex_digest(digest: &[u8]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
+        out.push(char::from(b"0123456789abcdef"[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+/// sha256 of a file, read in blocks (never whole in memory).
+pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex_digest(&hasher.finalize()))
+}
+
 /// True for a 64-character lowercase hex string.
 pub(crate) fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
@@ -45,7 +70,7 @@ impl BlobStore {
         &self.root
     }
 
-    fn path_for(&self, sha: &str) -> Result<PathBuf> {
+    pub(crate) fn path_for(&self, sha: &str) -> Result<PathBuf> {
         if !is_sha256_hex(sha) {
             return Err(CoreError::Internal(format!("invalid blob name {sha:?}")));
         }
@@ -81,6 +106,27 @@ impl BlobStore {
             let _ = fs::remove_file(&tmp);
             return Err(write_err("cannot write blob in", err));
         }
+        Ok(())
+    }
+
+    /// v0.5: moves `temp` (a fully written and synced file inside the originals directory,
+    /// whose sha256 is `sha`) into the archive with an atomic rename. If a valid blob with
+    /// that name already exists, it is kept and `temp` is removed.
+    pub(crate) fn put_file(&self, sha: &str, temp: &Path) -> Result<()> {
+        let path = self.path_for(sha)?;
+        if path.is_file() && sha256_file(&path).is_ok_and(|actual| actual == sha) {
+            let _ = fs::remove_file(temp);
+            return Ok(());
+        }
+        let dir = path.parent().expect("blob path has a parent");
+        let result = fs::create_dir_all(dir).and_then(|()| fs::rename(temp, &path));
+        if let Err(err) = result {
+            return Err(CoreError::storage(
+                WRITE_MESSAGE,
+                format!("cannot move {} to {}: {err}", temp.display(), path.display()),
+            ));
+        }
+        sync_dir(dir);
         Ok(())
     }
 

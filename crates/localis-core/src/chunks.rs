@@ -125,7 +125,7 @@ impl Store {
         let versions: Vec<String> = {
             let mut stmt = self.conn.prepare(
                 "SELECT v.id FROM document_versions v
-                 WHERE v.text_status = 'extracted'
+                 WHERE v.text_status = 'extracted' AND v.kind NOT IN ('audio', 'video')
                    AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.version_id = v.id)
                  ORDER BY v.imported_at, v.id",
             )?;

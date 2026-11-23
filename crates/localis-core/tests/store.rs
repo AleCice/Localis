@@ -70,14 +70,14 @@ fn migrates_from_scratch() {
     let store = Store::open(&nested).unwrap();
     assert!(nested.exists(), "parent directories are created");
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 4);
+    assert_eq!(SCHEMA_VERSION, 5);
     drop(store);
 
     let conn = raw(&nested);
     let version: u32 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let tables: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
         .unwrap()
@@ -107,6 +107,7 @@ fn migrates_from_scratch() {
             "documents",
             "folders",
             "jobs",
+            "media_links",
             "message_candidates",
             "message_sources",
             "messages",
@@ -114,6 +115,8 @@ fn migrates_from_scratch() {
             "projects",
             "settings",
             "sqlite_sequence",
+            "transcript_segments",
+            "transcriptions",
         ]
     );
     let columns: Vec<String> = conn

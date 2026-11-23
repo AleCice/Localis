@@ -1258,6 +1258,7 @@ fn migration_3_to_4_keeps_settings_embeddings_and_messages() {
                     ('m2', '{conv}', 2, 'assistant', 'answer', 'Risposta [1].', 'complete',
                      'qwen2.5-7b-instruct', 'hybrid', 'nomic-embed-text', 'c', 'c');
              DROP TABLE cloud_requests; DROP TABLE model_prices;
+             DROP TABLE media_links; DROP TABLE transcript_segments; DROP TABLE transcriptions;
              ALTER TABLE projects DROP COLUMN cloud_policy;
              ALTER TABLE projects DROP COLUMN cloud_embedding_consent;
              ALTER TABLE messages DROP COLUMN provider;
@@ -1272,7 +1273,7 @@ fn migration_3_to_4_keeps_settings_embeddings_and_messages() {
         .unwrap();
     }
     let store = env.reopen();
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), localis_core::SCHEMA_VERSION);
     let s = store.llm_settings().unwrap();
     assert_eq!(
         s.chat_model,
