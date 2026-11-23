@@ -43,7 +43,7 @@ function InspectorSource({ source, onOpen }: { source: Source; onOpen: (s: Sourc
       <span className="inspector-rank">{source.n != null ? `[${source.n}]` : `#${source.rank}`}</span>
       <span className="inspector-src-title">{source.title}</span>
       <span className="inspector-src-meta">
-        {unitLabel(source.unitKind, source.unit)} · {VIA_LABEL[source.via]}
+        {unitLabel(source.unitKind, source.unit, source.startMs)} · {VIA_LABEL[source.via]}
         {source.available ? "" : " · non più disponibile"}
       </span>
     </>

@@ -18,7 +18,22 @@
 //
 // Cloud (v0.4): see the «cloud» section below. Providers are fake and never contacted; keys stay
 // in memory only. Confirmation tokens, local-only policy and PRISM routing follow the backend rules.
+//
+// FARO (v0.5): chunked uploads follow the backend rules (consecutive offsets, declared size). Audio
+// and video play from a blob URL of the uploaded bytes (mediaUrl is overridden here only); duration
+// and video size are read by the browser from those bytes. Whisper is NOT available: model downloads
+// are simulated (nothing is contacted, the names say so) and a «transcription» produces placeholder
+// segments every 5 s labelled «trascrizione di prova del backend finto», never recognised speech.
+// Transcript chunks are one per segment (the backend groups consecutive segments).
 import type {
+  BeginUploadInput,
+  MediaLink,
+  MediaLinkInput,
+  Region,
+  TranscriptionLanguage,
+  TranscriptSegment,
+  WhisperModel,
+  WhisperModelId,
   AppError,
   CloudPreview,
   CloudProviderId,
@@ -56,7 +71,9 @@ import {
   DESCRIPTION_MAX,
   FOLDER_NAME_MAX,
   IMPORT_MAX_BYTES,
+  MEDIA_IMPORT_MAX_BYTES,
   NAME_MAX,
+  UPLOAD_CHUNK_BYTES,
   SNIPPET_MARK_END,
   SNIPPET_MARK_START,
 } from "./types";
@@ -163,6 +180,10 @@ const EXT_KIND: Record<string, DocumentKind> = {
   jpeg: "image",
   gif: "image",
   webp: "image",
+  mp3: "audio",
+  m4a: "audio",
+  wav: "audio",
+  mp4: "video",
 };
 
 function startsWith(bytes: Uint8Array, prefix: number[], offset = 0) {
@@ -221,6 +242,22 @@ function detect(fileName: string, bytes: Uint8Array): { kind: DocumentKind; medi
     case "markdown":
       if (decodeUtf8(bytes) === null) unsupported("il testo non è codificato in UTF-8.");
       return { kind, mediaType: kind === "text" ? "text/plain" : "text/markdown" };
+    case "audio":
+    case "video": {
+      const isFtyp = startsWith(bytes, ascii("ftyp"), 4);
+      if (ext === "mp3") {
+        const frame = bytes[0] === 0xff && ((bytes[1] ?? 0) & 0xe0) === 0xe0;
+        if (!startsWith(bytes, ascii("ID3")) && !frame) unsupported("il file .mp3 non è un audio MP3 valido.");
+        return { kind, mediaType: "audio/mpeg" };
+      }
+      if (ext === "wav") {
+        if (!startsWith(bytes, ascii("RIFF")) || !startsWith(bytes, ascii("WAVE"), 8))
+          unsupported("il file .wav non è un audio WAV valido.");
+        return { kind, mediaType: "audio/wav" };
+      }
+      if (!isFtyp) unsupported(`il file .${ext} non è un file MPEG-4 valido.`);
+      return { kind, mediaType: ext === "m4a" ? "audio/mp4" : "video/mp4" };
+    }
   }
 }
 
@@ -282,6 +319,8 @@ async function extract(version: DocumentVersion, bytes: Uint8Array): Promise<Tex
         "mock backend: DOCX text extraction is not implemented (the desktop app does it)",
       );
     case "image":
+    case "audio":
+    case "video":
       return [];
   }
 }
@@ -324,7 +363,7 @@ function runJob(jobId: number) {
 }
 
 function enqueue(version: DocumentVersion) {
-  if (version.kind === "image") return;
+  if (version.kind === "image" || version.kind === "audio" || version.kind === "video") return;
   const stamp = now();
   const job: Job = {
     id: lib.nextJobId++,
@@ -332,6 +371,7 @@ function enqueue(version: DocumentVersion) {
     versionId: version.id,
     kind: "extract_text",
     state: "queued",
+    progress: null,
     attempts: 0,
     error: null,
     errorDetail: null,
@@ -363,7 +403,8 @@ async function newVersion(
   mediaType: string,
   sha256: string,
 ): Promise<DocumentVersion> {
-  const size = kind === "image" ? await imageSize(bytes, mediaType) : { w: null, h: null };
+  const media = kind === "audio" || kind === "video" ? await mediaInfo(bytes, mediaType, kind) : null;
+  const size = kind === "image" ? await imageSize(bytes, mediaType) : media ? { w: media.w, h: media.h } : { w: null, h: null };
   const version: DocumentVersion = {
     id: crypto.randomUUID(),
     documentId,
@@ -375,10 +416,12 @@ async function newVersion(
     sha256,
     sourceModifiedAt: lastModified ? new Date(lastModified).toISOString() : null,
     importedAt: now(),
-    textStatus: kind === "image" ? "not_applicable" : "pending",
+    textStatus: kind === "image" || media ? "not_applicable" : "pending",
     pageCount: null,
     imageWidth: size.w,
     imageHeight: size.h,
+    durationMs: media?.durationMs ?? null,
+    transcription: null,
   };
   lib.blobs.set(sha256, bytes.slice());
   lib.versions.push(version);
@@ -386,9 +429,59 @@ async function newVersion(
   return version;
 }
 
-function checkBytes(bytes: Uint8Array) {
-  if (bytes.byteLength === 0) fail({ code: "validation", message: "Il file è vuoto." });
-  if (bytes.byteLength > IMPORT_MAX_BYTES) fail({ code: "too_large", message: "Il file supera il limite di 200 MB." });
+function isMediaName(fileName: string) {
+  const kind = EXT_KIND[fileName.slice(fileName.lastIndexOf(".") + 1).toLowerCase()];
+  return kind === "audio" || kind === "video";
+}
+
+function checkSize(size: number, fileName: string) {
+  if (size === 0) fail({ code: "validation", message: "Il file è vuoto." });
+  if (isMediaName(fileName)) {
+    if (size > MEDIA_IMPORT_MAX_BYTES) fail({ code: "too_large", message: "Il file supera il limite di 4 GB." });
+  } else if (size > IMPORT_MAX_BYTES) fail({ code: "too_large", message: "Il file supera il limite di 200 MB." });
+}
+
+function checkBytes(bytes: Uint8Array, fileName: string) {
+  checkSize(bytes.byteLength, fileName);
+}
+
+/** Duration and video size as read by the browser from the uploaded bytes (null when it cannot). */
+async function mediaInfo(
+  bytes: Uint8Array,
+  mediaType: string,
+  kind: "audio" | "video",
+): Promise<{ durationMs: number | null; w: number | null; h: number | null }> {
+  const none = { durationMs: null, w: null, h: null };
+  if (typeof document === "undefined" || typeof URL.createObjectURL !== "function") return none;
+  const url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: mediaType }));
+  try {
+    const el = document.createElement(kind);
+    el.preload = "metadata";
+    const ok = await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), 4000);
+      el.onloadedmetadata = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      el.onerror = () => {
+        clearTimeout(timer);
+        resolve(false);
+      };
+      el.src = url;
+    });
+    if (!ok) return none;
+    const durationMs = Number.isFinite(el.duration) ? Math.round(el.duration * 1000) : null;
+    const video = kind === "video" ? (el as HTMLVideoElement) : null;
+    return {
+      durationMs,
+      w: video && video.videoWidth ? video.videoWidth : null,
+      h: video && video.videoHeight ? video.videoHeight : null,
+    };
+  } catch {
+    return none;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }
 
 function gcBlobs() {
@@ -400,8 +493,17 @@ function removeDocuments(ids: Set<string>) {
   const versionIds = new Set(lib.versions.filter((v) => ids.has(v.documentId)).map((v) => v.id));
   lib.documents = lib.documents.filter((d) => !ids.has(d.id));
   lib.versions = lib.versions.filter((v) => !versionIds.has(v.id));
+  for (const job of lib.jobs) if (versionIds.has(job.versionId)) faro.timers.get(job.id)?.();
   lib.jobs = lib.jobs.filter((j) => !versionIds.has(j.versionId));
-  for (const id of versionIds) lib.text.delete(id);
+  for (const id of versionIds) {
+    lib.text.delete(id);
+    faro.segments.delete(id);
+    const url = faro.mediaUrls.get(id);
+    if (url) URL.revokeObjectURL(url);
+    faro.mediaUrls.delete(id);
+  }
+  // Links of a deleted media or target go with it (CASCADE in the backend).
+  faro.links = faro.links.filter((l) => !versionIds.has(l.mediaVersionId) && !versionIds.has(l.targetVersionId) && !ids.has(l.mediaDocumentId) && !ids.has(l.targetDocumentId));
   gcBlobs();
 }
 
@@ -502,7 +604,8 @@ interface Chunk {
   versionId: string;
   title: string;
   unit: number;
-  unitKind: "page" | "block";
+  unitKind: "page" | "block" | "segment";
+  startMs?: number | null;
   text: string;
 }
 
@@ -522,6 +625,12 @@ function splitPassages(text: string, max = 1200): string[] {
   return out;
 }
 
+function unitKindOf(version: DocumentVersion): "page" | "block" | "segment" {
+  if (version.kind === "pdf") return "page";
+  if (version.kind === "audio" || version.kind === "video") return "segment";
+  return "block";
+}
+
 function projectChunks(projectId: string, documentIds?: Set<string>): Chunk[] {
   const chunks: Chunk[] = [];
   for (const doc of lib.documents.filter((d) => d.projectId === projectId)) {
@@ -534,7 +643,8 @@ function projectChunks(projectId: string, documentIds?: Set<string>): Chunk[] {
           versionId: current.id,
           title: doc.title,
           unit: unit.unit,
-          unitKind: current.kind === "pdf" ? "page" : "block",
+          unitKind: unitKindOf(current),
+          startMs: unit.startMs ?? null,
           text,
         });
       }
@@ -902,6 +1012,7 @@ function planAnswer(projectId: string, question: string, documentIdsIn: string[]
     title: c.title,
     unit: c.unit,
     unitKind: c.unitKind,
+    startMs: c.startMs ?? null,
     text: c.text,
     via: "lexical",
     available: true,
@@ -1192,6 +1303,221 @@ async function runChat(input: SendMessageInput, onEvent: (event: ChatEvent) => v
 
 // ------------------------------------------------------------------ API
 
+// ------------------------------------------------------------------ FARO (v0.5)
+
+interface PendingUpload {
+  input: BeginUploadInput;
+  parts: Uint8Array[];
+  received: number;
+}
+
+const WHISPER_CATALOG: Omit<WhisperModel, "installed" | "download" | "error">[] = [
+  { id: "tiny", name: "Whisper Tiny", fileName: "ggml-tiny.bin", sizeBytes: 77691713, sha256: "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21" },
+  { id: "base", name: "Whisper Base", fileName: "ggml-base.bin", sizeBytes: 147951465, sha256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe" },
+  { id: "small", name: "Whisper Small", fileName: "ggml-small.bin", sizeBytes: 487601967, sha256: "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b" },
+  { id: "large-v3-turbo-q5", name: "Whisper Large v3 Turbo (q5)", fileName: "ggml-large-v3-turbo-q5_0.bin", sizeBytes: 574041195, sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2" },
+];
+/** Appended to the model names: nothing is downloaded by the mock. */
+const SIMULATED = " · download simulato (backend finto)";
+const MOCK_TRANSCRIPT_LABEL = "[trascrizione di prova del backend finto: nessun riconoscimento vocale]";
+const SEGMENT_MS = 5000;
+
+const faro = {
+  uploads: new Map<string, PendingUpload>(),
+  mediaUrls: new Map<string, string>(),
+  // Filled on first use (see modelStateOf): no work at module load, so the build can drop the mock.
+  models: new Map<WhisperModelId, { installed: boolean; received: number | null; error: string | null; timer: number | null }>(),
+  segments: new Map<string, TranscriptSegment[]>(),
+  transcribeParams: new Map<number, { model: WhisperModelId; language: TranscriptionLanguage }>(),
+  /** Stops the simulated work of a job (called on cancel and deletion). */
+  timers: new Map<number, () => void>(),
+  links: [] as MediaLink[],
+  running: null as number | null,
+};
+
+
+function modelStateOf(id: WhisperModelId) {
+  let state = faro.models.get(id);
+  if (!state && WHISPER_CATALOG.some((m) => m.id === id)) {
+    // Optional dev convenience: VITE_MOCK_WHISPER_INSTALLED=tiny,base starts with those «installed».
+    const preinstalled = String(import.meta.env.VITE_MOCK_WHISPER_INSTALLED ?? "").split(",").map((x) => x.trim());
+    state = { installed: preinstalled.includes(id), received: null, error: null, timer: null };
+    faro.models.set(id, state);
+  }
+  return state;
+}
+
+function whisperModels(): WhisperModel[] {
+  return WHISPER_CATALOG.map((m) => {
+    const state = modelStateOf(m.id)!;
+    return {
+      ...m,
+      name: m.name + SIMULATED,
+      installed: state.installed,
+      download: state.received !== null ? { receivedBytes: state.received, totalBytes: m.sizeBytes } : null,
+      error: state.error,
+    };
+  });
+}
+
+function modelState(id: WhisperModelId) {
+  return modelStateOf(id) ?? fail({ code: "not_found", message: "Modello sconosciuto." });
+}
+
+function findVersion(id: string): DocumentVersion {
+  return lib.versions.find((v) => v.id === id) ?? fail({ code: "not_found", message: "La versione non esiste più." });
+}
+
+function isMediaVersion(v: DocumentVersion) {
+  return v.kind === "audio" || v.kind === "video";
+}
+
+function placeholderSegments(version: DocumentVersion, model: WhisperModelId): TranscriptSegment[] {
+  const duration = version.durationMs ?? 3 * SEGMENT_MS;
+  const count = Math.max(1, Math.min(2000, Math.ceil(duration / SEGMENT_MS)));
+  const out: TranscriptSegment[] = [];
+  for (let i = 0; i < count; i++) {
+    const startMs = i * SEGMENT_MS;
+    const endMs = Math.min(duration, startMs + SEGMENT_MS);
+    out.push({
+      index: i + 1,
+      startMs,
+      endMs,
+      text: `${MOCK_TRANSCRIPT_LABEL} Segmento ${i + 1} di «${version.originalName}» (modello ${model} non eseguito).`,
+    });
+  }
+  return out;
+}
+
+/** One transcription at a time, like the backend (CPU bound). */
+function runTranscriptions() {
+  if (faro.running !== null) return;
+  const job = lib.jobs.filter((j) => j.kind === "transcribe" && j.state === "queued").sort((a, b) => a.id - b.id)[0];
+  if (!job) return;
+  const params = faro.transcribeParams.get(job.id);
+  const version = lib.versions.find((v) => v.id === job.versionId);
+  if (!params || !version) return;
+  faro.running = job.id;
+  Object.assign(job, { state: "running", progress: 0, attempts: job.attempts + 1, updatedAt: now() });
+  if (!version.transcription) version.textStatus = "pending";
+  const finish = () => {
+    window.clearInterval(timer);
+    faro.timers.delete(job.id);
+    if (faro.running === job.id) faro.running = null;
+    setTimeout(runTranscriptions, 0);
+  };
+  const timer = window.setInterval(() => {
+    if (!lib.jobs.includes(job) || job.state !== "running") return finish();
+    if (!modelStateOf(params.model)?.installed) {
+      Object.assign(job, { state: "failed", progress: null, error: "Modello non installato.", errorDetail: "mock backend", updatedAt: now() });
+      if (!version.transcription) version.textStatus = "failed";
+      return finish();
+    }
+    const progress = Math.min(100, (job.progress ?? 0) + 7);
+    Object.assign(job, { progress, updatedAt: now() });
+    if (progress < 100) return;
+    const segments = placeholderSegments(version, params.model);
+    faro.segments.set(version.id, segments);
+    lib.text.set(
+      version.id,
+      segments.map((s) => ({ unit: s.index, text: s.text, startMs: s.startMs, endMs: s.endMs })),
+    );
+    version.transcription = {
+      model: params.model,
+      // The mock recognises nothing: «und» (undetermined) unless the user chose a language.
+      language: params.language === "auto" ? "und" : params.language,
+      createdAt: now(),
+      segmentCount: segments.length,
+    };
+    version.textStatus = "extracted";
+    Object.assign(job, { state: "done", progress: 100, error: null, errorDetail: null, updatedAt: now() });
+    finish();
+  }, 350);
+  faro.timers.set(job.id, () => {
+    window.clearInterval(timer);
+    if (faro.running === job.id) faro.running = null;
+  });
+}
+
+const REGION_ERROR: AppError = { code: "validation", field: "region", message: "La regione deve stare dentro la pagina." };
+
+function validRegion(region: Region | null | undefined): Region | null {
+  if (!region) return null;
+  const { x, y, w, h } = region;
+  const ok = [x, y, w, h].every((n) => Number.isFinite(n)) && x >= 0 && y >= 0 && w > 0 && h > 0 && x + w <= 1 + 1e-9 && y + h <= 1 + 1e-9;
+  if (!ok) fail(REGION_ERROR);
+  return { x, y, w, h };
+}
+
+function buildLink(input: MediaLinkInput, previous?: MediaLink): MediaLink {
+  const media = findVersion(input.mediaVersionId);
+  if (!isMediaVersion(media)) fail({ code: "validation", message: "Si possono collegare solo registrazioni audio o video." });
+  const target = findVersion(input.targetVersionId);
+  const mediaDoc = findDocument(media.documentId);
+  const targetDoc = findDocument(target.documentId);
+  if (mediaDoc.projectId !== targetDoc.projectId)
+    fail({ code: "validation", message: "Registrazione e destinazione devono appartenere allo stesso progetto." });
+  const { startMs, endMs } = input;
+  if (!Number.isInteger(startMs) || startMs < 0)
+    fail({ code: "validation", field: "startMs", message: "L'inizio non è valido." });
+  if (!Number.isInteger(endMs) || endMs <= startMs)
+    fail({ code: "validation", field: "endMs", message: "La fine deve venire dopo l'inizio." });
+  if (media.durationMs != null && endMs > media.durationMs)
+    fail({ code: "validation", field: "endMs", message: "La fine supera la durata della registrazione." });
+  let page: number | null = null;
+  if (target.kind === "pdf") {
+    page = input.targetPage ?? null;
+    if (page === null || !Number.isInteger(page) || page < 1 || (target.pageCount != null && page > target.pageCount))
+      fail({ code: "validation", field: "targetPage", message: "Scegli una pagina del PDF." });
+  } else if (target.kind !== "image") {
+    fail({ code: "validation", field: "targetVersionId", message: "La destinazione deve essere un PDF o un'immagine." });
+  }
+  const note = input.note?.trim() ? input.note.trim() : null;
+  if (note && [...note].length > 2000) fail({ code: "validation", field: "note", message: "La nota supera 2000 caratteri." });
+  const stamp = now();
+  return {
+    id: previous?.id ?? crypto.randomUUID(),
+    projectId: mediaDoc.projectId,
+    mediaDocumentId: mediaDoc.id,
+    mediaVersionId: media.id,
+    startMs,
+    endMs,
+    targetDocumentId: targetDoc.id,
+    targetVersionId: target.id,
+    targetPage: page,
+    region: validRegion(input.region),
+    note,
+    createdAt: previous?.createdAt ?? stamp,
+    updatedAt: stamp,
+    mediaTitle: mediaDoc.title,
+    targetTitle: targetDoc.title,
+    available: true,
+  };
+}
+
+async function finishImport(upload: PendingUpload): Promise<ImportResult> {
+  const { input } = upload;
+  const bytes = new Uint8Array(upload.received);
+  let at = 0;
+  for (const part of upload.parts) {
+    bytes.set(part, at);
+    at += part.byteLength;
+  }
+  if (input.documentId) {
+    const document = await mockBackend.importVersion(input.documentId, bytes, input.fileName, input.lastModified);
+    return { status: "imported", document };
+  }
+  return mockBackend.importDocument(bytes, {
+    projectId: input.projectId,
+    folderId: input.folderId ?? null,
+    fileName: input.fileName,
+    lastModified: input.lastModified ?? null,
+  });
+}
+
+
+const LANGUAGES: TranscriptionLanguage[] = ["auto", "it", "en", "fr", "de", "es"];
+
 export const mockBackend: Api = {
   async listProjects() {
     await delay();
@@ -1301,7 +1627,7 @@ export const mockBackend: Api = {
     const folderId = meta.folderId ?? null;
     if (folderId && !lib.folders.some((f) => f.id === folderId && f.projectId === meta.projectId))
       fail({ code: "not_found", message: "La cartella non esiste più." });
-    checkBytes(bytes);
+    checkBytes(bytes, meta.fileName);
     const { kind, mediaType } = detect(meta.fileName, bytes);
     const sha256 = await sha256Hex(bytes);
     const existing = lib.versions.find(
@@ -1324,7 +1650,7 @@ export const mockBackend: Api = {
   async importVersion(documentId, bytes, fileName, lastModified) {
     await delay();
     const doc = findDocument(documentId);
-    checkBytes(bytes);
+    checkBytes(bytes, fileName);
     const { kind, mediaType } = detect(fileName, bytes);
     const versions = versionsOf(documentId);
     if (kind !== versions[0]!.kind)
@@ -1384,7 +1710,8 @@ export const mockBackend: Api = {
           title: doc.title,
           folderId: doc.folderId,
           unit: unit.unit,
-          unitKind: current.kind === "pdf" ? "page" : "block",
+          unitKind: unitKindOf(current),
+          startMs: unit.startMs ?? null,
           snippet,
           score,
         });
@@ -1409,8 +1736,12 @@ export const mockBackend: Api = {
     await delay();
     const job =
       lib.jobs.find((j) => j.id === id) ?? fail({ code: "not_found", message: "L'operazione non esiste più." });
-    if (job.state !== "failed") fail({ code: "conflict", message: "L'estrazione non è in errore." });
-    Object.assign(job, { state: "queued", error: null, errorDetail: null, updatedAt: now() });
+    if (job.state !== "failed") fail({ code: "conflict", message: "L'operazione non è in errore." });
+    Object.assign(job, { state: "queued", progress: null, error: null, errorDetail: null, updatedAt: now() });
+    if (job.kind === "transcribe") {
+      runTranscriptions();
+      return { ...job };
+    }
     setStatus(job.versionId, "pending");
     runJob(job.id);
     return { ...job };
@@ -1660,5 +1991,185 @@ export const mockBackend: Api = {
   async listCloudRequests(limit = 100) {
     await delay(60);
     return [...cloud.requests].reverse().slice(0, Math.max(1, limit)).map((r) => structuredClone(r));
+  },
+  // ---- v0.5 FARO (methods inline: a spread would keep the mock in production builds)
+  async beginUpload(input) {
+    await delay(40);
+    if (input.documentId) findDocument(input.documentId);
+    else {
+      projectExists(input.projectId);
+      if (input.folderId && !lib.folders.some((f) => f.id === input.folderId && f.projectId === input.projectId))
+        fail({ code: "not_found", message: "La cartella non esiste più." });
+    }
+    if (!Number.isInteger(input.sizeBytes) || input.sizeBytes < 0)
+      fail({ code: "validation", message: "Dimensione del file non valida." });
+    checkSize(input.sizeBytes, input.fileName);
+    if (!EXT_KIND[input.fileName.slice(input.fileName.lastIndexOf(".") + 1).toLowerCase()])
+      fail({ code: "unsupported", message: "Formato non supportato." });
+    const uploadId = crypto.randomUUID();
+    faro.uploads.set(uploadId, { input: { ...input }, parts: [], received: 0 });
+    return { uploadId, chunkBytes: UPLOAD_CHUNK_BYTES };
+  },
+  async uploadChunk(uploadId, offset, bytes) {
+    await delay(30);
+    const upload = faro.uploads.get(uploadId) ?? fail({ code: "not_found", message: "Il caricamento non esiste più." });
+    if (offset !== upload.received)
+      fail({ code: "validation", message: "Blocco fuori sequenza.", detail: `expected offset ${upload.received}, got ${offset}` });
+    if (bytes.byteLength === 0 || bytes.byteLength > UPLOAD_CHUNK_BYTES || upload.received + bytes.byteLength > upload.input.sizeBytes)
+      fail({ code: "validation", message: "Blocco di dimensione non valida." });
+    upload.parts.push(bytes.slice());
+    upload.received += bytes.byteLength;
+  },
+  async finishUpload(uploadId) {
+    await delay(60);
+    const upload = faro.uploads.get(uploadId) ?? fail({ code: "not_found", message: "Il caricamento non esiste più." });
+    faro.uploads.delete(uploadId);
+    if (upload.received !== upload.input.sizeBytes)
+      fail({ code: "validation", message: "Il file caricato è incompleto." });
+    return finishImport(upload);
+  },
+  async cancelUpload(uploadId) {
+    await delay(20);
+    faro.uploads.delete(uploadId);
+  },
+  mediaUrl(versionId) {
+    const cached = faro.mediaUrls.get(versionId);
+    if (cached) return cached;
+    const version = lib.versions.find((v) => v.id === versionId);
+    const bytes = version ? lib.blobs.get(version.sha256) : undefined;
+    if (!version || !bytes) return "";
+    const url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: version.mediaType }));
+    faro.mediaUrls.set(versionId, url);
+    return url;
+  },
+
+  async listWhisperModels() {
+    await delay(40);
+    return whisperModels();
+  },
+  async downloadWhisperModel(id) {
+    await delay(60);
+    const state = modelState(id);
+    const meta = WHISPER_CATALOG.find((m) => m.id === id)!;
+    if (state.installed || state.received !== null) return whisperModels();
+    state.error = null;
+    state.received = 0;
+    // Simulated: about 5 s per model whatever its size; nothing is contacted.
+    state.timer = window.setInterval(() => {
+      if (state.received === null) return;
+      state.received = Math.min(meta.sizeBytes, state.received + Math.ceil(meta.sizeBytes / 25));
+      if (state.received >= meta.sizeBytes) {
+        window.clearInterval(state.timer!);
+        state.timer = null;
+        state.received = null;
+        state.installed = true;
+      }
+    }, 200);
+    return whisperModels();
+  },
+  async cancelWhisperDownload(id) {
+    await delay(40);
+    const state = modelState(id);
+    if (state.timer !== null) window.clearInterval(state.timer);
+    state.timer = null;
+    state.received = null;
+    return whisperModels();
+  },
+  async deleteWhisperModel(id) {
+    await delay(60);
+    const state = modelState(id);
+    if (lib.jobs.some((j) => j.kind === "transcribe" && j.state === "running" && faro.transcribeParams.get(j.id)?.model === id))
+      fail({ code: "conflict", message: "Il modello è in uso da una trascrizione in corso." });
+    state.installed = false;
+    return whisperModels();
+  },
+  async startTranscription(versionId, model, language) {
+    await delay(60);
+    const version = findVersion(versionId);
+    if (!isMediaVersion(version))
+      fail({ code: "validation", message: "Si possono trascrivere solo registrazioni audio o video." });
+    if (!modelState(model).installed) fail({ code: "validation", field: "model", message: "Modello non installato." });
+    if (!LANGUAGES.includes(language)) fail({ code: "validation", field: "language", message: "Lingua non supportata." });
+    if (lib.jobs.some((j) => j.kind === "transcribe" && j.versionId === versionId && (j.state === "queued" || j.state === "running")))
+      fail({ code: "conflict", message: "Una trascrizione di questa registrazione è già in corso." });
+    const stamp = now();
+    const job: Job = {
+      id: lib.nextJobId++,
+      documentId: version.documentId,
+      versionId,
+      kind: "transcribe",
+      state: "queued",
+      progress: null,
+      attempts: 0,
+      error: null,
+      errorDetail: null,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    lib.jobs.push(job);
+    faro.transcribeParams.set(job.id, { model, language });
+    if (!version.transcription) version.textStatus = "pending";
+    runTranscriptions();
+    return { ...job };
+  },
+  async cancelJob(id) {
+    await delay(40);
+    const job = lib.jobs.find((j) => j.id === id) ?? fail({ code: "not_found", message: "L'operazione non esiste più." });
+    if (job.state !== "queued" && job.state !== "running")
+      fail({ code: "conflict", message: "L'operazione non è in corso." });
+    faro.timers.get(job.id)?.();
+    faro.timers.delete(job.id);
+    Object.assign(job, {
+      state: "failed",
+      progress: null,
+      error: job.kind === "transcribe" ? "Trascrizione annullata." : "Estrazione annullata.",
+      errorDetail: "cancelled by the user",
+      updatedAt: now(),
+    });
+    const version = lib.versions.find((v) => v.id === job.versionId);
+    if (version && job.kind === "transcribe" && !version.transcription) version.textStatus = "not_applicable";
+    setTimeout(runTranscriptions, 0);
+    return { ...job };
+  },
+  async getTranscript(versionId) {
+    await delay(60);
+    findVersion(versionId);
+    return (faro.segments.get(versionId) ?? []).map((s) => ({ ...s }));
+  },
+
+  async listMediaLinks(mediaVersionId) {
+    await delay(40);
+    findVersion(mediaVersionId);
+    return faro.links
+      .filter((l) => l.mediaVersionId === mediaVersionId)
+      .sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs)
+      .map((l) => structuredClone(l));
+  },
+  async listLinksForTarget(targetVersionId) {
+    await delay(40);
+    findVersion(targetVersionId);
+    return faro.links
+      .filter((l) => l.targetVersionId === targetVersionId)
+      .sort((a, b) => (a.targetPage ?? 0) - (b.targetPage ?? 0) || a.startMs - b.startMs)
+      .map((l) => structuredClone(l));
+  },
+  async createMediaLink(input) {
+    await delay(60);
+    const link = buildLink(input);
+    faro.links.push(link);
+    return structuredClone(link);
+  },
+  async updateMediaLink(id, input) {
+    await delay(60);
+    const index = faro.links.findIndex((l) => l.id === id);
+    if (index < 0) fail({ code: "not_found", message: "Il collegamento non esiste più." });
+    const link = buildLink(input, faro.links[index]);
+    faro.links[index] = link;
+    return structuredClone(link);
+  },
+  async deleteMediaLink(id) {
+    await delay(40);
+    if (!faro.links.some((l) => l.id === id)) fail({ code: "not_found", message: "Il collegamento non esiste più." });
+    faro.links = faro.links.filter((l) => l.id !== id);
   },
 };

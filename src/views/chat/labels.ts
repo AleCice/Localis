@@ -1,11 +1,14 @@
 import type { RetrievalInfo, Source, UnitKind } from "../../api/types";
+import { formatClock } from "../../lib/time";
 
-export function unitLabel(unitKind: UnitKind, unit: number): string {
+/** «p. 3», «blocco 4», or the segment's timestamp («00:12:34») for recordings. */
+export function unitLabel(unitKind: UnitKind, unit: number, startMs?: number | null): string {
+  if (unitKind === "segment") return startMs != null ? formatClock(startMs) : `segmento ${unit}`;
   return unitKind === "page" ? `p. ${unit}` : `blocco ${unit}`;
 }
 
 export function sourceLabel(source: Source): string {
-  return `«${source.title}», ${unitLabel(source.unitKind, source.unit)}`;
+  return `«${source.title}», ${unitLabel(source.unitKind, source.unit, source.startMs)}`;
 }
 
 /** Accessible name of a citation button. */

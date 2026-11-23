@@ -7,6 +7,8 @@ export interface LibraryLink {
   versionId: string;
   unit: number;
   unitKind: UnitKind;
+  /** v0.5: start of the transcript segment (unitKind "segment"): opens the player there. */
+  startMs?: number | null;
   /** Passage text to show next to the document (e.g. a cited source). */
   snippet: string | null;
   /** Changes on every request, so opening the same source twice jumps again. */

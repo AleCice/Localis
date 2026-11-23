@@ -14,6 +14,11 @@ import type {
   SearchHit,
   Source,
   TextStatus,
+  MediaLink,
+  TranscriptSegment,
+  UnitKind,
+  WhisperModel,
+  WhisperModelId,
 } from "../api/types";
 
 let counter = 0;
@@ -57,6 +62,8 @@ const MEDIA: Record<DocumentKind, string> = {
   markdown: "text/markdown",
   docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   image: "image/png",
+  audio: "audio/mpeg",
+  video: "video/mp4",
 };
 
 /** Synthetic library document with one current version. */
@@ -84,10 +91,13 @@ export function makeDocument(
     sha256: "a".repeat(64),
     sourceModifiedAt: null,
     importedAt: at,
-    textStatus: options.status ?? (kind === "image" ? "not_applicable" : "extracted"),
+    textStatus:
+      options.status ?? (kind === "image" || kind === "audio" || kind === "video" ? "not_applicable" : "extracted"),
     pageCount: kind === "pdf" ? 3 : null,
-    imageWidth: kind === "image" ? 640 : null,
-    imageHeight: kind === "image" ? 480 : null,
+    imageWidth: kind === "image" ? 640 : kind === "video" ? 1280 : null,
+    imageHeight: kind === "image" ? 480 : kind === "video" ? 720 : null,
+    durationMs: kind === "audio" || kind === "video" ? 20 * 60 * 1000 : null,
+    transcription: null,
     ...options.version,
   };
   return {
@@ -111,6 +121,7 @@ export function makeJob(doc: LibraryDocument, overrides: Partial<Job> = {}): Job
     versionId: doc.current.id,
     kind: "extract_text",
     state: "done",
+    progress: null,
     attempts: 1,
     error: null,
     errorDetail: null,
@@ -120,6 +131,10 @@ export function makeJob(doc: LibraryDocument, overrides: Partial<Job> = {}): Job
   };
 }
 
+function unitKindOf(kind: DocumentKind): UnitKind {
+  return kind === "pdf" ? "page" : kind === "audio" || kind === "video" ? "segment" : "block";
+}
+
 export function makeHit(doc: LibraryDocument, unit: number, snippet: string): SearchHit {
   return {
     documentId: doc.id,
@@ -127,7 +142,7 @@ export function makeHit(doc: LibraryDocument, unit: number, snippet: string): Se
     title: doc.title,
     folderId: doc.folderId,
     unit,
-    unitKind: doc.current.kind === "pdf" ? "page" : "block",
+    unitKind: unitKindOf(doc.current.kind),
     snippet,
   };
 }
@@ -150,7 +165,7 @@ export function makeSource(doc: LibraryDocument, overrides: Partial<Source> = {}
     versionId: doc.current.id,
     title: doc.title,
     unit: 2,
-    unitKind: doc.current.kind === "pdf" ? "page" : "block",
+    unitKind: unitKindOf(doc.current.kind),
     text: "Il teorema degli zeri afferma che una funzione continua che cambia segno ha uno zero.",
     via: "lexical",
     available: true,
@@ -233,6 +248,51 @@ export function makePreview(overrides: Partial<CloudPreview> = {}): CloudPreview
     estCost: { min: { amount: 0.0077, currency: "USD" }, max: { amount: 0.0282, currency: "USD" } },
     queryEmbeddedBy: null,
     expiresAt: "2026-03-10T09:10:00.000Z",
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------- v0.5 FARO
+
+export function makeSegments(count: number, stepMs = 10_000): TranscriptSegment[] {
+  return Array.from({ length: count }, (_, i) => ({
+    index: i + 1,
+    startMs: i * stepMs,
+    endMs: (i + 1) * stepMs,
+    text: `Frase sintetica numero ${i + 1} della lezione.`,
+  }));
+}
+
+const WHISPER_META: Record<WhisperModelId, Pick<WhisperModel, "name" | "fileName" | "sizeBytes">> = {
+  tiny: { name: "Whisper Tiny", fileName: "ggml-tiny.bin", sizeBytes: 77691713 },
+  base: { name: "Whisper Base", fileName: "ggml-base.bin", sizeBytes: 147951465 },
+  small: { name: "Whisper Small", fileName: "ggml-small.bin", sizeBytes: 487601967 },
+  "large-v3-turbo-q5": { name: "Whisper Large v3 Turbo", fileName: "ggml-large-v3-turbo-q5_0.bin", sizeBytes: 574041195 },
+};
+
+export function makeWhisperModel(id: WhisperModelId, overrides: Partial<WhisperModel> = {}): WhisperModel {
+  return { id, ...WHISPER_META[id], sha256: "b".repeat(64), installed: false, download: null, error: null, ...overrides };
+}
+
+export function makeLink(media: LibraryDocument, target: LibraryDocument, overrides: Partial<MediaLink> = {}): MediaLink {
+  const at = stamp();
+  return {
+    id: uuid("1i"),
+    projectId: PROJECT_ID,
+    mediaDocumentId: media.id,
+    mediaVersionId: media.current.id,
+    startMs: 750_000,
+    endMs: 900_000,
+    targetDocumentId: target.id,
+    targetVersionId: target.current.id,
+    targetPage: target.current.kind === "pdf" ? 2 : null,
+    region: null,
+    note: null,
+    createdAt: at,
+    updatedAt: at,
+    mediaTitle: media.title,
+    targetTitle: target.title,
+    available: true,
     ...overrides,
   };
 }

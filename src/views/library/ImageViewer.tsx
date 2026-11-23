@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
+import type { Region } from "../../api/types";
 import { FitWidthIcon, MinusIcon, PlusIcon } from "../../components/Icons";
 import type { Zoom } from "./PdfViewer";
+import { RegionOverlay } from "./Region";
 
 const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4];
 
@@ -10,9 +12,21 @@ interface ImageViewerProps {
   title: string;
   width: number | null;
   height: number | null;
+  /** v0.5: region to highlight (a link's destination; the image is not modified). */
+  region?: Region | null;
+  regionLabel?: string;
 }
 
-export function ImageViewer({ data, mediaType, title, width, height }: ImageViewerProps) {
+export function ImageViewer({
+  data,
+  mediaType,
+  title,
+  width,
+  height,
+  region = null,
+  regionLabel = "Regione collegata",
+}: ImageViewerProps) {
+  const [loaded, setLoaded] = useState(false);
   const [url, setUrl] = useState<string | null>(null);
   const [zoom, setZoom] = useState<Zoom>("fit");
   const [failed, setFailed] = useState(false);
@@ -69,6 +83,7 @@ export function ImageViewer({ data, mediaType, title, width, height }: ImageView
       </div>
       <div className="image-scroller" tabIndex={0} role="region" aria-label={`Immagine: ${title}`}>
         {url ? (
+          <div className={zoom === "fit" ? "page-frame image-frame is-fit" : "page-frame image-frame"}>
           <img
             src={url}
             alt={title}
@@ -80,8 +95,11 @@ export function ImageViewer({ data, mediaType, title, width, height }: ImageView
             }
             width={width ?? undefined}
             height={height ?? undefined}
+            onLoad={() => setLoaded(true)}
             onError={() => setFailed(true)}
           />
+          {region && loaded ? <RegionOverlay region={region} label={regionLabel} /> : null}
+          </div>
         ) : null}
       </div>
     </div>

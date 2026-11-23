@@ -25,6 +25,7 @@ vi.mock("../../api/client", () => ({
     search: vi.fn(),
     listJobs: vi.fn(),
     retryJob: vi.fn(),
+    listLinksForTarget: vi.fn(),
   },
 }));
 
@@ -69,6 +70,7 @@ beforeEach(() => {
   mockedApi.readOriginal.mockResolvedValue(new ArrayBuffer(8));
   mockedApi.getText.mockResolvedValue([]);
   mockedApi.search.mockResolvedValue([]);
+  mockedApi.listLinksForTarget.mockResolvedValue([]);
   URL.createObjectURL = vi.fn(() => "blob:mock");
   URL.revokeObjectURL = vi.fn();
 });
@@ -87,7 +89,7 @@ describe("import", () => {
     const user = renderLibrary();
 
     expect(await screen.findByText(/Nessun documento\. Importa PDF/)).toBeInTheDocument();
-    expect(importInput()).toHaveAttribute("accept", ".pdf,.txt,.md,.markdown,.docx,.png,.jpg,.jpeg,.gif,.webp");
+    expect(importInput()).toHaveAttribute("accept", ".pdf,.txt,.md,.markdown,.docx,.png,.jpg,.jpeg,.gif,.webp,.mp3,.m4a,.wav,.mp4");
     expect(importInput()).toHaveAttribute("multiple");
 
     await user.upload(importInput(), file("appunti.txt", "ciao"));

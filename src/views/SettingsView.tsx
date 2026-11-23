@@ -8,6 +8,7 @@ import { CloudProvidersSection } from "./settings/CloudProvidersSection";
 import { LmStudioSection } from "./settings/LmStudioSection";
 import { ModelsSection } from "./settings/ModelsSection";
 import { PricesSection } from "./settings/PricesSection";
+import { TranscriptionSection } from "./settings/TranscriptionSection";
 
 interface SettingsViewProps {
   theme: ThemePref;
@@ -57,6 +58,7 @@ export function SettingsView({ theme, onThemeChange, sidebarToggle, project }: S
           <ModelsSection llm={llm} project={project} />
           <CloudActivitySection />
         </CloudStoreProvider>
+        <TranscriptionSection />
       </div>
     </div>
   );

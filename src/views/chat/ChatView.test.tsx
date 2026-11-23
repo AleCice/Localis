@@ -692,3 +692,36 @@ describe("cloud send (v0.4)", () => {
     expect(within(inspector).getByText(/900 token in ingresso, 50 in uscita · 0,0021/)).toBeInTheDocument();
   });
 });
+
+describe("sources from recordings (v0.5)", () => {
+  it("shows the segment timestamp instead of page/block and opens the media at startMs", async () => {
+    const lecture = makeDocument("lezione.mp3", { kind: "audio" });
+    const conversation = makeConversation("Lezione");
+    const answer = makeMessage(conversation, "assistant", "Il docente lo spiega [1].", {
+      sources: [
+        makeSource(lecture, {
+          rank: 1,
+          n: 1,
+          cited: true,
+          unit: 42,
+          unitKind: "segment",
+          startMs: 754_000,
+          text: "Il teorema degli zeri vale per funzioni continue.",
+        }),
+      ],
+    });
+    const { user, onOpenSource } = renderChat([conversation], [answer]);
+    const cite = await screen.findByRole("button", { name: "Fonte 1: «lezione.mp3», 00:12:34" });
+    await user.click(screen.getByText("Fonti citate (1)"));
+    expect(screen.getByText("00:12:34", { selector: ".source-unit" })).toBeVisible();
+    await user.click(cite);
+    expect(onOpenSource).toHaveBeenLastCalledWith({
+      documentId: lecture.id,
+      versionId: lecture.current.id,
+      unit: 42,
+      unitKind: "segment",
+      startMs: 754_000,
+      snippet: "Il teorema degli zeri vale per funzioni continue.",
+    });
+  });
+});

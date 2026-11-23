@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from "react";
 import { api } from "../../api/client";
-import type { AppError, Folder, LibraryDocument, Project, SearchHit } from "../../api/types";
-import { IMPORT_EXTENSIONS, IMPORT_MAX_BYTES, toAppError } from "../../api/types";
+import type { AppError, Folder, LibraryDocument, MediaLink, Project, SearchHit } from "../../api/types";
+import { IMPORT_EXTENSIONS, toAppError } from "../../api/types";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { ErrorBanner } from "../../components/ErrorBanner";
 import { FolderPlusIcon, PanelIcon, SearchIcon, UploadIcon } from "../../components/Icons";
@@ -12,7 +12,9 @@ import { useLibrary } from "../../hooks/useLibrary";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import type { LoadStatus } from "../../hooks/useProjects";
 import { DocumentList, documentRowId } from "./DocumentList";
-import { DocumentViewer, tooLargeError, VIEWER_HEADING_ID, type ViewerTarget } from "./DocumentViewer";
+import { CANCELLED_UPLOAD, importFile } from "../../lib/upload";
+import { DocumentViewer, VIEWER_HEADING_ID, type ViewerTarget } from "./DocumentViewer";
+import { isMediaKind, latestTranscribeJob, mediaStatus } from "./labels";
 import { FolderNameDialog } from "./FolderNameDialog";
 import { folderNodeId, FolderTree } from "./FolderTree";
 import { ImportSummary, type ImportOutcome, type ImportState } from "./ImportSummary";
@@ -146,6 +148,7 @@ function Library({ project, sidebarToggle, link, onLinkHandled, onBackToChat }: 
   const [dragging, setDragging] = useState(false);
   const dragDepth = useRef(0);
   const fileRef = useRef<HTMLInputElement>(null);
+  const importAbort = useRef<AbortController | null>(null);
 
   const [folderDialog, setFolderDialog] = useState<FolderDialogMode>(null);
   const [deletingFolder, setDeletingFolder] = useState<Folder | null>(null);
@@ -182,8 +185,22 @@ function Library({ project, sidebarToggle, link, onLinkHandled, onBackToChat }: 
   const inFolder = documents.filter((d) => (d.folderId ?? null) === folderId);
   const excludedFromSearch = documents.filter((d) => d.current.textStatus !== "extracted").length;
 
+  // The latest job of the current version, when it failed (extraction, or transcription for media).
   const failedJob = useCallback(
-    (doc: LibraryDocument) => jobs.find((j) => j.versionId === doc.current.id && j.state === "failed") ?? null,
+    (doc: LibraryDocument) => {
+      let latest = null;
+      for (const j of jobs) {
+        if (j.versionId !== doc.current.id) continue;
+        if (isMediaKind(doc.current.kind) && j.kind !== "transcribe") continue;
+        if (!latest || j.id > latest.id) latest = j;
+      }
+      return latest && latest.state === "failed" ? latest : null;
+    },
+    [jobs],
+  );
+  const mediaStatusOf = useCallback(
+    (doc: LibraryDocument) =>
+      isMediaKind(doc.current.kind) ? mediaStatus(doc.current, latestTranscribeJob(jobs, doc.current.id)) : null,
     [jobs],
   );
 
@@ -245,7 +262,45 @@ function Library({ project, sidebarToggle, link, onLinkHandled, onBackToChat }: 
       void store.refresh();
       return;
     }
-    openDocument(doc, { unit: hit.unit, unitKind: hit.unitKind });
+    openDocument(doc, { unit: hit.unit, unitKind: hit.unitKind, startMs: hit.startMs ?? null });
+  };
+
+  // ---- Manual links between recordings and pages/images (v0.5)
+  const openLinkTarget = (link: MediaLink) => {
+    const doc = documents.find((d) => d.id === link.targetDocumentId);
+    if (!doc) {
+      setNotice({ code: "not_found", message: "La destinazione del collegamento non esiste più." });
+      return;
+    }
+    setQuery("");
+    setSubmitted("");
+    openDocument(doc, {
+      unit: link.targetPage ?? 1,
+      unitKind: "page",
+      versionId: link.targetVersionId,
+      region: link.region,
+      link,
+    });
+    setFolderId(doc.folderId ?? null);
+    requestAnimationFrame(() => document.getElementById(VIEWER_HEADING_ID)?.focus());
+  };
+  const openLinkMedia = (link: MediaLink) => {
+    const doc = documents.find((d) => d.id === link.mediaDocumentId);
+    if (!doc) {
+      setNotice({ code: "not_found", message: "La registrazione collegata non esiste più." });
+      return;
+    }
+    setQuery("");
+    setSubmitted("");
+    openDocument(doc, {
+      unit: 0,
+      unitKind: "segment",
+      versionId: link.mediaVersionId,
+      startMs: link.startMs,
+      link,
+    });
+    setFolderId(doc.folderId ?? null);
+    requestAnimationFrame(() => document.getElementById(VIEWER_HEADING_ID)?.focus());
   };
 
   // ---- External link (a source cited in the chat): open that document and version at that point.
@@ -259,7 +314,13 @@ function Library({ project, sidebarToggle, link, onLinkHandled, onBackToChat }: 
       setSubmitted("");
       setNotice(null);
       setSelectedId(doc.id);
-      setTarget({ unit: link.unit, unitKind: link.unitKind, versionId: link.versionId, snippet: link.snippet });
+      setTarget({
+        unit: link.unit,
+        unitKind: link.unitKind,
+        versionId: link.versionId,
+        snippet: link.snippet,
+        startMs: link.startMs ?? null,
+      });
       setPane("viewer");
       setFolderId(doc.folderId ?? null);
       requestAnimationFrame(() => document.getElementById(VIEWER_HEADING_ID)?.focus());
@@ -280,32 +341,41 @@ function Library({ project, sidebarToggle, link, onLinkHandled, onBackToChat }: 
     if (files.length === 0 || importState?.running) return;
     const destination = folderId;
     const outcomes: ImportOutcome[] = [];
+    const controller = new AbortController();
+    importAbort.current = controller;
     setImportState({ running: true, total: files.length, outcomes: [], folderLabel: folderLabel(destination) });
     for (const file of files) {
       let outcome: ImportOutcome;
-      if (file.size > IMPORT_MAX_BYTES) {
-        outcome = { name: file.name, kind: "error", error: tooLargeError() };
+      if (controller.signal.aborted) {
+        outcome = { name: file.name, kind: "cancelled" };
       } else {
         try {
-          const bytes = new Uint8Array(await file.arrayBuffer());
-          const result = await api.importDocument(bytes, {
+          const result = await importFile(file, {
             projectId: project.id,
             folderId: destination,
-            fileName: file.name,
-            lastModified: file.lastModified || null,
+            signal: controller.signal,
+            onProgress: (sentBytes, totalBytes) =>
+              setImportState((prev) =>
+                prev ? { ...prev, progress: { name: file.name, sentBytes, totalBytes } } : prev,
+              ),
           });
           outcome = { name: file.name, kind: result.status, document: result.document };
         } catch (err) {
-          outcome = { name: file.name, kind: "error", error: toAppError(err) };
+          const error = toAppError(err);
+          outcome =
+            err === CANCELLED_UPLOAD || error.code === "cancelled"
+              ? { name: file.name, kind: "cancelled" }
+              : { name: file.name, kind: "error", error };
         }
       }
       outcomes.push(outcome);
-      setImportState((prev) => (prev ? { ...prev, outcomes: [...outcomes] } : prev));
+      setImportState((prev) => (prev ? { ...prev, outcomes: [...outcomes], progress: null } : prev));
     }
-    setImportState((prev) => (prev ? { ...prev, running: false } : prev));
+    importAbort.current = null;
+    setImportState((prev) => (prev ? { ...prev, running: false, progress: null } : prev));
     await store.refresh();
     const only = outcomes.length === 1 ? outcomes[0] : undefined;
-    if (only && only.kind !== "error") openDocument(only.document);
+    if (only && (only.kind === "imported" || only.kind === "duplicate")) openDocument(only.document);
   };
 
   const onDragEnter = (event: DragEvent<HTMLDivElement>) => {
@@ -485,6 +555,7 @@ function Library({ project, sidebarToggle, link, onLinkHandled, onBackToChat }: 
                   state={importState}
                   onOpen={(doc) => openDocument(doc)}
                   onDismiss={() => setImportState(null)}
+                  onCancel={() => importAbort.current?.abort()}
                 />
               ) : null}
             </div>
@@ -561,8 +632,8 @@ function Library({ project, sidebarToggle, link, onLinkHandled, onBackToChat }: 
                     {libraryEmpty ? (
                       <div className="library-empty">
                         <p>
-                          Nessun documento. Importa PDF, testi, Markdown, documenti Word o immagini con «Importa» o
-                          trascinandoli qui.
+                          Nessun documento. Importa PDF, testi, Markdown, documenti Word, immagini o registrazioni
+                          (MP3, M4A, WAV, MP4) con «Importa» o trascinandoli qui.
                         </p>
                         <p className="hint">
                           Localis conserva una copia di ogni file: gli originali sul disco non vengono modificati.
@@ -578,6 +649,7 @@ function Library({ project, sidebarToggle, link, onLinkHandled, onBackToChat }: 
                         onRetry={(doc) => void retry(doc)}
                         canRetry={(doc) => failedJob(doc) !== null}
                         retrying={retrying}
+                        mediaStatusOf={mediaStatusOf}
                       />
                     )}
                   </section>
@@ -615,6 +687,10 @@ function Library({ project, sidebarToggle, link, onLinkHandled, onBackToChat }: 
                       onBack={stacked ? backToBrowser : undefined}
                       onBackToChat={onBackToChat}
                       onDismissTarget={() => setTarget(null)}
+                      jobs={jobs}
+                      documents={documents}
+                      onOpenLinkTarget={openLinkTarget}
+                      onOpenLinkMedia={openLinkMedia}
                     />
                   </>
                 ) : (

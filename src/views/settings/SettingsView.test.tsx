@@ -22,6 +22,7 @@ vi.mock("../../api/client", () => ({
     setPrice: vi.fn(),
     deletePrice: vi.fn(),
     listCloudRequests: vi.fn(),
+    listWhisperModels: vi.fn(),
   },
 }));
 
@@ -76,6 +77,7 @@ beforeEach(() => {
   mockedApi.listPrices.mockResolvedValue([]);
   mockedApi.setPrice.mockImplementation(async (price) => [price]);
   mockedApi.listCloudRequests.mockResolvedValue([]);
+  mockedApi.listWhisperModels.mockResolvedValue([]);
 });
 
 afterEach(() => {

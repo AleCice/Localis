@@ -544,6 +544,7 @@ function Chat({
         versionId: source.versionId,
         unit: source.unit,
         unitKind: source.unitKind,
+        ...(source.startMs != null ? { startMs: source.startMs } : {}),
         snippet: source.text,
       });
     },

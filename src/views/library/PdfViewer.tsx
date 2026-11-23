@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
-import type { AppError } from "../../api/types";
+import type { AppError, Region } from "../../api/types";
 import { ErrorBanner } from "../../components/ErrorBanner";
 import { ChevronIcon, FitWidthIcon, MinusIcon, PlusIcon } from "../../components/Icons";
 import { Spinner } from "../../components/Spinner";
 import { useDelayedFlag } from "../../hooks/useDelayedFlag";
 import type { PageSize, PdfHandle } from "./pdfjs";
+import { RegionOverlay } from "./Region";
 
 const ZOOM_STEPS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 const PAGE_GUTTER = 32;
@@ -16,6 +17,9 @@ interface PdfViewerProps {
   title: string;
   /** Page to show; a new object (e.g. from a search result) jumps there again. */
   target?: { page: number } | null;
+  /** v0.5: region of the target page to highlight (a link's destination; the PDF is not modified). */
+  region?: Region | null;
+  regionLabel?: string;
 }
 
 function openError(err: unknown): AppError {
@@ -30,7 +34,7 @@ function openError(err: unknown): AppError {
  * Single-page PDF viewer: one canvas at a time keeps memory bounded whatever the
  * page count. pdf.js is loaded on demand from ./pdfjs.
  */
-export function PdfViewer({ data, title, target }: PdfViewerProps) {
+export function PdfViewer({ data, title, target, region = null, regionLabel = "Regione collegata" }: PdfViewerProps) {
   const [handle, setHandle] = useState<PdfHandle | null>(null);
   const [error, setError] = useState<AppError | null>(null);
   const [page, setPage] = useState(target?.page ?? 1);
@@ -289,12 +293,17 @@ export function PdfViewer({ data, title, target }: PdfViewerProps) {
         aria-keyshortcuts="ArrowLeft ArrowRight PageUp PageDown Home End + -"
         onKeyDown={onKeyDown}
       >
-        <canvas
-          ref={canvasRef}
-          className="pdf-canvas"
-          role="img"
-          aria-label={`${title}, pagina ${page} di ${numPages}`}
-        />
+        <div className="page-frame">
+          <canvas
+            ref={canvasRef}
+            className="pdf-canvas"
+            role="img"
+            aria-label={`${title}, pagina ${page} di ${numPages}`}
+          />
+          {region && target && page === target.page && !rendering ? (
+            <RegionOverlay region={region} label={regionLabel} />
+          ) : null}
+        </div>
       </div>
     </div>
   );

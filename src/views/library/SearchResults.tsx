@@ -2,6 +2,7 @@ import type { AppError, SearchHit } from "../../api/types";
 import { ErrorBanner } from "../../components/ErrorBanner";
 import { Spinner } from "../../components/Spinner";
 import { parseSnippet } from "../../lib/snippet";
+import { formatTimestamp } from "../../lib/time";
 
 interface SearchResultsProps {
   query: string;
@@ -13,8 +14,14 @@ interface SearchResultsProps {
   onOpen: (hit: SearchHit) => void;
 }
 
-export const unitLabel = (hit: Pick<SearchHit, "unit" | "unitKind">) =>
-  hit.unitKind === "page" ? `p. ${hit.unit}` : `blocco ${hit.unit}`;
+export const unitLabel = (hit: Pick<SearchHit, "unit" | "unitKind" | "startMs">) =>
+  hit.unitKind === "segment"
+    ? hit.startMs != null
+      ? formatTimestamp(hit.startMs)
+      : `segmento ${hit.unit}`
+    : hit.unitKind === "page"
+      ? `p. ${hit.unit}`
+      : `blocco ${hit.unit}`;
 
 export function Snippet({ text }: { text: string }) {
   return (

@@ -1,23 +1,37 @@
 import type { AppError, LibraryDocument } from "../../api/types";
 import { CloseIcon } from "../../components/Icons";
 import { Spinner } from "../../components/Spinner";
+import { formatBytes } from "../../lib/format";
 
 export type ImportOutcome =
   | { name: string; kind: "imported"; document: LibraryDocument }
   | { name: string; kind: "duplicate"; document: LibraryDocument }
-  | { name: string; kind: "error"; error: AppError };
+  | { name: string; kind: "error"; error: AppError }
+  /** v0.5: stopped with «Annulla» (nothing kept). */
+  | { name: string; kind: "cancelled" };
+
+/** v0.5: transfer of the file being imported in chunks. */
+export interface ImportProgress {
+  name: string;
+  sentBytes: number;
+  totalBytes: number;
+}
 
 export interface ImportState {
   running: boolean;
   total: number;
   outcomes: ImportOutcome[];
   folderLabel: string;
+  /** Chunked transfer in progress (audio/video and large files). */
+  progress?: ImportProgress | null;
 }
 
 interface ImportSummaryProps {
   state: ImportState;
   onOpen: (doc: LibraryDocument) => void;
   onDismiss: () => void;
+  /** Stops the import (current transfer discarded, remaining files skipped). */
+  onCancel?: () => void;
 }
 
 function summaryLine(outcomes: ImportOutcome[]): string {
@@ -28,12 +42,19 @@ function summaryLine(outcomes: ImportOutcome[]): string {
   if (imported) parts.push(imported === 1 ? "1 importato" : `${imported} importati`);
   if (duplicates) parts.push(duplicates === 1 ? "1 già presente" : `${duplicates} già presenti`);
   if (errors) parts.push(errors === 1 ? "1 non importato" : `${errors} non importati`);
+  const cancelled = outcomes.filter((o) => o.kind === "cancelled").length;
+  if (cancelled) parts.push(cancelled === 1 ? "1 annullato" : `${cancelled} annullati`);
   return parts.join(", ");
 }
 
 /** Per-file outcome of an import: imported, already present, or error with details on demand. */
-export function ImportSummary({ state, onOpen, onDismiss }: ImportSummaryProps) {
-  const { running, total, outcomes, folderLabel } = state;
+/** Percent shown and announced in steps of 10 (screen readers are not flooded on every chunk). */
+function percentOf(progress: ImportProgress): number {
+  return progress.totalBytes > 0 ? Math.min(100, Math.floor((progress.sentBytes / progress.totalBytes) * 100)) : 0;
+}
+
+export function ImportSummary({ state, onOpen, onDismiss, onCancel }: ImportSummaryProps) {
+  const { running, total, outcomes, folderLabel, progress } = state;
   const hasErrors = outcomes.some((o) => o.kind === "error");
   return (
     <section
@@ -51,6 +72,11 @@ export function ImportSummary({ state, onOpen, onDismiss }: ImportSummaryProps) 
             <>Importazione completata: {summaryLine(outcomes)}.</>
           )}
         </p>
+        {running && onCancel ? (
+          <button type="button" className="btn btn-secondary btn-sm" onClick={onCancel}>
+            Annulla
+          </button>
+        ) : null}
         {!running ? (
           <button
             type="button"
@@ -63,6 +89,20 @@ export function ImportSummary({ state, onOpen, onDismiss }: ImportSummaryProps) 
           </button>
         ) : null}
       </div>
+      {running && progress ? (
+        <div className="import-progress">
+          <span className="import-name" title={progress.name}>
+            {progress.name}
+          </span>
+          <progress max={100} value={percentOf(progress)} aria-label={`Importazione di ${progress.name}`} />
+          <span className="hint import-bytes">
+            {percentOf(progress)} % · {formatBytes(progress.sentBytes)} di {formatBytes(progress.totalBytes)}
+          </span>
+          <span className="visually-hidden" role="status">
+            {`${progress.name}: ${Math.floor(percentOf(progress) / 10) * 10} %`}
+          </span>
+        </div>
+      ) : null}
       {outcomes.length > 0 ? (
         <ul className="import-list">
           {outcomes.map((outcome, i) => (
@@ -84,6 +124,8 @@ export function ImportSummary({ state, onOpen, onDismiss }: ImportSummaryProps) 
                     Apri
                   </button>
                 </span>
+              ) : outcome.kind === "cancelled" ? (
+                <span className="import-result">Annullato</span>
               ) : (
                 <span className="import-result import-error">
                   {outcome.error.message}

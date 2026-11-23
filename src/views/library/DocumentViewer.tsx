@@ -1,15 +1,29 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { api } from "../../api/client";
-import type { AppError, DocumentVersion, LibraryDocument } from "../../api/types";
+import type { AppError, DocumentVersion, Job, LibraryDocument, MediaLink, Region, UnitKind } from "../../api/types";
 import { IMPORT_MAX_BYTES, toAppError } from "../../api/types";
 import { ErrorBanner } from "../../components/ErrorBanner";
 import { ArrowLeftIcon, CloseIcon, CopyIcon, InfoIcon } from "../../components/Icons";
 import { Spinner } from "../../components/Spinner";
 import { useDelayedFlag } from "../../hooks/useDelayedFlag";
 import { formatBytes, formatDateTime } from "../../lib/format";
+import { formatClock, formatInterval, formatTimestamp } from "../../lib/time";
+import { CANCELLED_UPLOAD, checkImportSize, needsChunkedUpload, uploadInChunks } from "../../lib/upload";
+import { Backlinks } from "./Backlinks";
 import { ImageViewer } from "./ImageViewer";
-import { KIND_ACCEPT, KIND_LABEL, STATUS_EXPLANATION } from "./labels";
-import { StatusLabel } from "./StatusLabel";
+import {
+  isMediaKind,
+  KIND_ACCEPT,
+  KIND_LABEL,
+  languageName,
+  latestTranscribeJob,
+  mediaStatus,
+  STATUS_EXPLANATION,
+  whisperLabel,
+} from "./labels";
+import { MediaViewer } from "./MediaViewer";
+import { describeRegion } from "./Region";
+import { StatusLabel, TranscriptionStatus } from "./StatusLabel";
 import { TextViewer } from "./TextViewer";
 
 // The PDF viewer is a separate chunk together with pdf.js.
@@ -17,11 +31,17 @@ const PdfViewer = lazy(() => import("./PdfViewer").then((m) => ({ default: m.Pdf
 
 export interface ViewerTarget {
   unit: number;
-  unitKind: "page" | "block";
+  unitKind: UnitKind;
   /** Version the target refers to (default: the current one). */
   versionId?: string;
   /** Passage to show next to the document (a source cited in the chat). */
   snippet?: string | null;
+  /** v0.5: point of a recording to open at (transcript segment or link interval). */
+  startMs?: number | null;
+  /** v0.5: region of the page/image to highlight (target of a link). */
+  region?: Region | null;
+  /** v0.5: the manual link that led here (shown next to the document). */
+  link?: MediaLink | null;
 }
 
 interface DocumentViewerProps {
@@ -41,6 +61,14 @@ interface DocumentViewerProps {
   onBackToChat?: () => void;
   /** Hides the cited passage. */
   onDismissTarget?: () => void;
+  /** v0.5: jobs of the project (transcription progress). */
+  jobs?: Job[];
+  /** v0.5: documents of the project (targets of links). */
+  documents?: LibraryDocument[];
+  /** v0.5: open the target of a link (from a recording). */
+  onOpenLinkTarget?: (link: MediaLink) => void;
+  /** v0.5: open the recording of a link at its start (backlink). */
+  onOpenLinkMedia?: (link: MediaLink) => void;
 }
 
 export const VIEWER_HEADING_ID = "viewer-title";
@@ -91,6 +119,10 @@ export function DocumentViewer({
   onBack,
   onBackToChat,
   onDismissTarget,
+  jobs = [],
+  documents = [],
+  onOpenLinkTarget,
+  onOpenLinkMedia,
 }: DocumentViewerProps) {
   const [infoOpen, setInfoOpen] = useState(false);
   const [versions, setVersions] = useState<DocumentVersion[] | null>(null);
@@ -99,6 +131,8 @@ export function DocumentViewer({
     target?.versionId && target.versionId !== doc.current.id ? target.versionId : null,
   );
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<{ sent: number; total: number } | null>(null);
+  const uploadAbort = useRef<AbortController | null>(null);
   const [uploadError, setUploadError] = useState<AppError | null>(null);
   const [uploadNotice, setUploadNotice] = useState<string | null>(null);
   const [copied, setCopied] = useState<"ok" | "error" | null>(null);
@@ -142,6 +176,16 @@ export function DocumentViewer({
     () => (target && target.unitKind === "block" ? { unit: target.unit } : null),
     [target],
   );
+  const mediaTarget = useMemo(
+    () =>
+      target && (target.unitKind === "segment" || target.startMs != null)
+        ? { startMs: target.startMs ?? null, unit: target.unitKind === "segment" ? target.unit : null }
+        : null,
+    [target],
+  );
+  const regionTarget = target?.region && onTargetVersion ? target.region : null;
+  const isMedia = isMediaKind(version.kind);
+  const transcribeJob = isMedia ? latestTranscribeJob(jobs, version.id) : null;
   const showLoading = useDelayedFlag(
     !original.data && !original.error && (version.kind === "pdf" || version.kind === "image"),
   );
@@ -152,20 +196,40 @@ export function DocumentViewer({
     if (!file) return;
     setUploadError(null);
     setUploadNotice(null);
-    if (file.size > IMPORT_MAX_BYTES) {
-      setUploadError(tooLargeError());
+    const tooLarge = checkImportSize(file);
+    if (tooLarge) {
+      setUploadError(tooLarge);
       return;
     }
     setUploading(true);
     try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const updated = await api.importVersion(doc.id, bytes, file.name, file.lastModified || null);
+      let updated: LibraryDocument;
+      if (needsChunkedUpload(file)) {
+        const controller = new AbortController();
+        uploadAbort.current = controller;
+        setUploadProgress({ sent: 0, total: file.size });
+        const result = await uploadInChunks(file, {
+          projectId: doc.projectId,
+          folderId: doc.folderId,
+          documentId: doc.id,
+          signal: controller.signal,
+          onProgress: (sent, total) => setUploadProgress({ sent, total }),
+        });
+        updated = result.document;
+      } else {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        updated = await api.importVersion(doc.id, bytes, file.name, file.lastModified || null);
+      }
       setViewedId(null);
       setUploadNotice(`Versione ${updated.current.versionNo} caricata.`);
       await onChanged();
     } catch (err) {
-      setUploadError(toAppError(err));
+      const error = toAppError(err);
+      if (error === CANCELLED_UPLOAD || error.code === "cancelled") setUploadNotice("Caricamento annullato.");
+      else setUploadError(error);
     } finally {
+      uploadAbort.current = null;
+      setUploadProgress(null);
       setUploading(false);
     }
   };
@@ -201,6 +265,8 @@ export function DocumentViewer({
             data={original.data}
             title={doc.title}
             target={onTargetVersion ? pageTarget : null}
+            region={regionTarget}
+            regionLabel={regionTarget ? `Regione collegata: ${describeRegion(regionTarget)}` : undefined}
           />
         </Suspense>
       );
@@ -213,9 +279,26 @@ export function DocumentViewer({
           title={doc.title}
           width={version.imageWidth}
           height={version.imageHeight}
+          region={regionTarget}
+          regionLabel={regionTarget ? `Regione collegata: ${describeRegion(regionTarget)}` : undefined}
         />
       );
     }
+  } else if (isMedia) {
+    body = (
+      <MediaViewer
+        key={version.id}
+        doc={doc}
+        version={version}
+        job={transcribeJob}
+        target={onTargetVersion ? mediaTarget : null}
+        documents={documents}
+        onChanged={onChanged}
+        onRetry={canRetry ? onRetry : undefined}
+        retrying={retrying}
+        onOpenLink={(link) => onOpenLinkTarget?.(link)}
+      />
+    );
   } else {
     body = (
       <TextViewer
@@ -245,7 +328,18 @@ export function DocumentViewer({
           </h2>
           <p className="viewer-sub">
             {KIND_LABEL[version.kind]} · {folderLabel}
-            {version.textStatus !== "not_applicable" ? (
+            {version.durationMs != null ? <> · {formatTimestamp(version.durationMs)}</> : null}
+            {isMedia ? (
+              <>
+                {" · "}
+                <TranscriptionStatus
+                  status={mediaStatus(version, transcribeJob)}
+                  title={doc.title}
+                  onRetry={canRetry ? onRetry : undefined}
+                  retrying={retrying}
+                />
+              </>
+            ) : version.textStatus !== "not_applicable" ? (
               <>
                 {" · "}
                 <StatusLabel
@@ -293,7 +387,14 @@ export function DocumentViewer({
         <aside className="cited-passage" aria-labelledby={`${panelId}-passage`}>
           <div className="cited-passage-head">
             <h3 id={`${panelId}-passage`} className="cited-passage-title">
-              Passaggio citato · {target.unitKind === "page" ? `pagina ${target.unit}` : `blocco ${target.unit}`}
+              Passaggio citato ·{" "}
+              {target.unitKind === "page"
+                ? `pagina ${target.unit}`
+                : target.unitKind === "segment"
+                  ? target.startMs != null
+                    ? formatClock(target.startMs)
+                    : `segmento ${target.unit}`
+                  : `blocco ${target.unit}`}
               {!isCurrent ? ` · versione ${version.versionNo}` : ""}
             </h3>
             {onBackToChat ? (
@@ -317,6 +418,45 @@ export function DocumentViewer({
             {target.snippet}
           </p>
         </aside>
+      ) : null}
+
+      {target?.link && !target.snippet && (onTargetVersion || versionMissing) ? (
+        <aside className="cited-passage link-origin" aria-labelledby={`${panelId}-link`}>
+          <div className="cited-passage-head">
+            <h3 id={`${panelId}-link`} className="cited-passage-title">
+              {isMedia
+                ? `Collegato a ${target.link.targetTitle}${target.link.targetPage != null ? ` · p. ${target.link.targetPage}` : ""}`
+                : `Collegato a ${target.link.mediaTitle} · ${formatInterval(target.link.startMs, target.link.endMs)}`}
+              {target.link.region && !isMedia ? " · regione evidenziata" : ""}
+            </h3>
+            {!isMedia && onOpenLinkMedia ? (
+              <button type="button" className="link-btn" onClick={() => onOpenLinkMedia(target.link!)}>
+                Ascolta da {formatTimestamp(target.link.startMs)}
+              </button>
+            ) : null}
+            {isMedia && onOpenLinkTarget ? (
+              <button type="button" className="link-btn" onClick={() => onOpenLinkTarget(target.link!)}>
+                Apri la destinazione
+              </button>
+            ) : null}
+            {onDismissTarget ? (
+              <button
+                type="button"
+                className="icon-btn icon-btn-sm"
+                aria-label="Nascondi collegamento"
+                title="Nascondi collegamento"
+                onClick={onDismissTarget}
+              >
+                <CloseIcon />
+              </button>
+            ) : null}
+          </div>
+          {target.link.note ? <p className="cited-passage-text">{target.link.note}</p> : null}
+        </aside>
+      ) : null}
+
+      {(version.kind === "pdf" || version.kind === "image") && onOpenLinkMedia ? (
+        <Backlinks versionId={version.id} onOpen={onOpenLinkMedia} />
       ) : null}
 
       <div className="viewer-layout">
@@ -343,6 +483,24 @@ export function DocumentViewer({
                 <div>
                   <dt>Pagine</dt>
                   <dd>{version.pageCount}</dd>
+                </div>
+              ) : null}
+              {version.durationMs != null ? (
+                <div>
+                  <dt>Durata</dt>
+                  <dd>{formatTimestamp(version.durationMs)}</dd>
+                </div>
+              ) : null}
+              {version.transcription ? (
+                <div>
+                  <dt>Trascrizione</dt>
+                  <dd>
+                    {whisperLabel(version.transcription.model)} · {languageName(version.transcription.language)} ·{" "}
+                    {version.transcription.segmentCount} segmenti ·{" "}
+                    <time dateTime={version.transcription.createdAt}>
+                      {formatDateTime(version.transcription.createdAt)}
+                    </time>
+                  </dd>
                 </div>
               ) : null}
               {version.imageWidth != null && version.imageHeight != null ? (
@@ -425,6 +583,21 @@ export function DocumentViewer({
               </section>
             ) : null}
 
+            {uploadProgress ? (
+              <div className="upload-progress">
+                <progress
+                  max={uploadProgress.total || 1}
+                  value={uploadProgress.sent}
+                  aria-label="Caricamento della nuova versione"
+                />
+                <span className="hint">
+                  {formatBytes(uploadProgress.sent)} di {formatBytes(uploadProgress.total)}
+                </span>
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => uploadAbort.current?.abort()}>
+                  Annulla
+                </button>
+              </div>
+            ) : null}
             {uploadError ? <ErrorBanner error={uploadError} /> : null}
             {uploadNotice ? (
               <p className="hint" role="status">

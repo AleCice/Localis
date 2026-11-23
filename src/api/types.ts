@@ -420,7 +420,7 @@ export interface CloudPreview {
   host: string;
   question: string;
   /** Sources included in the request, as they will be sent. */
-  sources: { n: number; title: string; unit: number; unitKind: UnitKind; chars: number; via: Source["via"] }[];
+  sources: { n: number; title: string; unit: number; unitKind: UnitKind; chars: number; via: Source["via"]; /** v0.5: segments only */ startMs?: number | null }[];
   historyPairs: number;
   historyChars: number;
   /** Total characters sent (system prompt + history + sources + question). */
