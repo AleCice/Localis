@@ -1,7 +1,15 @@
 // The only module that talks to the backend. Components import from here.
 // Owner: main agent.
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type {
+  BeginUploadInput,
+  MediaLink,
+  MediaLinkInput,
+  TranscriptSegment,
+  TranscriptionLanguage,
+  UploadHandle,
+  WhisperModel,
+  WhisperModelId,
   CloudEmbeddingEstimate,
   CloudPolicy,
   CloudPreview,
@@ -110,6 +118,34 @@ export interface Api {
   /** Drops a prepared payload the user did not confirm. */
   discardCloudSend(token: string): Promise<void>;
   listCloudRequests(limit?: number): Promise<CloudRequest[]>;
+
+  // v0.5 FARO
+  /** Chunked import: begin → uploadChunk (in order) → finishUpload. Cancel frees the temp file. */
+  beginUpload(input: BeginUploadInput): Promise<UploadHandle>;
+  uploadChunk(uploadId: string, offset: number, bytes: Uint8Array): Promise<void>;
+  /** Hashes, checks the format and stores the original; for a new version returns `{status:"imported"}`. */
+  finishUpload(uploadId: string): Promise<ImportResult>;
+  cancelUpload(uploadId: string): Promise<void>;
+  /** URL the webview can stream (with HTTP Range) for an audio/video version. Pure: no backend call. */
+  mediaUrl(versionId: string): string;
+
+  listWhisperModels(): Promise<WhisperModel[]>;
+  /** Downloads from huggingface.co after the user confirmed in the UI (size shown); verified by SHA-256. */
+  downloadWhisperModel(id: WhisperModelId): Promise<WhisperModel[]>;
+  cancelWhisperDownload(id: WhisperModelId): Promise<WhisperModel[]>;
+  deleteWhisperModel(id: WhisperModelId): Promise<WhisperModel[]>;
+  /** Queues a local transcription job (replaces an existing transcript when it completes). */
+  startTranscription(versionId: string, model: WhisperModelId, language: TranscriptionLanguage): Promise<Job>;
+  /** Cancels a queued or running job (transcriptions; extraction jobs too). */
+  cancelJob(id: number): Promise<Job>;
+  getTranscript(versionId: string): Promise<TranscriptSegment[]>;
+
+  listMediaLinks(mediaVersionId: string): Promise<MediaLink[]>;
+  /** Links whose target is this version (backlinks shown in the PDF/image viewer). */
+  listLinksForTarget(targetVersionId: string): Promise<MediaLink[]>;
+  createMediaLink(input: MediaLinkInput): Promise<MediaLink>;
+  updateMediaLink(id: string, input: MediaLinkInput): Promise<MediaLink>;
+  deleteMediaLink(id: string): Promise<void>;
 }
 
 function isTauri(): boolean {
@@ -200,6 +236,29 @@ const tauriApi: Api = {
   prepareCloudSend: (input) => call<CloudPreview | null>("prepare_cloud_send", { input }),
   discardCloudSend: (token) => call<void>("discard_cloud_send", { token }),
   listCloudRequests: (limit) => call<CloudRequest[]>("list_cloud_requests", { limit: limit ?? 100 }),
+
+  beginUpload: (input) => call<UploadHandle>("begin_upload", { input }),
+  uploadChunk: (uploadId, offset, bytes) =>
+    call<void>("upload_chunk", bytes, { "x-upload-id": uploadId, "x-offset": String(offset) }),
+  finishUpload: (uploadId) => call<ImportResult>("finish_upload", { uploadId }),
+  cancelUpload: (uploadId) => call<void>("cancel_upload", { uploadId }),
+  // Custom protocol served by the backend with Range support (see src-tauri media protocol).
+  mediaUrl: (versionId) => convertFileSrc(versionId, "localis-media"),
+
+  listWhisperModels: () => call<WhisperModel[]>("list_whisper_models"),
+  downloadWhisperModel: (id) => call<WhisperModel[]>("download_whisper_model", { id }),
+  cancelWhisperDownload: (id) => call<WhisperModel[]>("cancel_whisper_download", { id }),
+  deleteWhisperModel: (id) => call<WhisperModel[]>("delete_whisper_model", { id }),
+  startTranscription: (versionId, model, language) =>
+    call<Job>("start_transcription", { versionId, model, language }),
+  cancelJob: (id) => call<Job>("cancel_job", { id }),
+  getTranscript: (versionId) => call<TranscriptSegment[]>("get_transcript", { versionId }),
+
+  listMediaLinks: (mediaVersionId) => call<MediaLink[]>("list_media_links", { mediaVersionId }),
+  listLinksForTarget: (targetVersionId) => call<MediaLink[]>("list_links_for_target", { targetVersionId }),
+  createMediaLink: (input) => call<MediaLink>("create_media_link", { input }),
+  updateMediaLink: (id, input) => call<MediaLink>("update_media_link", { id, input }),
+  deleteMediaLink: (id) => call<void>("delete_media_link", { id }),
 };
 
 // The in-memory mock exists only for UI development and browser tests

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window: only Localis' own commands (projects, library, jobs, chat, cloud providers). No plugins.",
+  "description": "Main window: only Localis' own commands (projects, library, jobs, chat, cloud, lectures). No plugins.",
   "windows": [
     "main"
   ],
@@ -47,6 +47,22 @@
     "allow-set-cloud-embedding-consent",
     "allow-prepare-cloud-send",
     "allow-discard-cloud-send",
-    "allow-list-cloud-requests"
+    "allow-list-cloud-requests",
+    "allow-begin-upload",
+    "allow-upload-chunk",
+    "allow-finish-upload",
+    "allow-cancel-upload",
+    "allow-list-whisper-models",
+    "allow-download-whisper-model",
+    "allow-cancel-whisper-download",
+    "allow-delete-whisper-model",
+    "allow-start-transcription",
+    "allow-cancel-job",
+    "allow-get-transcript",
+    "allow-list-media-links",
+    "allow-list-links-for-target",
+    "allow-create-media-link",
+    "allow-update-media-link",
+    "allow-delete-media-link"
   ]
 }

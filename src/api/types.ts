@@ -71,7 +71,11 @@ export const IMPORT_MAX_BYTES = 200 * 1024 * 1024;
 export const FOLDER_NAME_MAX = 120;
 
 /** Extensions accepted by the importer (lowercase, without dot). */
-export const IMPORT_EXTENSIONS = ["pdf", "txt", "md", "markdown", "docx", "png", "jpg", "jpeg", "gif", "webp"] as const;
+export const IMPORT_EXTENSIONS = ["pdf", "txt", "md", "markdown", "docx", "png", "jpg", "jpeg", "gif", "webp", "mp3", "m4a", "wav", "mp4"] as const;
+/** v0.5: max size of an audio/video file (imported in chunks, see beginUpload). */
+export const MEDIA_IMPORT_MAX_BYTES = 4 * 1024 * 1024 * 1024;
+/** v0.5: files larger than this (and all audio/video) are imported in chunks of this size. */
+export const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 
 export interface Folder {
   id: string;
@@ -88,7 +92,7 @@ export interface NewFolderInput {
   name: string;
 }
 
-export type DocumentKind = "pdf" | "text" | "markdown" | "docx" | "image";
+export type DocumentKind = "pdf" | "text" | "markdown" | "docx" | "image" | "audio" | "video";
 
 /**
  * State of the searchable text of a version.
@@ -113,8 +117,12 @@ export interface DocumentVersion {
   importedAt: string;
   textStatus: TextStatus;
   pageCount: number | null; // PDF only
-  imageWidth: number | null; // images only
+  imageWidth: number | null; // images and video
   imageHeight: number | null;
+  /** v0.5: audio/video duration in milliseconds (null for other kinds or if unknown). */
+  durationMs: number | null;
+  /** v0.5: audio/video only, when a transcription exists. */
+  transcription: TranscriptionInfo | null;
 }
 
 /** A document = a sequence of versions of the same work; `current` is the latest. */
@@ -145,9 +153,13 @@ export type ImportResult =
 export interface TextUnit {
   unit: number;
   text: string;
+  /** v0.5: transcript segments only. */
+  startMs?: number | null;
+  endMs?: number | null;
 }
 
-export type UnitKind = "page" | "block";
+/** v0.5: "segment" = transcript segment of an audio/video (unit = 1-based segment index; see startMs). */
+export type UnitKind = "page" | "block" | "segment";
 
 export interface SearchHit {
   documentId: string;
@@ -158,6 +170,8 @@ export interface SearchHit {
   unitKind: UnitKind;
   /** Plain text excerpt; matched terms are wrapped in U+0002 (start) and U+0003 (end). */
   snippet: string;
+  /** v0.5: start of the segment for unitKind "segment". */
+  startMs?: number | null;
 }
 
 export const SNIPPET_MARK_START = "\u0002";
@@ -169,8 +183,10 @@ export interface Job {
   id: number;
   documentId: string;
   versionId: string;
-  kind: "extract_text";
+  kind: "extract_text" | "transcribe";
   state: JobState;
+  /** v0.5: 0–100 while a transcription runs; null when unknown. */
+  progress: number | null;
   attempts: number;
   /** Italian, user-facing; only when failed. */
   error: string | null;
@@ -282,6 +298,8 @@ export interface Source {
   unitKind: UnitKind;
   /** Passage text as passed to the model (or the raw result excerpt). */
   text: string;
+  /** v0.5: start of the transcript segment for unitKind "segment". */
+  startMs?: number | null;
   /** "position": not found by search, opening passage of a selected document (question without searchable terms). */
   via: "lexical" | "semantic" | "both" | "position";
   /** False when the document or version no longer exists. */
@@ -443,4 +461,93 @@ export interface CloudRequest {
   cost: Money | null;
   ok: boolean;
   error: string | null;
+}
+
+// ---------------------------------------------------------------- v0.5 FARO (lectures: audio/video, transcription, timeline)
+
+/** Chunked import (all audio/video, and any file over UPLOAD_CHUNK_BYTES). */
+export interface BeginUploadInput {
+  projectId: string;
+  folderId?: string | null;
+  fileName: string;
+  sizeBytes: number;
+  lastModified?: number | null;
+  /** Set to upload a new version of this document instead of a new document. */
+  documentId?: string | null;
+}
+
+export interface UploadHandle {
+  uploadId: string;
+  chunkBytes: number;
+}
+
+export type WhisperModelId = "tiny" | "base" | "small" | "large-v3-turbo-q5";
+
+export interface WhisperModel {
+  id: WhisperModelId;
+  name: string; // e.g. "Whisper Small"
+  fileName: string; // e.g. "ggml-small.bin"
+  sizeBytes: number;
+  sha256: string;
+  /** Downloaded and verified in the app data directory. */
+  installed: boolean;
+  download: { receivedBytes: number; totalBytes: number } | null;
+  /** Italian, user-facing, after a failed download. */
+  error: string | null;
+}
+
+export type TranscriptionLanguage = "auto" | "it" | "en" | "fr" | "de" | "es";
+
+export interface TranscriptionInfo {
+  model: WhisperModelId;
+  language: string; // detected or chosen ISO code
+  createdAt: string;
+  segmentCount: number;
+}
+
+export interface TranscriptSegment {
+  index: number; // 1-based (= TextUnit.unit)
+  startMs: number;
+  endMs: number;
+  text: string;
+}
+
+/** Non-destructive region on a PDF page or an image, normalised to 0..1 of its width/height. */
+export interface Region {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** Manual link between an interval of a recording and a slide/PDF page or a photo (optionally a region). */
+export interface MediaLink {
+  id: string;
+  projectId: string;
+  mediaDocumentId: string;
+  mediaVersionId: string;
+  startMs: number;
+  endMs: number;
+  targetDocumentId: string;
+  targetVersionId: string;
+  /** PDF page (1-based); null for images. */
+  targetPage: number | null;
+  region: Region | null;
+  note: string | null;
+  createdAt: string;
+  updatedAt: string;
+  /** Snapshot titles for display; `available` false when the media or target no longer exists. */
+  mediaTitle: string;
+  targetTitle: string;
+  available: boolean;
+}
+
+export interface MediaLinkInput {
+  mediaVersionId: string;
+  startMs: number;
+  endMs: number;
+  targetVersionId: string;
+  targetPage?: number | null;
+  region?: Region | null;
+  note?: string | null;
 }
